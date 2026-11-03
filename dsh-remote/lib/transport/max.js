@@ -54,10 +54,16 @@ export const MAX_CHAT_RPS_INTERVAL_MS = 500;
 /** Причины, при которых сообщение закрывается молчаливой пометкой. */
 const QUIET_REASONS = new Set([
   "aborted",
+  "cancelled",
+  "canceled",
+  "expired",
+  "failed",
+  "send-failed",
+  "detached",
+  "disposed",
+  "closed",
   "undelivered",
   "restarted",
-  "expired",
-  "cancelled",
   "",
 ]);
 
@@ -151,6 +157,8 @@ export function createMaxTransport(options = {}) {
   const webhookUrl = typeof options.webhookUrl === "string" && options.webhookUrl !== "" ? options.webhookUrl : null;
 
   let marker = Number.isFinite(options.marker) ? options.marker : null;
+  /** Кого увидели в bot_started/bot_added: сессия может взять id отсюда. */
+  const detected = { chatId: null, userId: null };
   let running = false;
   let loopPromise = null;
   const sent = new Map();
@@ -242,12 +250,19 @@ export function createMaxTransport(options = {}) {
     return sender !== null && allowed.has(String(sender));
   }
 
+  // Очереди объявляем до обработчиков: ответ на колбэк и правки тоже проходят
+  // через троттлинг (MAX ограничивает и POST /answers двумя запросами в секунду).
+  const sendQueue = throttle([], MAX_CHAT_RPS_INTERVAL_MS, { now, sleep });
+  const editQueue = throttle([], MAX_CHAT_RPS_INTERVAL_MS, { now, sleep });
+
   /** Ответить на колбэк: один запрос и подтверждает нажатие, и правит сообщение. */
   async function answerCallback(callbackId, text) {
-    await request("POST", "/answers", {
+    // Документация MAX: тело — NewMessageBody в поле `message`
+    // ({message: {text, format, attachments}}), не «плоский» {text}.
+    await editQueue.push(() => request("POST", "/answers", {
       query: { callback_id: callbackId },
-      body: { text, format: "html" },
-    });
+      body: { message: { text, format: "html", attachments: [] } },
+    })).run();
   }
 
   /** Раздать ответ подписчикам. */
@@ -326,7 +341,11 @@ export function createMaxTransport(options = {}) {
     }
 
     if (update?.type === "bot_started" || update?.type === "bot_added") {
-      log(`max: ${update.type} — бот подключён к чату`);
+      const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? null;
+      const user = update?.user?.user_id ?? update?.message?.sender?.user_id ?? null;
+      if (chat !== null) detected.chatId = chat;
+      if (user !== null) detected.userId = user;
+      log(`max: ${update.type} — бот подключён (chat_id ${chat ?? "?"}, user_id ${user ?? "?"})`);
     }
   }
 
@@ -354,9 +373,6 @@ export function createMaxTransport(options = {}) {
     }
   }
 
-  const sendQueue = throttle([], MAX_CHAT_RPS_INTERVAL_MS, { now, sleep });
-  const editQueue = throttle([], MAX_CHAT_RPS_INTERVAL_MS, { now, sleep });
-
   const transport = {
     id: "max",
     caps,
@@ -378,6 +394,10 @@ export function createMaxTransport(options = {}) {
     },
     get messages() {
       return sent;
+    },
+    /** id, увиденные в bot_started/bot_added (для ручной привязки). */
+    get detected() {
+      return { ...detected };
     },
 
     /** Поднять long polling. Повторный вызов безопасен. */
@@ -466,10 +486,38 @@ export function createMaxTransport(options = {}) {
       return { messageId: mid };
     },
 
+    /**
+     * Правка сообщения по сохранённым `chatId`/`messageId` — после рестарта,
+     * когда in-memory `sent` пуст (нужно 008: recover и TTL-пометка).
+     */
+    async editMessage({ chatId: target, messageId } = {}, text) {
+      if (messageId === undefined || messageId === null) return false;
+      await editQueue.push(() => request("PUT", "/messages", {
+        query: { message_id: messageId },
+        body: { text: escapeHtml(text), format: "html" },
+      })).run();
+      return true;
+    },
+
+    /** Снять кнопки по сохранённым id (после рестарта). */
+    async clearButtons({ messageId } = {}) {
+      if (messageId === undefined || messageId === null) return false;
+      await editQueue.push(() => request("PUT", "/messages", {
+        query: { message_id: messageId },
+        body: { text: "⌛ ждёт ответа", format: "html", attachments: [] },
+      })).run();
+      return true;
+    },
+
     /** Правка текста вопроса (напоминание, TTL-пометка). */
     async editQuestion(question, text) {
       const record = sent.get(question?.shortId);
-      if (record === undefined) return false;
+      if (record === undefined) {
+        // После рестарта записи нет, но reliability сохраняет id в состоянии.
+        const messageId = question?.messageId;
+        if (messageId !== undefined && messageId !== null) return transport.editMessage({ messageId }, text);
+        return false;
+      }
       await editQueue.push(() => request("PUT", "/messages", {
         query: { message_id: record.mid },
         body: {
@@ -484,7 +532,11 @@ export function createMaxTransport(options = {}) {
     /** Закрыть вопрос: кнопки снимаются, текст помечается. */
     async closeQuestion(question, summary = "") {
       const record = sent.get(question?.shortId);
-      if (record === undefined) return;
+      if (record === undefined) {
+        const messageId = question?.messageId;
+        if (messageId !== undefined && messageId !== null) await transport.clearButtons({ messageId });
+        return;
+      }
       const quiet = QUIET_REASONS.has(summary);
       const text = quiet ? "⌛ ждёт ответа" : `✅ Отвечено: ${escapeHtml(summary)}`;
       try {

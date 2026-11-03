@@ -159,7 +159,11 @@ test("нажатие кнопки: message_callback -> /answers и один от
   const call = calls.find((item) => item.key === "POST /answers");
   assert.ok(call, "нажатие подтверждено одним запросом");
   assert.equal(call.url.searchParams.get("callback_id"), "cb1");
-  assert.match(call.body.text, /Нет/);
+  // Документация MAX: тело /answers — NewMessageBody в поле `message`.
+  assert.match(call.body.message.text, /✅ Отвечено: Нет/);
+  assert.equal(call.body.message.format, "html");
+  assert.deepEqual(call.body.message.attachments, []);
+  assert.equal(call.body.text, undefined, "плоского text в теле нет");
 });
 
 test("дедуп: одно и то же обновление не обрабатывается дважды", async (t) => {
@@ -350,4 +354,160 @@ test("фича max: webhook в конфиге даёт ошибку в лог, �
 
   assert.equal(errors.length, 1);
   assert.match(errors[0], /webhook недоступен/);
+});
+
+// --- регрессии по ревью 011 -------------------------------------------------
+
+test("quiet reasons: служебные причины закрывают сообщение молчаливой пометкой", async (t) => {
+  const { transport, calls } = setup(t);
+  await transport.sendQuestion(question());
+
+  await transport.closeQuestion(question(), "send-failed");
+
+  const put = calls.filter((item) => item.key === "PUT /messages").at(-1);
+  assert.equal(put.body.text, "⌛ ждёт ответа", "не «✅ Отвечено: send-failed»");
+});
+
+test("троттлинг /answers: серия кликов идёт с паузой 500 мс", async (t) => {
+  const updates = [
+    {
+      type: "message_callback",
+      timestamp: 1,
+      callback: { callback_id: "cb1", payload: "q:aaaaaaaa:o1", user: { user_id: 7 }, chat: { chat_id: 42 } },
+    },
+    {
+      type: "message_callback",
+      timestamp: 2,
+      callback: { callback_id: "cb2", payload: "q:bbbbbbbb:o1", user: { user_id: 7 }, chat: { chat_id: 42 } },
+    },
+  ];
+  const { transport, sleeps, calls } = setup(t, { routes: { updates } });
+  await transport.sendQuestion(question({ shortId: "aaaaaaaa" }));
+  await transport.sendQuestion(question({ shortId: "bbbbbbbb" }));
+
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.equal(calls.filter((item) => item.key === "POST /answers").length, 2, "оба клика подтверждены");
+  assert.ok(sleeps.includes(500), `ответы идут через очередь: ${JSON.stringify(sleeps)}`);
+});
+
+test("bot_started: id запоминаются, а не только логируются", async (t) => {
+  const updates = [
+    { type: "bot_started", timestamp: 1, user: { user_id: 777 }, chat: { chat_id: 4242 } },
+    { type: "message_callback", timestamp: 2, callback: { callback_id: "cb1", payload: "q:a1b2c3d4:o1", user: { user_id: 777 }, chat: { chat_id: 4242 } } },
+  ];
+  const { transport } = setup(t, { routes: { updates }, options: { allowedUserIds: [] } });
+  await transport.sendQuestion(question());
+
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.deepEqual(transport.detected, { chatId: 4242, userId: 777 });
+});
+
+test("после рестарта editMessage/clearButtons правят по сохранённым id", async (t) => {
+  const { transport, calls } = setup(t);
+
+  assert.equal(await transport.editMessage({ chatId: 42, messageId: "mid.77" }, "⏳ осталось 5 минут"), true);
+  assert.equal(await transport.clearButtons({ chatId: 42, messageId: "mid.77" }), true);
+  const puts = calls.filter((item) => item.key === "PUT /messages");
+  assert.equal(puts.length, 2);
+  assert.equal(puts[0].url.searchParams.get("message_id"), "mid.77");
+  assert.deepEqual(puts[1].body.attachments, []);
+});
+
+test("после рестарта editQuestion/closeQuestion работают по question.messageId", async (t) => {
+  const { transport, calls } = setup(t);
+  const restored = { shortId: "cccccccc", messageId: "mid.88" };
+
+  assert.equal(await transport.editQuestion(restored, "⌛ ждёт ответа"), true);
+  await transport.closeQuestion(restored, "expired");
+
+  const puts = calls.filter((item) => item.key === "PUT /messages");
+  assert.equal(puts.length, 2, "правка и закрытие по id из состояния");
+  assert.equal(puts[0].url.searchParams.get("message_id"), "mid.88");
+});
+
+test("фича max: marker читается и пишется через состояние (переживает перезапуск)", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-max-marker-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stateFile = path.join(dir, "state.json");
+
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url, init });
+    const parsed = new URL(url);
+    if (parsed.pathname === "/updates") {
+      if (calls.filter((item) => new URL(item.url).pathname === "/updates").length === 1) {
+        return { ok: true, status: 200, async json() { return { updates: [], marker: 77 }; } };
+      }
+      return new Promise((resolve, reject) => {
+        init.signal?.addEventListener?.("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    }
+    return { ok: true, status: 200, async json() { return { ok: true }; } };
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { maxFeature } = await import("../lib/features/max.js");
+  const previous = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = stateFile;
+  t.after(() => {
+    if (previous === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previous;
+  });
+
+  const makeCtx = () => {
+    const provided = new Map();
+    return {
+      provided,
+      ctx: {
+        provide: (name, service) => provided.set(name, service),
+        get: (name) => (name === "credentials" ? { resolve: async () => ({ value: TOKEN, source: "file" }) } : provided.get(name) ?? null),
+      },
+    };
+  };
+  const makeDeps = () => {
+    const disposers = [];
+    return {
+      disposers,
+      deps: {
+        logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        get: () => null,
+        onDispose: (disposer) => disposers.push(disposer),
+      },
+    };
+  };
+
+  const first = makeCtx();
+  const firstDeps = makeDeps();
+  await maxFeature.apply(first.ctx, { max: { chatId: 42 } }, firstDeps.deps);
+  await settle();
+  for (const dispose of [...firstDeps.disposers].reverse()) await dispose?.();
+
+  const markerPath = path.join(dir, "max-marker.json");
+  assert.equal(fs.existsSync(markerPath), true, "файл marker появился рядом с состоянием");
+  assert.equal(JSON.parse(fs.readFileSync(markerPath, "utf8")).marker, 77);
+
+  const second = makeCtx();
+  const secondDeps = makeDeps();
+  await maxFeature.apply(second.ctx, { max: { chatId: 42 } }, secondDeps.deps);
+  await settle();
+  for (const dispose of [...secondDeps.disposers].reverse()) await dispose?.();
+
+  const updateCalls = calls.filter((item) => new URL(item.url).pathname === "/updates");
+  assert.equal(new URL(updateCalls.at(-1).url).searchParams.get("marker"), "77", "рестарт продолжил с marker");
 });

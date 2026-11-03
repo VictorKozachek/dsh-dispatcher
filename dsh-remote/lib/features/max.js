@@ -11,6 +11,10 @@
  * транспорт и пишет внятную ошибку в лог (карточка 011) — «молчания» не будет.
  */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { createCredentialAccess } from "../store.js";
 import { createMaxTransport } from "../transport/max.js";
 
@@ -19,6 +23,34 @@ export const TRANSPORT_SERVICE = "remoteTransport";
 
 /** Имя ссылки на токен MAX в `ctx.credentials`. */
 export const MAX_TOKEN_REF = "DSH_REMOTE_MAX_TOKEN";
+
+/** Файл с `marker` рядом с состоянием: у MAX нет глобального update_id. */
+function markerFile(deps) {
+  const store = deps.get("remoteStore");
+  const stateFile = typeof store?.paths?.file === "string" && store.paths.file !== ""
+    ? store.paths.file
+    : (process.env.DSH_REMOTE_STATE || path.join(os.homedir(), ".dsh", "remote-control", "state.json"));
+  return path.join(path.dirname(stateFile), "max-marker.json");
+}
+
+function readMarker(file, log) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    return Number.isFinite(parsed?.marker) ? parsed.marker : null;
+  } catch (error) {
+    if (error?.code !== "ENOENT") log(`фича max: marker не прочитан (${error?.message ?? error})`);
+    return null;
+  }
+}
+
+function writeMarker(file, marker, log) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, JSON.stringify({ marker }), { mode: 0o600 });
+  } catch (error) {
+    log(`фича max: marker не сохранён (${error?.message ?? error})`);
+  }
+}
 
 export const maxFeature = {
   name: "max",
@@ -55,6 +87,11 @@ export const maxFeature = {
       return;
     }
 
+    const markerPath = markerFile(deps);
+    const log = (message) => deps.logger.debug(message);
+    const savedMarker = readMarker(markerPath, log);
+    if (savedMarker !== null) deps.logger.info(`фича max: продолжаю с marker ${savedMarker}`);
+
     let transport;
     try {
       transport = createMaxTransport({
@@ -63,11 +100,8 @@ export const maxFeature = {
         userId: settings.userId,
         allowedUserIds: Array.isArray(settings.allowedUserIds) ? settings.allowedUserIds : [],
         pollTimeoutSec: settings.pollTimeoutSec,
-        marker: settings.marker,
-        persistMarker: (marker) => {
-          if (typeof deps.setMarker === "function") deps.setMarker(marker);
-          else deps.logger.debug(`фича max: marker ${marker} (не сохранён — нет хранилища)`);
-        },
+        marker: savedMarker ?? settings.marker,
+        persistMarker: (marker) => writeMarker(markerPath, marker, log),
         log: (message) => deps.logger.debug(message),
       });
     } catch (error) {
