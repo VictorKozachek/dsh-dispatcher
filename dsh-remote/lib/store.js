@@ -55,6 +55,8 @@ export function defaultState() {
     hybrid: { enabled: false, waitMs: DEFAULT_HYBRID_WAIT_MS },
     recent: [],
     pending: [],
+    /** 014: дедуп уведомлений доски: что уже отправлено и сколько было todo. */
+    notify: { seen: [], lastTodo: {}, baseline: {} },
   };
 }
 
@@ -439,6 +441,17 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
     },
     recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
     pending: Array.isArray(value.pending) ? value.pending : [],
+    notify: {
+      seen: Array.isArray(value.notify?.seen) ? value.notify.seen.filter((key) => typeof key === "string").slice(-500) : [],
+      lastTodo: value.notify?.lastTodo !== null && typeof value.notify?.lastTodo === "object"
+        ? { ...value.notify.lastTodo }
+        : {},
+      // 014: baseline теперь по воркспейсам (`{project: true}`), старое
+      // логическое значение читаем как «все воркспейсы уже базовые».
+      baseline: value.notify?.baseline !== null && typeof value.notify?.baseline === "object"
+        ? { ...value.notify.baseline }
+        : {},
+    },
   };
 }
 
