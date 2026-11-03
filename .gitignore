@@ -16,3 +16,7 @@ __pycache__/
 .DS_Store
 .idea/
 *.log
+
+# Локальные кэши проверки Rust-релея (создаются cargo test в песочнице)
+.cargo-home/
+.cargo-target/
