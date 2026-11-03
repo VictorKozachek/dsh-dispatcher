@@ -101,21 +101,43 @@ test("ручной ряд ui-remote: установка отказывает и 
   assert.match(result.stderr, /смонтируется дважды/);
 });
 
-test("уже установленный пакет: повторный запуск идемпотентен", (t) => {
+test("уже установленный пакет: ранний выход и манифест не переписывается", (t) => {
   const home = tempHome(t);
   const profileDir = path.join(home, "profiles", "web");
   fs.mkdirSync(profileDir, { recursive: true });
-  fs.writeFileSync(path.join(profileDir, "package.json"), JSON.stringify({
+  const manifest = path.join(profileDir, "package.json");
+  fs.writeFileSync(manifest, JSON.stringify({
     name: "web-profile",
     dependencies: { "dsh-remote": `link:${pluginDir}` },
     dsh: { profile: { bundles: ["dsh-remote"] } },
   }));
+  const before = fs.readFileSync(manifest, "utf8");
+  const mtimes = fs.statSync(manifest).mtimeMs;
 
   const result = run(t, ["--profile", "web"], home);
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /уже установлен|уже объявлен зависимостью/);
+  assert.match(result.stdout, /пакет уже установлен — пропускаю/, "сработал именно ранний выход");
+  assert.doesNotMatch(result.stdout, /манифест профиля обновлён/, "запись не выполнялась");
+  assert.equal(fs.readFileSync(manifest, "utf8"), before, "манифест байт в байт тот же");
+  assert.equal(fs.statSync(manifest).mtimeMs, mtimes, "файл даже не переписан");
+  assert.equal(fs.existsSync(path.join(profileDir, "node_modules")), false, "симлинков не появилось");
 });
+
+test("файл исполняемый и запускается без bash (режим 100755)", (t) => {
+  const mode = fs.statSync(script).mode & 0o111;
+  assert.notEqual(mode, 0, "bin/install-remote.sh должен быть +x");
+
+  const home = tempHome(t);
+  const result = spawnSync(script, ["--dry-run"], {
+    encoding: "utf8",
+    env: { ...process.env, DSH_HOME: home },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /dry-run: ничего не изменено/);
+});
+
 
 test("неизвестная опция: код 2 и подсказка", (t) => {
   const home = tempHome(t);
