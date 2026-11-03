@@ -289,6 +289,8 @@ export function createReliability({
   tickIntervalMs = 15_000,
   notifyTimeoutMs = 2_000,
   setTimeout: setTimeoutImpl = setTimeout,
+  /** 012: (transportId) => transport, чтобы TTL/напоминания шли во все каналы. */
+  transportFor = null,
 } = {}) {
   if (!ON_EXPIRE_VALUES.includes(onExpire)) {
     throw new TypeError(`reliability: onExpire должен быть одним из ${ON_EXPIRE_VALUES.join(", ")}`);
@@ -347,7 +349,7 @@ export function createReliability({
   }
 
   /** Гонка отправки с дедлайном и сигналом: зависший send не держит handler. */
-  function raceSend(question, target, { deadline, signal }) {
+  function raceSend(question, target, { deadline, signal, send }) {
     return new Promise((resolve, reject) => {
       // Свой контроллер: дедлайн тоже должен отменять саму отправку, а не только
       // гонку — иначе зависший send доедет после того, как вопрос отдан в GUI.
@@ -372,7 +374,8 @@ export function createReliability({
       if (signal?.aborted === true) onAbort();
       signal?.addEventListener?.("abort", onAbort, { once: true });
       const opts = target === undefined ? { signal: controller.signal } : { ...target, signal: controller.signal };
-      Promise.resolve(channel().sendQuestion(question, opts)).then(
+      const sendFn = typeof send === "function" ? send : channel().sendQuestion.bind(channel());
+      Promise.resolve(sendFn(question, opts)).then(
         (value) => finish(resolve, value),
         (error) => finish(reject, error),
       );
@@ -425,6 +428,24 @@ export function createReliability({
    * Это та точка, где ответчик (002) решает отдать вопрос GUI: ему достаточно
    * на `'give-up'` вернуть `next()`.
    */
+  /**
+   * Транспорты, куда доставлен вопрос (012): все `deliveries`, иначе базовый.
+   * Через `transportFor` они находятся по id после рестарта.
+   */
+  function targetsFor(question) {
+    const found = [];
+    const deliveries = Array.isArray(question?.deliveries) ? question.deliveries : [];
+    for (const delivery of deliveries) {
+      const target = typeof transportFor === "function" ? transportFor(delivery?.transport) : null;
+      if (target !== null && target !== undefined && typeof target.sendQuestion === "function") {
+        if (!found.includes(target)) found.push(target);
+      }
+    }
+    const base = channel();
+    if (found.length === 0 && base !== null) found.push(base);
+    return found;
+  }
+
   /** Живой транспорт: у фасада (005) внутри, у обычного сервиса — он сам. */
   function channel() {
     if (transport === null || transport === undefined) return null;
@@ -432,16 +453,19 @@ export function createReliability({
     return transport;
   }
 
-  async function deliver({ question, chatId, signal } = {}) {
+  async function deliver({ question, chatId, signal, transport: overrideTransport = null } = {}) {
     if (question === null || typeof question !== "object") return "give-up";
-    if (typeof channel()?.sendQuestion !== "function") {
+    // 012: доставка в конкретный канал (брокер), а не только в «свой» транспорт.
+    const source = overrideTransport ?? transport;
+    const active = source?.__isTransportFacade === true ? source.current ?? null : source;
+    if (typeof active?.sendQuestion !== "function") {
       // Отправлять некуда: не врём «delivered», сразу отдаём вопрос GUI.
       journal.append({ event: "give-up", shortId: question.shortId, reason: "no-transport" });
       return "give-up";
     }
     const deadline = now() + connectTimeoutMs;
     // Фактический чат: явный аргумент или свойство транспорта (004 его отдаёт).
-    const resolvedChatId = chatId ?? channel()?.chatId ?? null;
+    const resolvedChatId = chatId ?? active?.chatId ?? null;
     const target = resolvedChatId === null ? undefined : { chatId: resolvedChatId };
 
     const outgoing = prepareQuestion(question);
@@ -451,7 +475,16 @@ export function createReliability({
       try {
         // Отправка может зависнуть: гоним её с дедлайном и сигналом, иначе
         // handler ждал бы вечно, а вопрос после аборта всё равно уехал бы.
-        const sentValue = await raceSend(outgoing, target, { deadline, signal });
+        const sentValue = await raceSend(outgoing, target, {
+          deadline,
+          signal,
+          send: (outgoingQuestion, options) => active.sendQuestion(outgoingQuestion, options),
+        });
+        // 012: доставка в конкретный канал — модель вопроса помнит messageId
+        // каждого канала (брокеру и recover нужен id, а не строка "delivered").
+        if (typeof active?.id === "string" && typeof question?.addDelivery === "function") {
+          question.addDelivery({ transport: active.id, messageId: sentValue?.messageId ?? null, chatId: resolvedChatId });
+        }
         rememberOpen(question, { messageId: sentValue?.messageId, chatId: resolvedChatId });
         journal.append({ event: "delivered", shortId: question.shortId, attempt });
         return "delivered";
@@ -496,6 +529,8 @@ export function createReliability({
             sessionId: sessionId ?? question.sessionId ?? null,
             chatId: chatId ?? question.chatId ?? null,
             messageId: messageId ?? null,
+            // 012: каналы, куда вопрос доставлен (список переживает рестарт).
+            deliveries: Array.isArray(question.deliveries) ? question.deliveries.map((item) => ({ ...item })) : [],
             createdAt: now(),
           });
         } else {
@@ -503,6 +538,9 @@ export function createReliability({
           if (entry !== undefined) {
             if (messageId !== undefined && entry.messageId === null) entry.messageId = messageId;
             if (chatId !== undefined && chatId !== null && entry.chatId === null) entry.chatId = chatId;
+            if (Array.isArray(question.deliveries) && question.deliveries.length > 0) {
+              entry.deliveries = question.deliveries.map((item) => ({ ...item }));
+            }
           }
         }
         return current;
@@ -510,6 +548,33 @@ export function createReliability({
     } catch (error) {
       logger(`состояние: открытый вопрос ${question.shortId} не сохранён (${error?.message ?? error})`);
     }
+  }
+
+  /**
+   * Где лежит сообщение вопроса (messageId/chatId) — для брокера 012:
+   * `deliver` по контракту возвращает строку, а брокеру нужен id сообщения.
+   */
+  function deliveryInfo(shortId, transportId = null) {
+    if (typeof shortId !== "string" || shortId === "") return null;
+    try {
+      const current = normalizeState(store.read());
+      const entry = current.questions.find((item) => item.shortId === shortId);
+      if (entry === undefined) return null;
+      if (typeof transportId === "string") {
+        const delivery = (entry.deliveries ?? []).find((item) => item.transport === transportId);
+        if (delivery !== undefined) return { messageId: delivery.messageId ?? null, chatId: delivery.chatId ?? null };
+      }
+      return { messageId: entry.messageId ?? null, chatId: entry.chatId ?? null };
+    } catch (error) {
+      logger(`состояние: доставка ${shortId} не прочитана (${error?.message ?? error})`);
+      return null;
+    }
+  }
+
+  /** Запомнить доставки вопроса в состоянии (012: несколько каналов). */
+  function noteDeliveries(question) {
+    if (question === null || typeof question !== "object") return;
+    rememberOpen(question);
   }
 
   /** Убрать вопрос из открытых (ответили/сняли). */
@@ -563,6 +628,38 @@ export function createReliability({
     let failed = 0;
 
     for (const orphan of orphans) {
+      // 012: закрываем каждую доставку (после рестарта каналов может быть два).
+      const deliveries = Array.isArray(orphan.deliveries) && orphan.deliveries.length > 0
+        ? orphan.deliveries
+        : [orphan];
+      if (deliveries.length > 1) {
+        let ok = true;
+        for (const delivery of deliveries) {
+          const target = typeof transportFor === "function" ? transportFor(delivery.transport) : null;
+          const question = { shortId: orphan.shortId, questionId: orphan.questionId ?? orphan.shortId };
+          try {
+            if (delivery.messageId !== null && delivery.messageId !== undefined && typeof target?.editMessage === "function") {
+              await target.editMessage({ chatId: delivery.chatId, messageId: delivery.messageId }, reason);
+              if (typeof target.clearButtons === "function") {
+                await target.clearButtons({ chatId: delivery.chatId, messageId: delivery.messageId });
+              }
+            } else if (typeof target?.closeQuestion === "function") {
+              await target.closeQuestion(question, "restarted");
+            }
+          } catch (error) {
+            ok = false;
+            logger(`рестарт: канал ${delivery.transport ?? "?"} вопроса ${orphan.shortId} не снят (${error?.message ?? error})`);
+          }
+        }
+        if (ok) {
+          cancelled += 1;
+          journal.append({ event: "orphan-cancelled", shortId: orphan.shortId });
+        } else {
+          failed += 1;
+          journal.append({ event: "orphan-failed", shortId: orphan.shortId });
+        }
+        continue;
+      }
       try {
         const live = channel();
         const question = { shortId: orphan.shortId, questionId: orphan.questionId ?? orphan.shortId };
@@ -607,17 +704,18 @@ export function createReliability({
   async function notify(question, text) {
     // Правку проверяем по результату, а не по наличию метода: фасад 005 есть
     // всегда, но если за ним нет живого канала, правка «успешно» ничего не делает.
-    if (typeof transport?.editQuestion === "function") {
+    let editedAny = false;
+    for (const target of targetsFor(question)) {
+      if (typeof target.editQuestion !== "function") continue;
       try {
-        const edited = await transport.editQuestion(question, text);
-        // Только явный `true`: фасад без живого канала возвращает undefined,
-        // и это не повод считать напоминание доставленным.
-        if (edited === true) return "edited";
-        logger(`уведомление ${question.shortId}: транспорт не смог править сообщение`);
+        const edited = await target.editQuestion(question, text);
+        if (edited === true) editedAny = true;
+        else logger(`уведомление ${question.shortId}: канал ${target.id ?? "?"} не смог править сообщение`);
       } catch (error) {
         logger(`уведомление ${question.shortId}: правка не удалась (${error?.message ?? error})`);
       }
     }
+    if (editedAny) return "edited";
     // Если правка не удалась (нет метода, вернул не `true`, фасад без канала) —
     // карточка требует короткое новое сообщение. Не теряем напоминание молча.
     if (typeof transport?.sendQuestion === "function") {
@@ -686,13 +784,16 @@ export function createReliability({
         // §7.3: по TTL сообщение помечается «⌛ ждёт ответа», и только потом
         // снимаются кнопки. Silent-close сам текст не меняет.
         let marked = false;
-        try {
-          marked = (await withTimeout(
-            Promise.resolve(transport?.editQuestion?.(question, "⌛ ждёт ответа")),
-            notifyTimeoutMs,
-          )) === true;
-        } catch (error) {
-          logger(`TTL: пометка вопроса ${shortId} не удалась (${error?.message ?? error})`);
+        for (const target of targetsFor(question)) {
+          try {
+            const markedOne = (await withTimeout(
+              Promise.resolve(target?.editQuestion?.(question, "⌛ ждёт ответа")),
+              notifyTimeoutMs,
+            )) === true;
+            marked = marked || markedOne;
+          } catch (error) {
+            logger(`TTL: пометка вопроса ${shortId} в канале ${target.id ?? "?"} не удалась (${error?.message ?? error})`);
+          }
         }
         if (!marked) {
           // Пометка невозможна (нет editQuestion / фасад без канала): сообщение
@@ -700,11 +801,13 @@ export function createReliability({
           journal.append({ event: "expire-unmarked", shortId });
           logger(`TTL: транспорт не умеет править сообщение ${shortId} — пометка «⌛» не поставлена`);
         }
-        try {
-          // Зависшая правка не должна блокировать сторож: ограничиваем время.
-          await withTimeout(Promise.resolve(transport?.closeQuestion?.(question, "expired")), notifyTimeoutMs);
-        } catch (error) {
-          logger(`TTL: кнопки вопроса ${shortId} не снялись (${error?.message ?? error})`);
+        for (const target of targetsFor(question)) {
+          try {
+            // Зависшая правка не должна блокировать сторож: ограничиваем время.
+            await withTimeout(Promise.resolve(target?.closeQuestion?.(question, "expired")), notifyTimeoutMs);
+          } catch (error) {
+            logger(`TTL: кнопки вопроса ${shortId} в канале ${target.id ?? "?"} не снялись (${error?.message ?? error})`);
+          }
         }
         const resolved = resolveExpiry(question);
         journal.append({ event: "expired", shortId, outcome: onExpire });
@@ -868,6 +971,8 @@ export function createReliability({
     notify,
     watch,
     unwatch,
+    noteDeliveries,
+    deliveryInfo,
     tick,
     start,
     stop,

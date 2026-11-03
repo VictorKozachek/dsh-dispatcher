@@ -57,6 +57,7 @@ const CLOSE_REASONS = new Set([
   "detached",
   "disposed",
   "closed",
+  "answered-elsewhere",
 ]);
 
 /** Рабочий диапазон long polling из отчёта по API (25–50 с). */
