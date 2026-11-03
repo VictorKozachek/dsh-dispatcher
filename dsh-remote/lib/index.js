@@ -93,9 +93,18 @@ export async function apply(ctx, config = {}) {
   const dispose = () => {
     if (disposed) return;
     disposed = true;
-    for (const disposer of disposers.splice(0)) {
+    // 034: LIFO — ресурсы снимаются в обратном порядке монтирования. Это важно
+    // для graceful shutdown: ответчик закрывает сообщения ещё живым транспортом,
+    // а поллеры/WS останавливаются последними (команды/фасад) — иначе закрывать
+    // открытые вопросы было бы нечем. Промисы снятия дожидаться нельзя
+    // (dispose синхронный), поэтому их отклонения гасим, чтобы после stop() не
+    // было unhandledRejection.
+    for (const disposer of disposers.splice(0).reverse()) {
       try {
-        disposer();
+        const result = disposer();
+        if (result !== null && typeof result?.then === "function") {
+          result.then(undefined, (error) => logger.warn(`снятие ресурса фичи упало: ${describeError(error)}`));
+        }
       } catch (error) {
         logger.warn(`снятие ресурса фичи упало: ${describeError(error)}`);
       }
