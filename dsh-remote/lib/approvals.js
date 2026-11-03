@@ -93,6 +93,8 @@ export function createApprovals({
   audit = null,
   /** Гибрид 028: `{enabled, waitMs}` или функция. */
   hybrid = null,
+  /** 031: метрики (только числа). */
+  metrics = null,
 } = {}) {
   // 025: «по умолчанию безопасно» живёт в самом ответчике, а не только в фиче —
   // иначе прямой вызов createApprovals (тесты, будущие вызывающие) спрашивал бы
@@ -135,7 +137,7 @@ export function createApprovals({
   const channels = (Array.isArray(transports) && transports.length > 0 ? transports : (transport === null ? [] : [transport]))
     .filter((item) => item !== null && typeof item === "object");
   const useBroker = channels.length > 1;
-  const broker = useBroker ? createBroker({ transports: channels, deliverFor, log }) : null;
+  const broker = useBroker ? createBroker({ transports: channels, deliverFor, log, metrics }) : null;
   const primary = channels[0] ?? null;
   /** Каналы, умеющие сообщить ответ: без них подтверждение брать нельзя. */
   const subscribable = channels.filter((item) => typeof item.onAnswer === "function");
@@ -351,6 +353,11 @@ export function createApprovals({
     }
     late.delete(entry.approval.shortId);
     stats.hybridLate += 1;
+    try {
+      metrics?.inc?.("approvals.late");
+    } catch {
+      /* метрики не должны ронять поздний ответ */
+    }
     record(entry.approval, {
       outcome,
       decision: "late",
@@ -492,6 +499,14 @@ export function createApprovals({
   }
 
   function statsFor(outcome) {
+    try {
+      if (outcome === APPROVAL_OUTCOME.allowedOnce) metrics?.inc?.("approvals.allowed_once");
+      else if (outcome === APPROVAL_OUTCOME.rejected) metrics?.inc?.("approvals.rejected");
+      else if (outcome === APPROVAL_OUTCOME.unavailable) metrics?.inc?.("approvals.unavailable");
+      else if (outcome === APPROVAL_OUTCOME.cancelled) metrics?.inc?.("approvals.cancelled");
+    } catch {
+      /* метрики не должны ронять решение */
+    }
     if (outcome === APPROVAL_OUTCOME.allowedOnce) stats.allowed += 1;
     else if (outcome === APPROVAL_OUTCOME.rejected) stats.rejected += 1;
     else if (outcome === APPROVAL_OUTCOME.unavailable) stats.unavailable += 1;
@@ -560,6 +575,11 @@ export function createApprovals({
       const resolution = activePolicy.decide(request);
       if (resolution.remote !== true) {
         approval.cancel("policy", now());
+        try {
+          metrics?.inc?.("approvals.policy_gui");
+        } catch {
+          /* метрики не должны ронять решение */
+        }
         statsFor(APPROVAL_OUTCOME.unavailable);
         record(approval, { outcome: APPROVAL_OUTCOME.unavailable, decision: "gui" });
         const legacy = recordPolicyDecision(request, toolName, resolution);
@@ -599,6 +619,11 @@ export function createApprovals({
         entry.timer = setTimeoutImpl(() => {
           if (entry.settled) return;
           approval.cancel("timeout", now(), outcomeOnTimeout);
+          try {
+            metrics?.inc?.("approvals.timeout");
+          } catch {
+            /* метрики не должны ронять таймаут */
+          }
           statsFor(outcomeOnTimeout);
           record(approval, { outcome: outcomeOnTimeout, decision: "timeout" });
           if (entry.delivered) {
