@@ -12,7 +12,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { DEFAULT_KEEP_ROTATED, DEFAULT_MAX_BYTES as AUDIT_MAX_BYTES } from "../lib/audit.js";
 import { DOCTOR_FAIL_IDS } from "../lib/doctor.js";
+import { DEFAULT_LOG_KEEP, DEFAULT_LOG_MAX_BYTES } from "../lib/reliability.js";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const packageDir = path.dirname(testDir);
@@ -110,4 +112,61 @@ test("SLO сформулированы и измеримы через /remote st
   assert.match(text, /le:\s*2000/, "порог 2 с выражен через бакет гистограммы");
   assert.match(text, /pending/, "SLO про потерю вопросов при рестарте измерим по pending/doctor");
   assert.match(text, /deliveries/, "SLO про доставку измерим по deliveries");
+});
+
+// ---------------------------------------------------------------------------
+// Числа ротации: доки не должны разъезжаться с кодом (033)
+// ---------------------------------------------------------------------------
+
+/** Человеческий размер так, как его пишут доки: «5 МиБ» / «512 КиБ». */
+function human(bytes) {
+  const mib = 1024 * 1024;
+  if (bytes % mib === 0) return `${bytes / mib} МиБ`;
+  return `${bytes / 1024} КиБ`;
+}
+
+function docText(relative) {
+  return fs.readFileSync(path.resolve(packageDir, "..", relative), "utf8");
+}
+
+test("размеры и число ротированных журналов в доках совпадают с кодом", () => {
+  const auditSize = human(AUDIT_MAX_BYTES);
+  const logSize = human(DEFAULT_LOG_MAX_BYTES);
+  assert.equal(auditSize, "5 МиБ", "канон аудита 5 МиБ");
+  assert.equal(logSize, "512 КиБ", "канон лога 512 КиБ");
+  assert.equal(DEFAULT_KEEP_ROTATED, 5);
+  assert.equal(DEFAULT_LOG_KEEP, 5);
+
+  // Доки переносят строки — сравниваем по схлопнутым пробелам.
+  const flat = (text) => text.replace(/\s+/g, " ");
+  const runbook = flat(docText("docs/RUNBOOK.md"));
+  assert.ok(runbook.includes(`аудит — ${auditSize} × ${DEFAULT_KEEP_ROTATED}`), "RUNBOOK: аудит по коду");
+  assert.ok(runbook.includes(`лог — ${logSize} × ${DEFAULT_LOG_KEEP}`), "RUNBOOK: лог по коду");
+
+  const approvals = flat(docText("docs/approvals.md"));
+  assert.ok(approvals.includes(`ротация по ${auditSize} × ${DEFAULT_KEEP_ROTATED}`), "approvals: аудит по коду");
+
+  const readme = flat(docText("dsh-remote/README.md"));
+  assert.ok(readme.includes(auditSize), "README: размер аудита");
+  assert.ok(readme.includes(logSize), "README: размер лога");
+  assert.ok(readme.includes(`**${DEFAULT_LOG_KEEP}**`), "README: число ротированных");
+
+  for (const [name, text] of [
+    ["RUNBOOK", runbook],
+    ["approvals", approvals],
+    ["README", readme],
+  ]) {
+    assert.equal(text.includes("256 КиБ"), false, `${name}: устаревший размер 256 КиБ`);
+  }
+});
+
+test("RUNBOOK честно описывает битый state.json (запись не блокируется)", () => {
+  const runbook = docText("docs/RUNBOOK.md");
+  const section = sections(runbook).find((item) => item.title.toLowerCase().includes("битый `state.json`"));
+  assert.ok(section, "раздел про битый state.json есть");
+  assert.match(section.body, /запись\*\* не блокируется|не блокируется/i, "сказано, что запись не блокируется");
+  assert.match(section.body, /заменит файл дефолтом|заменит.*дефолт/i, "описано, что запись заменит файл");
+  assert.match(section.body, /сначала/i, "совет: сначала сохранить копию");
+  // «Файл из будущего» — по-прежнему блокируется и не перезаписывается.
+  assert.match(section.body, /не перезаписывает/i);
 });

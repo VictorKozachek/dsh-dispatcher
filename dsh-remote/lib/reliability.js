@@ -205,7 +205,13 @@ export function createJsonState({ file, now = () => Date.now(), logger = noop } 
  * `log.jsonl` без секретов: записи — только служебные поля, значения проходят
  * через `redact`, тела вопросов не пишутся. Ротация по размеру (`.1`).
  */
-export function createJournalLog({ file, maxBytes = 5 * 1024 * 1024, keep = 5, now = () => Date.now(), logger = noop } = {}) {
+/** 033: предел журнала плагина (log.jsonl). Аудит живёт по своим пределам. */
+export const DEFAULT_LOG_MAX_BYTES = 512 * 1024;
+
+/** Сколько ротированных файлов журнала храним (`.1`…`.5`). */
+export const DEFAULT_LOG_KEEP = 5;
+
+export function createJournalLog({ file, maxBytes = DEFAULT_LOG_MAX_BYTES, keep = DEFAULT_LOG_KEEP, now = () => Date.now(), logger = noop } = {}) {
   function append(entry) {
     const line = JSON.stringify(redactEntry({ at: now(), ...entry }));
     try {
@@ -273,7 +279,7 @@ export function createReliability({
   repushMs = REPUSH_MS,
   backoffBaseMs = 500,
   backoffMaxMs = 30_000,
-  logMaxBytes = 512 * 1024,
+  logMaxBytes = DEFAULT_LOG_MAX_BYTES,
   tickIntervalMs = 15_000,
   notifyTimeoutMs = 2_000,
   setTimeout: setTimeoutImpl = setTimeout,
