@@ -79,11 +79,10 @@ curl -s -H 'X-Relay-Version: 1' localhost:8080/healthz
 `POST /v1/questions` принимает **только** wrapper `{"question": {...}}`
 (`QuestionPublishRequest`), а `POST /v1/answers` — поля из `AnswerRequest`.
 
-Эти дополнения пока не внесены в контракт 016: его тесты живут в `dsh-remote/`
-(карточка 017 запрещает его менять), а сам 016 в testing. Нужна развязка
-оркестратора — отдельная карточка на контракт (`PROTOCOL.md`/`schema.json`/
-`COMPATIBILITY.md` + тесты) или возврат 016; до этого сервер и README фиксируют
-фактическое поведение.
+Эти дополнения внесены в контракт (карточка 023): `docs/relay/PROTOCOL.md`,
+`schema.json` (`PairingCodeResponse`, путь `/healthz`, query-схемы
+`QuestionQuery`/`AnswerQuery`, `nextId`) и `COMPATIBILITY.md` §2b. Сервер,
+документ и тесты контракта (`node --test dsh-remote/test`) согласованы.
 
 ## Очередь, TTL и повторы
 
