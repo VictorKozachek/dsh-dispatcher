@@ -1,0 +1,23 @@
+{
+  "question": {
+    "id": "b1e2c3d4-0000-4000-8000-000000000010",
+    "shortId": "a1b2c3d4",
+    "workspace": "/home/vic/projects/dsh-dispatcher",
+    "taskId": "016",
+    "role": "worker",
+    "title": "Вопрос агента",
+    "body": "Продолжать?",
+    "options": [
+      {
+        "id": "o1",
+        "label": "Да"
+      },
+      {
+        "id": "o2",
+        "label": "Нет"
+      }
+    ],
+    "createdAt": "2026-11-03T18:00:00Z",
+    "expiresAt": "2026-11-03T18:30:00Z"
+  }
+}
