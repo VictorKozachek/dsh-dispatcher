@@ -120,8 +120,10 @@ export function vacuum(fsImpl, { dir, bases = ["audit.jsonl", "log.jsonl"], keep
       }
     }
     candidates.sort((a, b) => a.index - b.index);
-    // Оставляем файлы с наибольшими индексами (самые свежие ротации).
-    const drop = candidates.slice(0, Math.max(0, candidates.length - effectiveKeep));
+    // Нумерация ротаций: .1 — самая свежая, .N — самая старая (так их двигает
+    // rotateIfNeeded). «Очистка старых» оставляет НАИМЕНЬШИЕ индексы .1..keep,
+    // а удаляет более старые .keep+1…; дырка в нумерации ничего не меняет.
+    const drop = candidates.slice(Math.max(0, effectiveKeep));
     for (const item of candidates) {
       if (drop.includes(item)) {
         if (!dryRun) {

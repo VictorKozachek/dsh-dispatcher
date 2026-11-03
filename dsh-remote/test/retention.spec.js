@@ -80,16 +80,17 @@ test("vacuum --dry-run ничего не удаляет, обычный — ос
 
   const dry = vacuum(fs, { dir, keep: 5, dryRun: true });
   assert.equal(dry.dryRun, true);
-  assert.equal(dry.removed.length, 2 + 0, "audit: удалить .1/.2; log: все 3 в пределах keep");
+  assert.equal(dry.removed.length, 2, "audit: удалить самые старые .6/.7; log: все в пределах keep");
+  assert.deepEqual(dry.removed.map((item) => path.basename(item.path)).sort(), ["audit.jsonl.6", "audit.jsonl.7"]);
   assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.1")), true, "dry-run не удалил");
   assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.7")), true);
 
   const real = vacuum(fs, { dir, keep: 5, dryRun: false });
   assert.equal(real.removed.length, 2);
-  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.1")), false);
-  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.2")), false);
-  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.3")), true, "свежие 5 остались");
-  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.7")), true);
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.1")), true, "самое свежее .1 осталось");
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.5")), true, "оставлены .1..5");
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.6")), false, "старое .6 удалено");
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.7")), false, "самое старое .7 удалено");
   assert.equal(real.freedBytes, 20);
   assert.equal(real.kept.length, 5 + 3);
 });
@@ -167,12 +168,12 @@ test("vacuum видит ротированные файлы с дыркой в �
   fs.writeFileSync(path.join(dir, "audit.jsonl.3"), "b".repeat(20));
 
   const dry = vacuum(fs, { dir, keep: 1, dryRun: true });
-  assert.deepEqual(dry.removed.map((item) => path.basename(item.path)), ["audit.jsonl.2"], "дырка не скрывает .3");
+  assert.deepEqual(dry.removed.map((item) => path.basename(item.path)), ["audit.jsonl.3"], "keep=1: .2 — свежая ротация, .3 — старая");
   assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.2")), true, "dry-run ничего не удалил");
 
   const real = vacuum(fs, { dir, keep: 1, dryRun: false });
-  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.2")), false);
-  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.3")), true, "свежий .3 остался");
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.2")), true, "свежий .2 остался");
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.3")), false, "старый .3 удалён");
   assert.equal(real.kept.length, 1);
 });
 
@@ -220,15 +221,16 @@ test("/remote vacuum: команда работает, --dry-run безопас�
   const dry = await remote.handler(invoke("vacuum --dry-run"));
   assert.equal(dry.kind, "success", dry.text);
   assert.match(dry.text, /--dry-run: будет удалено 2 файлов/);
-  assert.match(dry.text, /audit\.jsonl\.1/);
-  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.1")), true, "dry-run не удалил");
+  assert.match(dry.text, /audit\.jsonl\.6/);
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.6")), true, "dry-run не удалил");
 
   const real = await remote.handler(invoke("vacuum"));
   assert.equal(real.kind, "success", real.text);
   assert.match(real.text, /удалено 2 файлов, освобождено/);
-  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.1")), false);
-  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.2")), false);
-  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.3")), true, "оставлены последние 5");
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.1")), true, "оставлены свежие .1..5");
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.5")), true);
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.6")), false, "старое .6 удалено");
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.7")), false, "старое .7 удалено");
   assert.equal(fs.existsSync(path.join(dir, "log.jsonl.1")), true, "log в пределах keep не тронут");
   assert.match(real.text, /оставлено ротированных файлов: 7/);
 
@@ -288,4 +290,27 @@ test("vacuum: keep=NaN/отрицательный безопасен, bases не
   assert.equal(badBases.kept.length, 7, "log в пределах keep");
 
   assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.1")), true, "dry-run ничего не тронул");
+});
+
+test("vacuum после нескольких ротаций: keep=2 оставляет genN и genN-1", (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "audit.jsonl");
+  const audit = createAudit({ file, maxBytes: 300, keepRotated: 4 });
+  for (let index = 0; index < 60; index += 1) audit.append(entry(index));
+
+  assert.ok(fs.existsSync(`${file}.3`), "ротаций больше двух");
+  const dry = vacuum(fs, { dir, keep: 2, dryRun: true });
+  const keptBefore = dry.kept.filter((item) => path.basename(item.path).startsWith("audit.jsonl.")).map((item) => path.basename(item.path));
+  const removedBefore = dry.removed.map((item) => path.basename(item.path));
+  assert.deepEqual(keptBefore.sort(), ["audit.jsonl.1", "audit.jsonl.2"], "genN и genN-1 — это .1 и .2");
+  assert.deepEqual(removedBefore.sort(), ["audit.jsonl.3", "audit.jsonl.4"].filter((name) => fs.existsSync(path.join(dir, name))));
+  assert.equal(fs.existsSync(`${file}.1`), true, "dry-run не удалил");
+
+  vacuum(fs, { dir, keep: 2 });
+  assert.equal(fs.existsSync(`${file}.1`), true);
+  assert.equal(fs.existsSync(`${file}.2`), true);
+  assert.equal(fs.existsSync(`${file}.3`), false);
+
+  const empty = vacuum(fs, { dir: path.join(dir, "missing"), keep: 2 });
+  assert.deepEqual(empty.removed, [], "нет каталога — не падает");
 });
