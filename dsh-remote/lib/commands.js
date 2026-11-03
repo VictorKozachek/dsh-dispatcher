@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 
 import { createRegistry } from "./domain/registry.js";
 import { credentialRef, createCredentialAccess } from "./store.js";
+import { RELAY_TOKEN_REF } from "./transport/relay.js";
 
 /** Имя ссылки на токен Telegram в `ctx.credentials` (не значение!). */
 export const TELEGRAM_TOKEN_REF = credentialRef("DSH_REMOTE_TELEGRAM_TOKEN");
@@ -544,9 +545,6 @@ export function createRemoteCommands({
   }
 
   async function connect(invocation) {
-    if (!credentials.availableFor(TELEGRAM_TOKEN_REF)) {
-      return failure(`токен неоткуда взять: нет ctx.credentials и нет переменной ${TELEGRAM_TOKEN_REF}`);
-    }
     // Шаги connect спрашиваются локальными вопросами. Если удалённый режим уже
     // включён, ответчик перехватит их и отправит в мессенджер — в том числе
     // вопрос про токен. Поэтому сначала просим выключить.
@@ -561,16 +559,21 @@ export function createRemoteCommands({
 
     let token = null;
     try {
-      const transportAnswer = await askStep(invocation, {
+      // Выбор транспорта — до проверок Telegram: у relay свой токен
+      // (`DSH_REMOTE_RELAY_TOKEN`), и без Telegram-секрета его тоже можно подключить.
+      const choice = await askStep(invocation, {
         id: "remote-connect-transport",
         question: "Какой транспорт подключить?",
         options: ["Telegram", "Relay (свой сервер)", "MAX (пока недоступен)"],
       });
-      if (transportAnswer.selected[0]?.startsWith("MAX") === true) {
+      if (choice.selected[0]?.startsWith("MAX") === true) {
         return failure("MAX пока не поддерживается (фаза 2) — выберите Telegram или Relay");
       }
-      if (transportAnswer.selected[0]?.startsWith("Relay") === true) {
+      if (choice.selected[0]?.startsWith("Relay") === true) {
         return await connectRelay(invocation);
+      }
+      if (!credentials.availableFor(TELEGRAM_TOKEN_REF)) {
+        return failure(`токен неоткуда взять: нет ctx.credentials и нет переменной ${TELEGRAM_TOKEN_REF}`);
       }
 
       const tokenAnswer = await askStep(invocation, {

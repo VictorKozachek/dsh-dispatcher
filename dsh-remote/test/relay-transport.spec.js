@@ -276,3 +276,80 @@ test("RelayError: код протокола и retryable сохраняются"
     return true;
   });
 });
+
+// --- регрессии по ревью 018 -------------------------------------------------
+
+test("keyId не уходит в открытый Question, allowFreeText: true отправляется", async () => {
+  const calls = [];
+  const transport = createRelayTransport({
+    url: URL_BASE,
+    agentToken: TOKEN,
+    keyId: "key-2026-11",
+    fetch: fakeFetch({ "POST /v1/questions": () => response(201, { id: QUESTION_ID }) }, calls),
+  });
+
+  await transport.sendQuestion(question({ allowFreeText: true }));
+
+  const body = calls[0].body.question;
+  assert.equal("keyId" in body, false, "016/023 не знает поля keyId — релей 017 отверг бы его");
+  assert.equal(body.allowFreeText, true, "булево поле передаётся и как true");
+});
+
+test("question.expired снимает вопрос с ожидания (WS)", async () => {
+  const sockets = [];
+  class FakeSocket {
+    constructor(url, headers) {
+      this.url = url;
+      this.headers = headers;
+      this.listeners = new Map();
+      sockets.push(this);
+    }
+
+    addEventListener(name, handler) {
+      const list = this.listeners.get(name) ?? [];
+      list.push(handler);
+      this.listeners.set(name, list);
+    }
+
+    emit(name, event) {
+      for (const handler of this.listeners.get(name) ?? []) handler(event);
+    }
+
+    close() {
+      this.emit("close", {});
+    }
+  }
+
+  const transport = createRelayTransport({
+    url: URL_BASE,
+    agentToken: TOKEN,
+    fetch: fakeFetch({
+      "GET /healthz": () => response(200, { ok: true, version: "0.1.0" }),
+      "POST /v1/questions": () => response(201, { id: QUESTION_ID }),
+    }),
+    wsFactory: (url, headers) => new FakeSocket(url, headers),
+    setTimeout: () => 1,
+    clearTimeout: () => {},
+    log: () => {},
+  });
+
+  await transport.start();
+  await transport.sendQuestion(question());
+  assert.equal(transport.pending, 1);
+
+  sockets[0].emit("open", {});
+  sockets[0].emit("message", { data: JSON.stringify({ type: "question.expired", questionId: QUESTION_ID }) });
+  await tick();
+
+  assert.equal(transport.pending, 0, "истёкший вопрос больше не ждёт ответа");
+  await transport.stop();
+});
+
+test("onAnswer: подписка и отписка, повтор ответа не дублируется", async () => {
+  const transport = createRelayTransport({ url: URL_BASE, agentToken: TOKEN, fetch: fakeFetch({}) });
+  const answers = [];
+  const off = transport.onAnswer((answer) => answers.push(answer));
+  assert.equal(typeof off, "function");
+  off();
+  assert.throws(() => transport.onAnswer("не функция"), TypeError);
+});

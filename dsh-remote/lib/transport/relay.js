@@ -198,8 +198,11 @@ export function createRelayTransport({
     if (typeof question?.body === "string") body.body = question.body;
     if (typeof question?.detail === "string") body.detail = question.detail;
     if (question?.multiSelect === true) body.multiSelect = true;
-    if (question?.allowFreeText === false) body.allowFreeText = false;
-    if (typeof keyId === "string" && keyId !== "") body.keyId = keyId;
+    // 5) allowFreeText — булево поле контракта: отправляем и true, и false.
+    if (typeof question?.allowFreeText === "boolean") body.allowFreeText = question.allowFreeText;
+    // keyId здесь НЕ отправляем: в 016/023 у Question такого поля нет, а релей 017
+    // отвергает неизвестные поля (400). Он нужен только конверту e2e (задача 021),
+    // поэтому живёт в конфиге транспорта и попадёт в `enc`, а не в открытую часть.
     return body;
   }
 
@@ -329,9 +332,17 @@ export function createRelayTransport({
     } catch {
       return;
     }
-    if (event?.type !== "question.answered") return;
     const questionId = event?.questionId;
     if (typeof questionId !== "string") return;
+    if (event?.type === "question.expired") {
+      // Истёкший вопрос больше не ждёт ответа: иначе long-poll продолжил бы его
+      // опрашивать до бесконечности.
+      settled.add(questionId);
+      sent.delete(questionId);
+      safeLog(`relay: вопрос ${questionId} истёк — снимаю с ожидания`);
+      return;
+    }
+    if (event?.type !== "question.answered") return;
     try {
       const answer = await fetchAnswer(questionId);
       if (answer !== null) emit(answer);
