@@ -84,7 +84,7 @@ async fn device(stack: &Server) -> (String, String) {
         .expect("json");
     let device_id = register["deviceId"].as_str().expect("deviceId").to_string();
     let code: Value = client
-        .post(format!("{}/v1/pairing-codes", stack.base))
+        .post(format!("{}/v1/pairing", stack.base))
         .header("authorization", format!("Bearer {AGENT_TOKEN}"))
         .send()
         .await
@@ -646,7 +646,7 @@ async fn pairing_code_is_atomic_under_concurrency() {
         .expect("json");
     let device_id = register["deviceId"].as_str().expect("deviceId").to_string();
     let code: Value = client
-        .post(format!("{}/v1/pairing-codes", stack.base))
+        .post(format!("{}/v1/pairing", stack.base))
         .header("authorization", format!("Bearer {AGENT_TOKEN}"))
         .send()
         .await
@@ -897,10 +897,35 @@ async fn body_version_must_be_one() {
         .expect("версия в теле");
     assert_eq!(device_bad.status(), StatusCode::BAD_REQUEST);
 
+    let pair_bad = client
+        .post(format!("{}/v1/pair", stack.base))
+        .json(&json!({ "pairCode": "123456", "deviceId": "some-device", "version": 2 }))
+        .send()
+        .await
+        .expect("версия в pair");
+    assert_eq!(pair_bad.status(), StatusCode::BAD_REQUEST, "version:2 в pair отвергается");
+
     let mut with_version = question("q-ver00001", "a1b2c3d4");
     with_version["version"] = json!(2);
     let nested_bad = publish(&stack, &client, with_version).await;
     assert_eq!(nested_bad.status(), StatusCode::BAD_REQUEST, "version:2 в вопросе отвергается");
+
+    let (_device_id, token) = device(&stack).await;
+    assert_eq!(publish(&stack, &client, question("q-ver00002", "bbbbcccc")).await.status(), StatusCode::CREATED);
+    let answer_bad = client
+        .post(format!("{}/v1/answers", stack.base))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&json!({
+            "questionId": "q-ver00002",
+            "selected": ["o1"],
+            "answeredAt": now(),
+            "idempotencyKey": "77777777-7777-4777-8777-777777777777",
+            "version": 2,
+        }))
+        .send()
+        .await
+        .expect("версия в ответе");
+    assert_eq!(answer_bad.status(), StatusCode::BAD_REQUEST, "version:2 в AnswerRequest отвергается");
 }
 
 #[tokio::test]
@@ -976,7 +1001,7 @@ async fn pair_code_is_not_burned_by_invalid_device() {
     let stack = spawn().await;
     let client = client();
     let code: Value = client
-        .post(format!("{}/v1/pairing-codes", stack.base))
+        .post(format!("{}/v1/pairing", stack.base))
         .header("authorization", format!("Bearer {AGENT_TOKEN}"))
         .send()
         .await

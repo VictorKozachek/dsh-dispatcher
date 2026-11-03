@@ -139,13 +139,17 @@ pub async fn create_device(
         .fetch_one(pool)
         .await?;
     let device = device_from_row(&row);
-    if created {
-        sqlx::query("UPDATE devices SET push_token = ?1, label = ?2 WHERE id = ?3")
-            .bind(push_token)
-            .bind(label)
-            .bind(&device.id)
-            .execute(pool)
-            .await?;
+    // Идемпотентный повтор обновляет только переданные метаданные: клиент
+    // может прислать новый pushToken, не создавая второе устройство.
+    if push_token.is_some() || label.is_some() {
+        sqlx::query(
+            "UPDATE devices SET push_token = COALESCE(?1, push_token), label = COALESCE(?2, label) WHERE id = ?3",
+        )
+        .bind(push_token)
+        .bind(label)
+        .bind(&device.id)
+        .execute(pool)
+        .await?;
     }
     Ok((device, created))
 }

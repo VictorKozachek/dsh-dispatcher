@@ -148,7 +148,7 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/devices", post(routes::create_device))
         .route("/v1/devices/{id}", delete(routes::delete_device))
         .route("/v1/pair", post(routes::pair))
-        .route("/v1/pairing-codes", post(routes::create_pairing_code))
+        .route("/v1/pairing", post(routes::create_pairing_code))
         .route(
             "/v1/questions",
             post(routes::publish_question).get(routes::list_questions),

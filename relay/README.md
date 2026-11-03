@@ -51,7 +51,7 @@ curl -s -H 'X-Relay-Version: 1' localhost:8080/healthz
 | `GET /v1/health` | без авторизации | `{ok, version, at, devices}` |
 | `POST /v1/devices` | без авторизации | регистрация устройства (`platform`, `publicKey`), идемпотентно по паре |
 | `DELETE /v1/devices/{id}` | агент или само устройство | отзыв: токен перестаёт работать, WS-сессии закрываются |
-| `POST /v1/pairing-codes` | агент | создать одноразовый `pairCode` (TTL 10 минут) и показать человеку |
+| `POST /v1/pairing` | агент | создать одноразовый `pairCode` (TTL 10 минут) и показать человеку |
 | `POST /v1/pair` | без авторизации | подтвердить код → `deviceToken` |
 | `POST /v1/questions` | агент | опубликовать вопрос (открытый или e2e) |
 | `GET /v1/questions?since=&limit=&wait=` | устройство | вопросы; `wait` — long-poll вместо WS |
@@ -64,7 +64,7 @@ curl -s -H 'X-Relay-Version: 1' localhost:8080/healthz
 
 Всё перечисленное — новые пути/параметры под `/v1`, совместимость не ломают:
 
-- `POST /v1/pairing-codes` — плагину нужен способ получить код, который он покажет
+- `POST /v1/pairing` — плагину нужен способ получить код, который он покажет
   человеку; в 016 описан только `POST /v1/pair`, который код **принимает**.
 - `?wait=<сек>` у `GET /v1/questions` и `GET /v1/answers` — long-poll fallback для
   устройства без WebSocket (016 требует лишь WS).
@@ -79,10 +79,9 @@ curl -s -H 'X-Relay-Version: 1' localhost:8080/healthz
 `POST /v1/questions` принимает **только** wrapper `{"question": {...}}`
 (`QuestionPublishRequest`), а `POST /v1/answers` — поля из `AnswerRequest`.
 
-Документ `docs/relay/PROTOCOL.md` (задача 016) эти аддитивные дополнения пока не
-описывает: карточка 017 запрещает менять `dsh-remote/` (где лежат тесты контракта),
-поэтому обновление контракта 016 вынесено отдельной карточкой; сервер и README
-фиксируют фактическое поведение.
+Эти дополнения внесены в контракт 016 (`docs/relay/PROTOCOL.md`,
+`schema.json`, `COMPATIBILITY.md`) — набор эндпоинтов и тесты контракта
+(`node --test dsh-remote/test`) согласованы с сервером.
 
 ## Очередь, TTL и повторы
 

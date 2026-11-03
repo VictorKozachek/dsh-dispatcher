@@ -52,14 +52,27 @@
 |---|---|---|---|
 | `POST /v1/devices` | зарегистрировать устройство | `DeviceCreateRequest` | `201` + `Device` |
 | `DELETE /v1/devices/{id}` | отозвать устройство (токен сразу недействителен) | — | `204` |
+| `POST /v1/pairing` | плагин получает одноразовый `pairCode` (TTL 10 минут) для показа человеку | — (Bearer агента) | `201` + `{pairCode, expiresAt}` |
 | `POST /v1/pair` | подтвердить привязку по `pairCode` | `PairRequest` | `200` + `PairResponse` |
 | `POST /v1/questions` | опубликовать вопрос (плагин) | `QuestionPublishRequest` | `201` + `QuestionResponse` |
-| `GET /v1/questions?since=<rfc3339>&limit=<n>` | вопросы после `since` (курсор — `nextSince`) | — | `200` + `QuestionList` |
+| `GET /v1/questions?since=<rfc3339>&sinceId=<id>&limit=<n>&wait=<сек>` | вопросы после курсора; `wait` — long-poll до 25 с | — | `200` + `QuestionList` |
 | `POST /v1/answers` | ответ человека; идемпотентно по `idempotencyKey` | `AnswerRequest` | `201` + `Answer`; повтор — `200` + тот же `Answer` |
-| `GET /v1/answers?questionId=<id>` | ответ на вопрос (плагин) | — | `200` + `Answer` |
+| `GET /v1/answers?questionId=<id>&wait=<сек>` | ответ на вопрос (плагин); `wait` — long-poll до 25 с | — | `200` + `Answer` |
 | `GET /v1/events` | поток событий: WebSocket upgrade; без upgrade — `426` | — | WS; текстовые кадры — `Event` |
-| `GET /v1/health` | живость релея | — | `200` + `Health` |
+| `GET /v1/health` | живость релея; счётчики `devices`/`questions`/`answers` — аддитивные поля | — | `200` + `Health` |
+| `GET /healthz` | алиас `/v1/health` для liveness-проб (вне `/v1`, без авторизации) | — | `200` + `Health` |
 | `POST /v1/heartbeat` | устройство живо (интервал 30 с) | — | `204` |
+
+**Курсор пагинации:** `QuestionList` содержит `nextSince` (`createdAt` последнего
+вопроса) и аддитивное `nextId` (его id). Следующая страница запрашивается с
+`since=<nextSince>&sinceId=<nextId>` — так страницы не теряются и не дублируются,
+даже если у вопросов одинаковый `createdAt` (пачка из `ask_user_question`).
+`wait` у `questions`/`answers` — long-poll для устройства без WebSocket; сервер
+отвечает сразу, если данные уже есть, иначе держит соединение до `wait` секунд.
+
+**`version` в теле:** необязательное поле `version` (в `DeviceCreateRequest`,
+`PairRequest`, `Question`, `AnswerRequest`) допускает только значение `1`; иное —
+`400 bad-request`. Заголовок `X-Relay-Version` при этом всё равно обязателен.
 
 **Heartbeat/ping:** в WebSocket — ping-кадр каждые 25 с; если pong не пришёл за 10 с,
 соединение закрывается кодом `1001`, клиент переподключается с экспоненциальной

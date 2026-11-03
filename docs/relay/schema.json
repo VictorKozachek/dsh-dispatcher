@@ -60,6 +60,12 @@
         "request": null,
         "response": null
       }
+    },
+    "/v1/pairing": {
+      "post": {
+        "request": null,
+        "response": null
+      }
     }
   },
   "components": {

@@ -269,9 +269,6 @@ pub async fn pair(State(state): State<AppState>, Json(body): Json<Value>) -> Res
     if let Err(reason) = validate_body_version(&body) {
         return bad_request(&reason);
     }
-    if let Err(reason) = validate_body_version(&body) {
-        return bad_request(&reason);
-    }
     let code = body.get("pairCode").and_then(Value::as_str).unwrap_or("");
     let device_id = body.get("deviceId").and_then(Value::as_str).unwrap_or("");
     if code.len() != 6 || !code.chars().all(|ch| ch.is_ascii_digit()) {
@@ -696,6 +693,9 @@ pub async fn answer(
             "version",
         ],
     ) {
+        return bad_request(&reason);
+    }
+    if let Err(reason) = validate_body_version(&body) {
         return bad_request(&reason);
     }
     if let Err(reason) = validate_answer(&body) {
