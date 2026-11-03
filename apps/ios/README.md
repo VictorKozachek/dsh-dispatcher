@@ -64,7 +64,7 @@ TMPDIR="$PWD/.build/tmp" CLANG_MODULE_CACHE_PATH="$PWD/.build/modulecache" \
 cd apps/ios && swift test
 ```
 
-15 юнит-тестов, сеть не нужна (фейковый `RelayAPI`, `URLProtocol` для
+19 юнит-тестов, сеть не нужна (фейковый `RelayAPI`, `URLProtocol` для
 `RelayClient`, временные файлы, in-memory Keychain):
 
 - загрузка показывает только открытые вопросы;
@@ -79,7 +79,11 @@ cd apps/ios && swift test
   (101 вопрос = 2 страницы), `404` — это «ответа нет», `5xx` — `RelayClientError.api`;
 - `question.created` потоком обновляет список без pull-to-refresh;
 - **закрытые вопросы переживают перезапуск** (файл `closed-questions.json`);
-- парсинг WS-событий;
+- **WebSocket-URL**: `http → ws`, `https → wss`, порт/базовый путь сохраняются
+  (`http://127.0.0.1:8080 → ws://127.0.0.1:8080/v1/events`); чтение событий из
+  инжектируемого сокета с заголовками `Authorization`/`X-Relay-Version`;
+- неретраибельный ответ (401/403/409) снимается с очереди с сообщением «нужны
+  действия», а не повторяется вечно;
 - привязка кладёт токен в Keychain, а не рядом с URL/deviceId; `unpair` чистит.
 
 ## Что внутри
@@ -87,7 +91,7 @@ cd apps/ios && swift test
 | Файл | Роль |
 |---|---|
 | `Sources/RelayKit/Models.swift` | `RelayQuestion`, `RelayAnswer` (с `idempotencyKey`), `RelayPairing`, `RelayAPIError` |
-| `Sources/RelayKit/RelayClient.swift` | HTTP (`URLSession`) + WebSocket (`URLSessionWebSocketTask`) с `Authorization` и `X-Relay-Version: 1`, переподключение с backoff 1→30 с |
+| `Sources/RelayKit/RelayClient.swift` | HTTP (`URLSession`) + WebSocket (`URLSessionWebSocketTask`) с `Authorization` и `X-Relay-Version: 1`; WS-URL собирается заменой схемы (`http→ws`, `https→wss`), переподключение с backoff 1→30 с |
 | `Sources/RelayKit/QuestionsViewModel.swift` | состояние экранов, ответ через очередь, события потока |
 | `Sources/RelayKit/OfflineQueue.swift` | файловая очередь ответов (`Application Support/pending-answers.json`), переживает перезапуск |
 | `Sources/RelayKit/ClosedStore.swift` | файл закрытых вопросов (`closed-questions.json`) — вкладка «Закрытые» не пустеет после рестарта |
@@ -107,7 +111,7 @@ cd apps/ios && swift test
    `POST /v1/answers`; при ошибке остаётся в очереди и повторяется при следующем
    запуске/восстановлении сети. Повтор с тем же ключом сервер считает тем же
    ответом (`200`), дубля нет.
-4. **Поток:** WebSocket `GET /v1/events` в foreground; `question.created`
+4. **Поток:** WebSocket `GET /v1/events` (URL с `ws://`/`wss://`: та же схема-замена, что в `RelayClient.webSocketURL`), в foreground; `question.created`
    обновляет список, ответ из другого канала (`question.answered`) закрывает
    вопрос, `question.expired` переносит в закрытые. При разрыве — переподключение
    с backoff 1→30 с (счётчик сбрасывается после первого сообщения); ping/pong
@@ -126,3 +130,12 @@ cd apps/ios && swift test
   через сервер (`DELETE /v1/devices/{id}`), в MVP-экране не автоматизирован.
 - **Нет APNs-токена** — `registerDevice` отправляет только публичный ключ;
   `pushToken` появится вместе с APNs.
+- **`GET /v1/answers` — agent-only:** релей требует токен агента, `deviceToken`
+  получает `403`. Приложение этот метод не зовёт (ответ приходит событием +
+  `POST /v1/answers`); в клиенте он оставлен для симметрии контракта и помечен.
+- **Отвязка не отзывает устройство на релее:** `unpair` чистит Keychain и
+  локальную привязку, но `DELETE /v1/devices/{id}` не вызывает; каждая повторная
+  привязка создаёт новое устройство (новый `publicKey`). Для MVP принято, отзыв —
+  через сервер/`/remote disconnect` на стороне плагина.
+- **Backoff WS сбрасывается на первом сообщении**, а не на `open`:
+  `URLSessionWebSocketTask` не даёт события открытия; для MVP это некритично.

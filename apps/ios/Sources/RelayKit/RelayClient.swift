@@ -26,6 +26,16 @@ public protocol RelayAPI: Sendable {
     func events() -> AsyncStream<RelayEvent>
 }
 
+/// Сокет, который нужен клиенту: обёртка над `URLSessionWebSocketTask`,
+/// подменяемая в тестах (реальный WS не нужен).
+public protocol RelaySocket: AnyObject, Sendable {
+    func resume()
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?)
+    func receive() async throws -> URLSessionWebSocketTask.Message
+}
+
+extension URLSessionWebSocketTask: RelaySocket {}
+
 /// Клиент релея: Bearer-токен устройства, заголовок версии, JSON.
 public final class RelayClient: RelayAPI, @unchecked Sendable {
     public static let protocolVersion = "1"
@@ -33,17 +43,38 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
     private let baseURL: URL
     private let tokenProvider: @Sendable () -> String?
     private let session: URLSession
+    private let socketFactory: (@Sendable (URLRequest) -> RelaySocket)?
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
     public init(
         baseURL: URL,
         tokenProvider: @escaping @Sendable () -> String?,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        socketFactory: (@Sendable (URLRequest) -> RelaySocket)? = nil
     ) {
         self.baseURL = baseURL
         self.tokenProvider = tokenProvider
         self.session = session
+        self.socketFactory = socketFactory
+    }
+
+    /// WebSocket-URL из базового HTTP(S): `http → ws`, `https → wss`.
+    /// `appendingPathComponent` + `ws`-схема недопустимы для `URLRequest` сокета.
+    public static func webSocketURL(from baseURL: URL) -> URL? {
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        switch components.scheme?.lowercased() {
+        case "https": components.scheme = "wss"
+        case "http": components.scheme = "ws"
+        case "wss", "ws": break
+        default: return nil
+        }
+        var path = components.path
+        if !path.hasSuffix("/") { path += "/" }
+        components.path = path + "v1/events"
+        return components.url
     }
 
     // MARK: - Привязка
@@ -100,6 +131,8 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
         return collected
     }
 
+    /// Agent-only: `GET /v1/answers` требует токен агента (deviceToken → 403).
+    /// Приложение его не вызывает; оставлен для симметрии контракта.
     public func answer(questionId: String) async throws -> RelayAnswer? {
         do {
             let data = try await request(
@@ -151,12 +184,16 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
     private func socketEvents(onConnected: @escaping @Sendable () -> Void) -> AsyncThrowingStream<RelayEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
-                var request = URLRequest(url: baseURL.appendingPathComponent("v1/events"))
+                guard let wsURL = Self.webSocketURL(from: baseURL) else {
+                    continuation.finish(throwing: RelayClientError.invalidResponse("URL релея не http(s)"))
+                    return
+                }
+                var request = URLRequest(url: wsURL)
                 request.setValue("1", forHTTPHeaderField: "x-relay-version")
                 if let token = tokenProvider() {
                     request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
                 }
-                let socket = session.webSocketTask(with: request)
+                let socket: RelaySocket = socketFactory?(request) ?? session.webSocketTask(with: request)
                 socket.resume()
                 defer { socket.cancel(with: .goingAway, reason: nil) }
                 while !Task.isCancelled {

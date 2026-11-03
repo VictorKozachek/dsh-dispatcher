@@ -453,3 +453,90 @@ extension RelayClientTests {
         XCTAssertTrue((StubURLProtocol.requests[1].url?.query ?? "").contains("sinceId=q-99"))
     }
 }
+
+// MARK: - WebSocket: схема URL и чтение событий
+
+final class FakeSocket: RelaySocket, @unchecked Sendable {
+    private let messages: [URLSessionWebSocketTask.Message]
+    private let lock = NSLock()
+    private var index = 0
+    private(set) var resumed = false
+
+    init(messages: [URLSessionWebSocketTask.Message]) {
+        self.messages = messages
+    }
+
+    func resume() { resumed = true }
+
+    func cancel(with closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {}
+
+    func receive() async throws -> URLSessionWebSocketTask.Message {
+        let next: URLSessionWebSocketTask.Message? = lock.withLock {
+            guard index < messages.count else { return nil }
+            defer { index += 1 }
+            return messages[index]
+        }
+        if let next { return next }
+        throw URLError(.networkConnectionLost)
+    }
+}
+
+extension RelayClientTests {
+    func testWebSocketURLReplacesScheme() {
+        let http = RelayClient.webSocketURL(from: URL(string: "http://127.0.0.1:8080")!)
+        XCTAssertEqual(http?.absoluteString, "ws://127.0.0.1:8080/v1/events")
+
+        let https = RelayClient.webSocketURL(from: URL(string: "https://relay.example/base")!)
+        XCTAssertEqual(https?.absoluteString, "wss://relay.example/base/v1/events")
+
+        XCTAssertNil(RelayClient.webSocketURL(from: URL(string: "ftp://relay.example")!))
+    }
+
+    func testEventsReadFromFakeSocketWithHeaders() async {
+        let socket = FakeSocket(messages: [
+            .string(#"{"type":"question.created","questionId":"q-1"}"#),
+            .string(#"{"type":"question.answered","questionId":"q-1"}"#),
+        ])
+        let client = RelayClient(
+            baseURL: URL(string: "http://127.0.0.1:8080")!,
+            tokenProvider: { "token-1" },
+            session: makeStubSession(),
+            socketFactory: { request in
+                XCTAssertEqual(request.url?.absoluteString, "ws://127.0.0.1:8080/v1/events")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "authorization"), "Bearer token-1")
+                XCTAssertEqual(request.value(forHTTPHeaderField: "x-relay-version"), "1")
+                return socket
+            }
+        )
+
+        var events: [RelayEvent] = []
+        for await event in client.events() {
+            events.append(event)
+            if events.count == 2 { break }
+        }
+
+        XCTAssertEqual(events, [.questionCreated(questionId: "q-1"), .questionAnswered(questionId: "q-1")])
+        XCTAssertTrue(socket.resumed)
+    }
+
+    @MainActor
+    func testNonRetryableAnswerIsRemovedFromQueueWithAction() async {
+        let api = FakeRelayAPI()
+        api.answerResult = .failure(RelayClientError.api(status: 409, code: "conflict", message: "конфликт"))
+        let queue = tempQueue()
+        let viewModel = QuestionsViewModel(api: api, queue: queue)
+        try? queue.enqueue(RelayAnswer(
+            questionId: "q-1",
+            selected: ["o1"],
+            custom: nil,
+            answeredAt: "2026-11-03T18:00:00Z",
+            idempotencyKey: "key-1"
+        ))
+
+        await viewModel.flushQueue()
+
+        XCTAssertEqual(queue.count, 0, "неретраибельный ответ снят с очереди")
+        XCTAssertNotNil(viewModel.errorText)
+        XCTAssertTrue(viewModel.errorText?.contains("нужны действия") ?? false)
+    }
+}

@@ -87,9 +87,13 @@ public final class QuestionsViewModel: ObservableObject {
                 _ = try await api.send(item.answer)
                 try? queue.remove(questionId: item.answer.questionId)
             } catch {
-                try? queue.markFailed(questionId: item.answer.questionId, error: Self.describe(error))
                 if (error as? RelayClientError)?.isRetryable == false {
-                    errorText = "релей отклонил ответ: \(Self.describe(error))"
+                    // Неретраибельный отказ (401/403/409): держать в очереди и
+                    // повторять вечно бессмысленно — снимаем и просим действия.
+                    try? queue.remove(questionId: item.answer.questionId)
+                    errorText = "релей отклонил ответ, нужны действия: \(Self.describe(error))"
+                } else {
+                    try? queue.markFailed(questionId: item.answer.questionId, error: Self.describe(error))
                 }
             }
         }
