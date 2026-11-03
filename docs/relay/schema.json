@@ -30,7 +30,8 @@
       },
       "get": {
         "request": null,
-        "response": "#/components/schemas/QuestionList"
+        "response": "#/components/schemas/QuestionList",
+        "query": "#/components/schemas/QuestionQuery"
       }
     },
     "/v1/answers": {
@@ -40,7 +41,8 @@
       },
       "get": {
         "request": null,
-        "response": "#/components/schemas/Answer"
+        "response": "#/components/schemas/Answer",
+        "query": "#/components/schemas/AnswerQuery"
       }
     },
     "/v1/events": {
@@ -59,6 +61,18 @@
       "post": {
         "request": null,
         "response": null
+      }
+    },
+    "/v1/pairing": {
+      "post": {
+        "request": null,
+        "response": "#/components/schemas/PairingCodeResponse"
+      }
+    },
+    "/healthz": {
+      "get": {
+        "request": null,
+        "response": "#/components/schemas/Health"
       }
     }
   },
@@ -406,6 +420,10 @@
           },
           "nextSince": {
             "$ref": "#/components/schemas/Timestamp"
+          },
+          "nextId": {
+            "type": "string",
+            "maxLength": 64
           }
         }
       },
@@ -758,6 +776,66 @@
           },
           "version": {
             "$ref": "#/components/schemas/Version"
+          }
+        }
+      },
+      "PairingCodeResponse": {
+        "description": "Одноразовый код привязки, который плагин показывает человеку.",
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "pairCode",
+          "expiresAt"
+        ],
+        "properties": {
+          "pairCode": {
+            "type": "string",
+            "pattern": "^[0-9]{6}$"
+          },
+          "expiresAt": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        }
+      },
+      "QuestionQuery": {
+        "description": "Query-параметры GET /v1/questions (все необязательные).",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "since": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "sinceId": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 64
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "wait": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 25
+          }
+        }
+      },
+      "AnswerQuery": {
+        "description": "Query-параметры GET /v1/answers (все необязательные).",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "questionId": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 64
+          },
+          "wait": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 25
           }
         }
       }
