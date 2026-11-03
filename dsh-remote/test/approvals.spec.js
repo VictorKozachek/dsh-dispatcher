@@ -9,7 +9,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { APPROVAL_REQUEST_EVENT, createApprovals } from "../lib/approvals.js";
+import { createAudit } from "../lib/audit.js";
 import { APPROVAL_OUTCOME, RemoteApproval } from "../lib/domain/approval.js";
 import { features } from "../lib/features.js";
 
@@ -85,11 +90,12 @@ function request(overrides = {}) {
   };
 }
 
-function setup({ enabled = true, transport = fakeTransport(), requestOverride = {} } = {}) {
+function setup({ enabled = true, transport = fakeTransport(), requestOverride = {}, audit = null } = {}) {
   const registry = { resolve: () => ({ enabled, scope: enabled ? "global" : null }) };
   const approvals = createApprovals({
     transport,
     registry,
+    audit,
     now: () => 1_700_000_000_000,
     log: () => {},
   });
@@ -404,4 +410,134 @@ test("снятие плагина отвечает cancelled на открыты
 
   assert.equal(await pendingOutcome, "cancelled");
   assert.equal(transport.closed[0].summary, "Снято");
+});
+
+/** Журнал во временном каталоге + чтение строк. */
+function auditInTemp(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-approvals-audit-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "audit.jsonl");
+  const audit = createAudit({ file, now: () => 1_700_000_000_000 });
+  return { audit, file, read: () => (fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : []) };
+}
+
+test("аудит: удалённое решение пишется с каналом, исходом и временем ожидания", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const { approvals, transport, next } = setup({ audit });
+
+  const pendingOutcome = approvals.handler(request({ reason: "rm -rf /tmp/project" }), next);
+  await tick();
+  transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"], answeredBy: "user-7" });
+  await pendingOutcome;
+
+  const [record] = read();
+  assert.equal(record.kind, "approval");
+  assert.equal(record.toolName, "Bash");
+  assert.equal(record.callId, "call-42");
+  assert.equal(record.outcome, "allowed-once");
+  assert.equal(record.decision, "remote");
+  assert.equal(record.channel, "fake");
+  assert.equal(record.answeredBy, "user-7");
+  assert.equal(record.sessionId, "session-1");
+  assert.equal(record.waitedMs, 0);
+  assert.equal(JSON.stringify(record).includes("rm -rf"), false, "тело команды в журнал не попадает");
+});
+
+test("аудит: отданное GUI подтверждение видно как decision=gui", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const transport = fakeTransport({ failSend: true });
+  const { approvals, next } = setup({ transport, audit });
+
+  const outcome = await approvals.handler(request(), next);
+
+  assert.equal(outcome, "gui");
+  const [record] = read();
+  assert.equal(record.decision, "gui");
+  assert.equal(record.outcome, "unavailable");
+  assert.equal(record.toolName, "Bash");
+});
+
+test("аудит: снятое без ответа подтверждение — decision=timeout, outcome=cancelled", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const { approvals, transport, next } = setup({ audit });
+  const controller = new AbortController();
+
+  const pendingOutcome = approvals.handler(request({ signal: controller.signal }), next);
+  await tick();
+  controller.abort();
+  await pendingOutcome;
+
+  const [record] = read();
+  assert.equal(record.decision, "timeout");
+  assert.equal(record.outcome, "cancelled");
+  assert.equal(record.channel, "fake", "канал, где осталось сообщение, виден в журнале");
+  assert.equal(transport.sent.length, 1);
+});
+
+test("аудит: dispose снимает открытые подтверждения и пишет timeout", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const { approvals, next } = setup({ audit });
+
+  const pendingOutcome = approvals.handler(request(), next);
+  await tick();
+  approvals.dispose("detached");
+  await pendingOutcome;
+
+  const records = read();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].decision, "timeout");
+  assert.equal(records[0].outcome, "cancelled");
+});
+
+test("аудит: транспорт без sendQuestion — decision=gui, запрос не отправлен", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const transport = { id: "no-send", onAnswer: () => () => {} };
+  const { approvals, next, nextCalls } = setup({ transport, audit });
+
+  const outcome = await approvals.handler(request(), next);
+
+  assert.equal(outcome, "gui");
+  assert.equal(nextCalls.length, 1);
+  const [record] = read();
+  assert.equal(record.decision, "gui");
+  assert.equal(record.outcome, "unavailable");
+  assert.equal(record.toolName, "Bash");
+  assert.equal(record.sessionId, "session-1", "синтетическая запись несёт маркировку сессии");
+});
+
+test("аудит: транспорт без onAnswer — decision=gui, в журнале и в статусе", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const transport = {
+    id: "no-answers",
+    sent: [],
+    async sendQuestion(question) {
+      transport.sent.push(question);
+    },
+    async closeQuestion() {},
+  };
+  const { approvals, next } = setup({ transport, audit });
+
+  const outcome = await approvals.handler(request(), next);
+
+  assert.equal(outcome, "gui");
+  assert.equal(transport.sent.length, 0, "подтверждение без канала ответа не отправляем");
+  const [record] = read();
+  assert.equal(record.decision, "gui");
+  assert.equal(record.outcome, "unavailable");
+  assert.equal(record.callId, "call-42");
+});
+
+test("аудит: аборт на входе — decision=timeout, outcome=cancelled", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const { approvals, next } = setup({ audit });
+  const controller = new AbortController();
+  controller.abort();
+
+  const outcome = await approvals.handler(request({ signal: controller.signal }), next);
+
+  assert.equal(outcome, "cancelled");
+  const [record] = read();
+  assert.equal(record.decision, "timeout");
+  assert.equal(record.outcome, "cancelled");
+  assert.equal(record.toolName, "Bash");
 });

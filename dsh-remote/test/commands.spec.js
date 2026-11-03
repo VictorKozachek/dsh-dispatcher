@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { createStore } from "../lib/store.js";
+import { createAudit } from "../lib/audit.js";
 import { commandsFeature } from "../lib/features/commands.js";
 import { telegramFeature } from "../lib/features/telegram.js";
 import { answererFeature } from "../lib/features/answerer.js";
@@ -1367,4 +1368,68 @@ test("connect relay: неверный токен отвергается авто
   assert.equal(stand.store.read().bindings, null, "binding не сохранён");
   assert.equal(stand.credentials.calls.some(([method, ref]) => method === "set" && ref === RELAY_TOKEN_REF), false, "неверный токен не записан");
   assert.equal(result.text.includes(RELAY_TOKEN), false, "токен не напечатан");
+});
+
+/** Записать решения в журнал стенда (тот же каталог, что state.json). */
+function writeAudit(stand, entries) {
+  const audit = createAudit({ file: path.join(stand.dir, "audit.jsonl"), now: () => START_MS });
+  for (const entry of entries) audit.append(entry);
+}
+
+const AUDIT_REMOTE = {
+  kind: "approval",
+  questionId: "a-1",
+  toolName: "Bash",
+  callId: "call-1",
+  outcome: "allowed-once",
+  channel: "telegram",
+  answeredBy: "user-7",
+  waitedMs: 4_000,
+  decision: "remote",
+};
+const AUDIT_GUI = { ...AUDIT_REMOTE, questionId: "a-2", toolName: "Write", outcome: "unavailable", decision: "gui" };
+const AUDIT_TIMEOUT = { ...AUDIT_REMOTE, questionId: "a-3", toolName: "Edit", outcome: "cancelled", decision: "timeout" };
+
+test("/remote audit на пустом журнале отвечает справкой, а не падает", async (t) => {
+  const stand = harness(t);
+
+  const result = await stand.remote.handler(invoke("audit"));
+
+  assert.equal(result.kind, "success");
+  assert.match(result.text, /журнал подтверждений пуст/);
+});
+
+test("/remote audit N показывает последние решения без секретов", async (t) => {
+  const stand = harness(t);
+  writeAudit(stand, [AUDIT_REMOTE, AUDIT_GUI, AUDIT_TIMEOUT]);
+
+  const result = await stand.remote.handler(invoke("audit 2"));
+
+  assert.equal(result.kind, "success");
+  assert.match(result.text, /Последние 2 из 3 решений/);
+  assert.match(result.text, /Write/);
+  assert.match(result.text, /GUI/);
+  assert.match(result.text, /Edit/);
+  assert.match(result.text, /таймаут/);
+  assert.equal(/Bash/.test(result.text), false, "самое старое решение не попало в хвост из двух");
+});
+
+test("/remote audit: некорректный N — ошибка без стека", async (t) => {
+  const stand = harness(t);
+  writeAudit(stand, [AUDIT_REMOTE]);
+
+  const result = await stand.remote.handler(invoke("audit ноль"));
+
+  assert.equal(result.kind, "error");
+  assert.match(result.text, /usage: \/remote audit/);
+});
+
+test("status: сводка по подтверждениям — удалённо/GUI/без ответа", async (t) => {
+  const stand = harness(t);
+  writeAudit(stand, [AUDIT_REMOTE, AUDIT_GUI, AUDIT_TIMEOUT]);
+
+  const result = await stand.remote.handler(invoke("status"));
+
+  assert.equal(result.kind, "success");
+  assert.match(result.text, /подтверждения: удалённо 1, в GUI 1, без ответа 1 \(всего 3\)/);
 });

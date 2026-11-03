@@ -13,6 +13,7 @@
  */
 
 import { createApprovals } from "../approvals.js";
+import { createAudit } from "../audit.js";
 import { createRegistry } from "../domain/registry.js";
 import { resolveChannel } from "../store.js";
 
@@ -62,10 +63,18 @@ export const approvalsFeature = {
       if (transports.length <= 1) transports = null;
     }
 
+    // Аудит решений (026): `audit.jsonl` рядом с state.json; путь можно
+    // переопределить через DSH_REMOTE_AUDIT (тесты).
+    const audit = createAudit({
+      ...(typeof store?.paths?.dir === "string" && store.paths.dir !== "" ? { dir: store.paths.dir } : {}),
+      log: (message) => deps.logger.debug(message),
+    });
+
     const approvals = createApprovals({
       transport: deps.get(TRANSPORT_SERVICE),
       transports,
       registry,
+      audit,
       // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
       channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
       log: (message) => deps.logger.debug(message),
