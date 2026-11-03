@@ -1,0 +1,7 @@
+{
+  "platform": "ios",
+  "publicKey": "base64:Zm9vYmFyYmF6cXV1eC1wdWJsaWMta2V5LTAxMjM0NTY3ODk=",
+  "pushToken": "apns:0123456789abcdef",
+  "label": "iPhone Виктора",
+  "version": 1
+}

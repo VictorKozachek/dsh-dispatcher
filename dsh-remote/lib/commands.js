@@ -22,6 +22,9 @@
  * при чтении — как в реестре задачи 002: сессия → воркспейс → глобально.
  */
 
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { createRegistry } from "./domain/registry.js";
 import { credentialRef, createCredentialAccess } from "./store.js";
 
@@ -43,11 +46,205 @@ const HELP_TEXT = [
   "  /remote connect    — привязать бота (пошагово, локальными вопросами)",
   "  /remote on|off     — включить/выключить для этого проекта",
   "    --all            — для всех проектов, --session — только для этой сессии",
+  "    --hybrid         — гибрид: вопрос уходит в GUI, если в мессенджере молчат N секунд",
+  "    --no-hybrid      — выключить гибридный режим",
   "  /remote status     — привязка, режим, источник токена",
   "  /remote test       — отправить тестовый вопрос в мессенджер",
   "  /remote who        — сессия, воркспейс и эффективный режим",
+  "  /remote doctor     — проверка привязки, канала и состояния (ok/warn/fail)",
+  "  /remote channel <проект> <chatId> [threadId] — канал проекта (топик форума)",
+  "    --force          — если бот действительно в другом чате (чужой чат иначе отвергается)",
+  "    --transport=<id> — канал для конкретного канала (telegram, max); по умолчанию — транспорт привязки",
+  "  /remote channel list — какие каналы у каких проектов",
+  "  /remote channel remove <проект> — вернуть проект в общий чат",
   "  /remote disconnect — отвязать бота и выключить режим",
 ].join("\n");
+
+/**
+ * Версия плагина из `package.json` (для `doctor`).
+ * @returns строка версии или null.
+ */
+export function readPluginVersion() {
+  try {
+    const file = fileURLToPath(new URL("../package.json", import.meta.url));
+    const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+    return typeof pkg.version === "string" && pkg.version !== "" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Отчёт `doctor` человеческим текстом: пункт, деталь и что делать.
+ * @param checks - список `{level: ok|warn|fail, title, detail, hint?}`.
+ * @returns текст для команды.
+ */
+export function formatDoctorReport(checks) {
+  const list = Array.isArray(checks) ? checks : [];
+  const lines = list.map((check) => {
+    const head = `[${check.level}] ${check.title}: ${check.detail ?? ""}`;
+    return check.hint === undefined || check.hint === "" ? head : `${head}\n      → ${check.hint}`;
+  });
+  const failed = list.filter((check) => check.level === "fail").length;
+  const warned = list.filter((check) => check.level === "warn").length;
+  const summary = failed > 0
+    ? `есть проблемы: ${failed} fail, ${warned} warn — сделайте шаги из подсказок`
+    : warned > 0
+      ? `работает, но есть предупреждения: ${warned}`
+      : "всё в порядке";
+  return [...lines, "", summary].join("\n");
+}
+
+/**
+ * Проверки `doctor` на инжектируемых сервисах: без сети и без реальных часов.
+ *
+ * Уровни: `ok` — всё нормально, `warn` — работает, но стоит поправить, `fail` —
+ * без этого удалённый режим не заработает. Каждый пункт с подсказкой «что
+ * делать», иначе диагностика бесполезна.
+ *
+ * @param options - `{store, credentials, transport, telegramCallImpl, version, now}`.
+ * @returns список проверок.
+ */
+export async function runDoctorChecks({
+  store = null,
+  credentials = null,
+  transport = null,
+  telegramCallImpl = null,
+  version = null,
+  now = () => Date.now(),
+} = {}) {
+  const checks = [];
+  const add = (level, title, detail, hint) => {
+    checks.push({ level, title, detail: String(detail ?? ""), ...(hint === undefined ? {} : { hint }) });
+  };
+
+  add(
+    version === null ? "warn" : "ok",
+    "плагин",
+    version === null ? "версия не прочитана из package.json" : `dsh-remote ${version}`,
+    version === null ? "переустановите пакет: bin/install-remote.sh" : undefined,
+  );
+
+  // --- токен ---------------------------------------------------------------
+  let token = null;
+  const access = credentials;
+  if (access === null || typeof access?.availableFor !== "function") {
+    add("fail", "токен", "ctx.credentials недоступен", "задайте секрет или токен в окружении");
+  } else if (!access.availableFor(TELEGRAM_TOKEN_REF)) {
+    add("fail", "токен", `нет ссылки ${TELEGRAM_TOKEN_REF}`, "получите токен у @BotFather и выполните /remote connect");
+  } else {
+    try {
+      token = await access.resolve(TELEGRAM_TOKEN_REF);
+    } catch {
+      token = null;
+    }
+    if (typeof token !== "string" || token === "") {
+      add("fail", "токен", `${TELEGRAM_TOKEN_REF} не разрешился`, "проверьте секрет: /remote connect");
+      token = null;
+    } else {
+      const info = typeof access.describe === "function" ? await access.describe(TELEGRAM_TOKEN_REF).catch(() => null) : null;
+      const source = typeof info?.source === "string" ? info.source : "unknown";
+      const readonly = info?.writable === false ? ", только чтение" : "";
+      add("ok", "токен", `${TELEGRAM_TOKEN_REF} найден (источник: ${source}${readonly})`);
+    }
+  }
+
+  // --- getMe ---------------------------------------------------------------
+  if (token !== null && typeof telegramCallImpl === "function") {
+    try {
+      const me = await telegramCallImpl(token, "getMe", {});
+      const username = me?.result?.username ?? me?.username ?? null;
+      add(
+        typeof username === "string" && username !== "" ? "ok" : "warn",
+        "getMe",
+        typeof username === "string" && username !== "" ? `бот @${username} на связи` : "Telegram ответил без username",
+        typeof username === "string" && username !== "" ? undefined : "проверьте токен у @BotFather",
+      );
+    } catch (error) {
+      add("fail", "getMe", `Telegram не ответил: ${humanError(error, token)}`, "проверьте сеть и токен; токен можно перевыпустить у @BotFather");
+    }
+  } else if (token !== null) {
+    add("warn", "getMe", "проверка вне плагина недоступна");
+  }
+
+  // --- поллеры -------------------------------------------------------------
+  const lock = typeof store?.lockState === "function" ? store.lockState() : null;
+  if (lock === null) {
+    add("warn", "поллеры", "состояние не подключено", "проверьте установку плагина");
+  } else if (lock.held !== true) {
+    add("ok", "поллеры", "lock свободен");
+  } else if (lock.mine === true) {
+    add("ok", "поллеры", `lock держит этот процесс (pid ${lock.holder?.pid ?? "?"})`);
+  } else {
+    add(
+      "warn",
+      "поллеры",
+      `lock держит pid ${lock.holder?.pid ?? "?"}`,
+      "второй поллер получит 409 Conflict: остановите лишний процесс (или дождитесь завершения connect)",
+    );
+  }
+
+  // --- канал ---------------------------------------------------------------
+  if (transport === null) {
+    add("warn", "канал", "транспорт не поднят", "привяжите бота: /remote connect");
+  } else {
+    const lastError = transport.lastError ?? null;
+    const updateId = transport.lastUpdateId ?? null;
+    if (lastError !== null) {
+      add("warn", "канал", `последняя ошибка: ${humanError(lastError, token)}`, "проверьте сеть и токен; поллинг повторяется сам с backoff");
+    } else if (Number.isFinite(updateId) && updateId >= 0) {
+      add("ok", "канал", `поллинг работает, последний update_id ${updateId}`);
+    } else {
+      add("ok", "канал", "транспорт поднят");
+    }
+  }
+
+  // --- состояние и права ---------------------------------------------------
+  const statePath = typeof store?.paths?.file === "string" ? store.paths.file : null;
+  if (statePath === null) {
+    add("warn", "состояние", "state.json не найден", "оно появится после /remote connect");
+  } else {
+    let text = null;
+    let mode = null;
+    try {
+      text = fs.readFileSync(statePath, "utf8");
+      mode = fs.statSync(statePath).mode & 0o777;
+    } catch (error) {
+      const missing = error?.code === "ENOENT";
+      add(missing ? "warn" : "fail", "состояние", missing ? "файла ещё нет" : `не прочитан: ${humanError(error)}`, "оно появится после /remote connect");
+    }
+    if (text !== null) {
+      // Права проверяем независимо от содержимого: битый JSON — отдельная
+      // проблема, но файл с 644 не должен проходить незамеченным.
+      if (mode !== null) {
+        add(
+          mode === 0o600 ? "ok" : "warn",
+          "права",
+          `state.json: ${mode.toString(8)}`,
+          mode === 0o600 ? undefined : `должно быть 600: chmod 600 ${statePath}`,
+        );
+      }
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        add("fail", "состояние", "битый JSON", "удалите файл и выполните /remote connect заново");
+      }
+      if (parsed !== null && typeof parsed === "object") {
+        const binding = parsed.bindings ?? null;
+        add(
+          binding === null ? "warn" : "ok",
+          "состояние",
+          binding === null ? "привязки нет" : `привязка: ${binding.transport ?? "telegram"} @${binding.botUsername ?? "?"}`,
+          binding === null ? "выполните /remote connect" : undefined,
+        );
+      }
+    }
+  }
+
+  void now;
+  return checks;
+}
 
 /** `{kind:'success', text}` — то, что команда возвращает человеку. */
 function success(text) {
@@ -80,11 +277,17 @@ export function parseRemoteArgs(rawInput) {
   const text = String(rawInput ?? "").trim();
   if (text === "") return { subcommand: "status", flags: new Set(), rest: [] };
   const parts = text.split(/\s+/);
-  const flags = new Set(parts.slice(1).filter((part) => part.startsWith("--"))
-    .map((part) => part.slice(2).toLowerCase()));
+  const tokens = parts.slice(1).filter((part) => part.startsWith("--"));
+  const flags = new Set(tokens.map((part) => part.slice(2).split("=")[0].toLowerCase()));
+  const flagValues = new Map();
+  for (const token of tokens) {
+    const [name, value] = token.slice(2).split("=");
+    if (value !== undefined && value !== "") flagValues.set(name.toLowerCase(), value);
+  }
   return {
     subcommand: parts[0].toLowerCase(),
     flags,
+    flagValues,
     rest: parts.slice(1).filter((part) => !part.startsWith("--")),
   };
 }
@@ -409,6 +612,8 @@ export function createRemoteCommands({
       if (channel === null) return failure("канал не поднят: проверьте токен и /remote status");
     }
     try {
+      if (flags.has("hybrid")) store.setHybrid({ enabled });
+      if (flags.has("no-hybrid")) store.setHybrid({ enabled: false });
       if (flags.has("all")) {
         store.setEnabled({ kind: "global" }, enabled);
         const decision = registry.resolve({ sessionId, workspace: cwd });
@@ -460,8 +665,24 @@ export function createRemoteCommands({
       lines.push(`секрет: ${TELEGRAM_TOKEN_REF} — источник ${described.source}${described.writable ? " (запись разрешена)" : " (только чтение)"}`);
     }
 
+    lines.push(`гибрид: ${state.hybrid.enabled ? `вкл, ждём ${Math.round(state.hybrid.waitMs / 1000)} с` : "выкл"}`);
+    const hybridStats = ctx?.get?.("remoteAnswerer")?.stats ?? null;
+    if (hybridStats !== null && (hybridStats.hybridHanded > 0 || hybridStats.hybridPhoneAnswers > 0)) {
+      lines.push(`гибрид-метрика: в GUI ${hybridStats.hybridHanded}, ответов из телефона после GUI ${hybridStats.hybridPhoneAnswers}`);
+    }
     lines.push(`режим: глобально ${state.enabled.global ? "вкл" : "выкл"}; проект ${cwd === null ? "?" : cwd} ${cwd !== null && state.enabled.workspaces[cwd] === true ? "вкл" : "выкл"}; сессия ${sessionId === null ? "?" : sessionId} ${sessionId !== null && state.enabled.sessions[sessionId] === true ? "вкл" : "выкл"}`);
     lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
+
+    const channels = Object.entries(state.channels ?? {});
+    if (channels.length === 0) {
+      lines.push("каналы проектов: нет — все вопросы идут в общий чат");
+    } else {
+      for (const [name, perTransport] of channels) {
+        for (const [transportId, channel] of Object.entries(perTransport)) {
+          lines.push(`канал ${name} (${transportId}): чат ${channel.chatId}${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
+        }
+      }
+    }
 
     const lock = store.lockState();
     lines.push(lock.held ? `поллер: занят (pid ${lock.holder?.pid ?? "?"})` : "поллер: свободен");
@@ -531,6 +752,84 @@ export function createRemoteCommands({
   }
 
   /** `/remote disconnect` — отвязать бота и выключить режим. */
+  /** `/remote channel ...` — каналы проектов (015). */
+  function channelCommand(invocation, flags, rest, flagValues = null) {
+    // rest — аргументы после подкоманды: `list` | `remove <проект>` |
+    // `<проект> <chatId> [threadId]`.
+    const args = Array.isArray(rest) ? rest : [];
+    const [action, target, threadIdRaw] = args;
+
+    if (action === "list" || action === undefined) {
+      const channels = Object.entries(store.read().channels ?? {});
+      if (channels.length === 0) return success("каналы проектов не заданы: все вопросы идут в общий чат");
+      const lines = [];
+      for (const [name, perTransport] of channels) {
+        for (const [transportId, channel] of Object.entries(perTransport)) {
+          lines.push(`${name} (${transportId}) → чат ${channel.chatId}${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
+        }
+      }
+      return success(lines.join("\n"));
+    }
+
+    if (action === "remove") {
+      if (typeof target !== "string" || target === "") return failure("укажите проект: /remote channel remove <проект>");
+      const key = target.trim().replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+      if (!(key in (store.read().channels ?? {}))) return failure(`у проекта ${key} нет своего канала — он и так в общем чате`);
+      const transport = flagValues?.get("transport") ?? null;
+      store.removeChannel(target, transport);
+      return success(transport === null
+        ? `проект ${key} снова идёт в общий чат`
+        : `у проекта ${key} убран канал транспорта ${transport}`);
+    }
+
+    // set: `/remote channel <проект> <chatId> [threadId]`
+    const name = action;
+    const numericChat = Number(target);
+    // У групп и супергрупп Telegram chat_id отрицательный (форумы с топиками тоже),
+    // поэтому требуем лишь целое ненулевое число.
+    if (!Number.isInteger(numericChat) || numericChat === 0) {
+      return failure("chatId должен быть целым ненулевым числом (у групп и супергрупп он отрицательный): "
+        + "/remote channel <проект> <chatId>");
+    }
+    const bindingChat = store.read().bindings?.chatId;
+    // Чужой чат: бот может быть в нём не участником, и тогда ответы не придут.
+    // Осознанный обход — --force (человек знает, что бот добавлен в чат).
+    if (bindingChat !== undefined && bindingChat !== null && String(bindingChat) !== String(numericChat) && !flags.has("force")) {
+      return failure(`чат ${numericChat} не совпадает с привязанным (${bindingChat}): это чужой чат. `
+        + "Если бот действительно добавлен туда, повторите с --force");
+    }
+    const transport = flagValues?.get("transport") ?? null;
+    let channel = { chatId: numericChat };
+    if (threadIdRaw !== undefined && threadIdRaw !== "") {
+      const numericThread = Number(threadIdRaw);
+      if (!Number.isInteger(numericThread) || numericThread <= 0) {
+        return failure("threadId (топик форума) должен быть целым положительным числом");
+      }
+      channel = { chatId: numericChat, threadId: numericThread };
+    }
+    if (transport !== null && transport !== "") channel.transport = transport;
+    try {
+      store.setChannel(name, channel, transport);
+    } catch (error) {
+      return failure(`канал не сохранён: ${humanError(error)}`);
+    }
+    return success(`проект ${name} (${channel.transport ?? store.read().bindings?.transport ?? "default"}) → чат ${channel.chatId}`
+      + `${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
+  }
+
+  /** `/remote doctor` — диагностика: токен, getMe, поллеры, канал, состояние. */
+  async function doctor() {
+    const checks = await runDoctorChecks({
+      store,
+      credentials,
+      transport: liveTransport(),
+      telegramCallImpl: (token, method) => telegramCall(token, method),
+      version: readPluginVersion(),
+      now,
+    });
+    return success(formatDoctorReport(checks));
+  }
+
   async function disconnect(invocation) {
     const confirm = await askStep(invocation, {
       id: "remote-disconnect-confirm",
@@ -579,12 +878,32 @@ export function createRemoteCommands({
       }
     }
 
+    // 012: в мультиканальном режиме фасад пуст, а каналы живут в реестре —
+    // их тоже надо остановить, иначе после /remote disconnect они продолжат
+    // поллить и принимать ответы при уже очищенном состоянии.
+    const registry = ctx?.get?.("remoteTransports") ?? null;
+    if (registry !== null && typeof registry?.values === "function") {
+      for (const channel of [...registry.values()]) {
+        if (typeof channel?.stop !== "function") continue;
+        try {
+          await channel.stop();
+        } catch (error) {
+          log(`канал ${channel.id ?? "?"}.stop: ${humanError(error)}`);
+        }
+      }
+      try {
+        registry.clear?.();
+      } catch (error) {
+        log(`реестр каналов не очищен: ${humanError(error)}`);
+      }
+    }
+
     return success(`привязка удалена, режим выключен\n${secretNote}`);
   }
 
   /** Обработчик `/remote`: разбор и диспетчеризация. */
   async function handler(invocation) {
-    const { subcommand, flags } = parseRemoteArgs(invocation?.rawInput);
+    const { subcommand, flags, rest, flagValues } = parseRemoteArgs(invocation?.rawInput);
     try {
       switch (subcommand) {
         case "connect":
@@ -599,6 +918,10 @@ export function createRemoteCommands({
           return await testChannel(invocation);
         case "who":
           return who(invocation);
+        case "doctor":
+          return await doctor();
+        case "channel":
+          return channelCommand(invocation, flags, rest, flagValues);
         case "disconnect":
           return await disconnect(invocation);
         case "help":

@@ -47,6 +47,8 @@ const ALLOWED_UPDATES = Object.freeze(["message", "callback_query"]);
  */
 const CLOSE_REASONS = new Set([
   "aborted",
+  "undelivered",
+  "restarted",
   "cancelled",
   "canceled",
   "expired",
@@ -55,6 +57,7 @@ const CLOSE_REASONS = new Set([
   "detached",
   "disposed",
   "closed",
+  "answered-elsewhere",
 ]);
 
 /** Рабочий диапазон long polling из отчёта по API (25–50 с). */
@@ -250,11 +253,25 @@ export function createTelegramTransport(options = {}) {
   }
 
   /** Человек и чат из allowlist? Пустой allowlist — никого (безопасный дефолт). */
+  /**
+   * Чаты, из которых принимаем ответы: привязка + каналы проектов (015).
+   * `allowedChatIds` может быть функцией: `/remote channel` меняет набор без
+   * перезапуска транспорта.
+   */
+  function allowedChatSet() {
+    const extra = typeof options.allowedChatIds === "function" ? options.allowedChatIds() : options.allowedChatIds;
+    return new Set(
+      [chatId, ...(Array.isArray(extra) ? extra : [])]
+        .filter((item) => item !== undefined && item !== null && item !== "")
+        .map((item) => String(item)),
+    );
+  }
+
   function allowed(fromId, chatIdOfUpdate) {
     const from = fromId === undefined || fromId === null ? null : String(fromId);
     const chat = chatIdOfUpdate === undefined || chatIdOfUpdate === null ? null : String(chatIdOfUpdate);
     const known = from !== null && allowedUserIds.has(from);
-    const ownChat = chat !== null && chat === String(chatId);
+    const ownChat = chat !== null && allowedChatSet().has(chat);
     if (!known || !ownChat) {
       log(`telegram: чужой апдейт (from=${from ?? "?"}, chat=${chat ?? "?"}) — игнор`);
       return false;
@@ -415,6 +432,10 @@ export function createTelegramTransport(options = {}) {
 
   const transport = {
     id: "telegram",
+    /** Чат привязки: reliability сохраняет его рядом с messageId для recover. */
+    get chatId() {
+      return chatId;
+    },
     caps,
 
     /** Поднять поллинг. Повторный вызов безопасен. */
@@ -461,7 +482,8 @@ export function createTelegramTransport(options = {}) {
         throw new TypeError("telegram: у вопроса нет shortId — кнопки не соберутся");
       }
       const target = sendOptions?.chatId ?? chatId;
-
+      // Сигнал запроса: отменённая отправка не должна доехать после give-up.
+      const signal = sendOptions?.signal;
       // Текст собирает слой представления (006): шапка «откуда», тело, подсказка
       // multiSelect, усечение под caps.maxText. Отправляем parse_mode HTML,
       // поэтому экранируем ВЕСЬ простой текст целиком — сущности не рвутся.
@@ -491,8 +513,11 @@ export function createTelegramTransport(options = {}) {
           chat_id: target,
           parse_mode: "HTML",
           text,
+          ...(sendOptions?.threadId === undefined || sendOptions?.threadId === null
+            ? {}
+            : { message_thread_id: sendOptions.threadId }),
           ...(keyboard === undefined ? {} : { reply_markup: keyboard }),
-        });
+        }, { signal });
         if (result?.message_id !== undefined) record.messageIds.push(result.message_id);
       } catch (error) {
         if (record.messageIds.length === 0) sent.delete(shortId);
@@ -525,6 +550,60 @@ export function createTelegramTransport(options = {}) {
         return;
       }
       await closeRecord(shortId, record, text);
+    },
+
+    /**
+     * Правка текста вопроса (напоминание/пометка) в его сообщении.
+     *
+     * Ищем запись по `shortId` (процесс отправлял вопрос сам) или берём
+     * `chatId`/`messageId` из вопроса (их сохраняет reliability в состоянии).
+     * Возвращаем `true` только если правка реально ушла: reliability по этому
+     * результату решает, делать ли фолбэк — молча «проглотить» нельзя.
+     */
+    async editQuestion(question, text) {
+      const shortId = question?.shortId;
+      const record = typeof shortId === "string" ? sent.get(shortId) : undefined;
+      const target = record?.chatId ?? question?.chatId ?? chatId;
+      const messageIds = Array.isArray(record?.messageIds) && record.messageIds.length > 0
+        ? record.messageIds
+        : (Number.isFinite(question?.messageId) ? [question.messageId] : []);
+      if (messageIds.length === 0) return false;
+      await call("editMessageText", {
+        chat_id: target,
+        message_id: messageIds[0],
+        parse_mode: "HTML",
+        text: escapeHtml(text),
+      });
+      return true;
+    },
+
+    /**
+     * Правка сообщения по сохранённым id (без записи в памяти).
+     *
+     * Нужна после рестарта: транспорт нового процесса не помнит `sent`, но
+     * `chatId`/`messageId` лежат в состоянии — так «осиротевший» вопрос можно
+     * пометить «сессия перезапущена, вопрос снят».
+     */
+    async editMessage({ chatId: target, messageId } = {}, text) {
+      if (target === undefined || messageId === undefined) return false;
+      await call("editMessageText", {
+        chat_id: target,
+        message_id: messageId,
+        parse_mode: "HTML",
+        text: escapeHtml(text),
+      });
+      return true;
+    },
+
+    /** Снять кнопки по сохранённым id (после рестарта). */
+    async clearButtons({ chatId: target, messageId } = {}) {
+      if (target === undefined || messageId === undefined) return false;
+      await call("editMessageReplyMarkup", {
+        chat_id: target,
+        message_id: messageId,
+        reply_markup: { inline_keyboard: [] },
+      });
+      return true;
     },
 
     /** Подписка на ответы; возвращает отписку. */
