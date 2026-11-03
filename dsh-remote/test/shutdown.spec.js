@@ -15,6 +15,8 @@ import os from "node:os";
 import path from "node:path";
 
 import { createAnswerer } from "../lib/answerer.js";
+import { DISPOSE_PHASES, apply, orderDisposers } from "../lib/index.js";
+import { createFakeTransport } from "../lib/transport/fake.js";
 import { createQuestion } from "../lib/domain/question.js";
 import { createRegistry } from "../lib/domain/registry.js";
 import {
@@ -301,4 +303,131 @@ test("после stop() сторож можно поднять снова (по�
   assert.equal(reliability.store.read().questions.length, 1, "новый вопрос снова под восстановлением");
   const stats = reliability.stop();
   assert.equal(stats.cancelled, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Порядок снятия ресурсов (034): фазы, а не просто reverse монтирования
+// ---------------------------------------------------------------------------
+
+test("orderDisposers: фазы shutdown в фиксированном порядке, внутри фазы — LIFO", () => {
+  const calls = [];
+  const entries = [
+    { fn: () => calls.push("commands"), phase: "commands" },
+    { fn: () => calls.push("transport-1"), phase: "transports" },
+    { fn: () => calls.push("answerer"), phase: "closers" },
+    { fn: () => calls.push("panel"), phase: "other" },
+    { fn: () => calls.push("reliability"), phase: "timers" },
+    { fn: () => calls.push("transport-2"), phase: "transports" },
+    { fn: () => calls.push("approvals"), phase: "closers" },
+    { fn: () => calls.push("unknown-phase"), phase: "nonsense" },
+    null,
+    { fn: "не функция", phase: "closers" },
+  ];
+
+  const ordered = orderDisposers(entries);
+  for (const entry of ordered) entry.fn();
+
+  assert.deepEqual(calls, [
+    // other — в порядке монтирования, LIFO: сюда попал и неизвестный phase
+    "unknown-phase",
+    "panel",
+    // closers: approvals смонтирован позже answerer → снимается первым
+    "approvals",
+    "answerer",
+    "reliability",
+    // transports: transport-2 смонтирован позже
+    "transport-2",
+    "transport-1",
+    "commands",
+  ]);
+  assert.deepEqual([...DISPOSE_PHASES], ["other", "closers", "timers", "transports", "commands"]);
+});
+
+test("выгрузка реального плагина: сообщение закрывается ДО остановки транспорта", async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "state.json");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({
+    schemaVersion: 2,
+    enabled: { global: true, workspaces: {}, sessions: {} },
+    bindings: null,
+    hybrid: { enabled: false, waitMs: 20_000 },
+  }));
+  const previous = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = file;
+  t.after(() => {
+    if (previous === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previous;
+  });
+
+  const transport = createFakeTransport({ now: () => 0 });
+  const order = [];
+  const realClose = transport.closeQuestion.bind(transport);
+  transport.closeQuestion = async (question, summary) => {
+    order.push("close");
+    return realClose(question, summary);
+  };
+  const realStop = transport.stop.bind(transport);
+  transport.stop = async () => {
+    order.push("stop");
+    return realStop();
+  };
+
+  const handlers = [];
+  const effects = [];
+  const provided = new Map();
+  const services = { remoteTransport: transport };
+  const ctx = {
+    get: (service) => (Object.hasOwn(services, service) ? services[service] : provided.get(service) ?? null),
+    provide: (service, value) => provided.set(service, value),
+    on: (event, handler) => {
+      handlers.push({ event, handler });
+      return () => {};
+    },
+    effect: (execute, label) => {
+      const disposable = execute();
+      effects.push({ label, disposable });
+      return () => disposable?.();
+    },
+    logger: () => ({ debug() {}, info() {}, warn() {}, error() {} }),
+  };
+
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    await apply(ctx, {});
+    assert.equal(effects.length, 1, "dispose зарегистрирован через ctx.effect");
+
+    const requestHandler = handlers.find((item) => item.event === "user-questions/request");
+    assert.ok(requestHandler, "ответчик подписан на waterfall вопросов");
+    const pending = requestHandler.handler(
+      {
+        agent: { id: "session-1" },
+        questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }, { label: "Нет" }] }],
+      },
+      async () => "gui",
+    );
+    pending.catch(() => {});
+    await tickMs(6);
+    assert.equal(transport.calls.send, 1, "вопрос ушёл в канал");
+
+    // Выгрузка плагина настоящим путём cordis.
+    effects[0].disposable();
+
+    assert.equal(order[0], "close", `сначала закрытие сообщения, потом транспорт: ${order.join(" → ")}`);
+    assert.ok(order.includes("stop"), "транспорт остановлен");
+    assert.ok(order.indexOf("close") < order.indexOf("stop"), "close до stop");
+    assert.equal(order.filter((item) => item === "close").length, 1, "закрытие ровно одно");
+    assert.equal(transport.closed.length, 1, "сообщение закрыто в канале");
+
+    // Повторная выгрузка — no-op: новых close/stop нет.
+    const before = order.length;
+    effects[0].disposable();
+    assert.equal(order.length, before, "повторный dispose ничего не делает");
+    await tickMs(6);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(unhandled, [], "после выгрузки нет unhandledRejection");
 });

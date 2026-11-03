@@ -35,6 +35,35 @@ apply.inject = inject;
 const LEVELS = ["debug", "info", "warn", "error"];
 
 /**
+ * Фазы снятия ресурсов (034). Порядок фиксирован и не зависит от порядка
+ * монтирования фич:
+ *
+ *   other → closers → timers → transports → commands
+ *
+ * `closers` (ответчики вопросов/подтверждений) закрывают сообщения, пока
+ * транспорт ещё жив; `timers` снимают TTL-сторож и сбрасывают состояние;
+ * `transports` останавливают поллеры/WS (relay/telegram/max); `commands` —
+ * фасад и привязку. Внутри фазы ресурсы снимаются LIFO (обратно монтированию).
+ */
+export const DISPOSE_PHASES = Object.freeze(["other", "closers", "timers", "transports", "commands"]);
+
+/**
+ * Порядок снятия: сначала по фазам, внутри фазы — обратный порядок монтирования.
+ * Вынесено отдельно, чтобы контракт shutdown проверялся тестом без поднятия ctx.
+ */
+export function orderDisposers(entries) {
+  const groups = new Map(DISPOSE_PHASES.map((phase) => [phase, []]));
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (entry === null || typeof entry?.fn !== "function") continue;
+    const phase = groups.has(entry.phase) ? entry.phase : "other";
+    groups.get(phase).push(entry);
+  }
+  const ordered = [];
+  for (const phase of DISPOSE_PHASES) ordered.push(...groups.get(phase).slice().reverse());
+  return ordered;
+}
+
+/**
  * Логгер `[dsh-remote]`: у cordis логгер может быть и функцией (`ctx.logger(name)`
  * даёт именованный), и объектом. Лог не должен мешать работе, поэтому все
  * обращения обёрнуты: даже битый логгер не роняет `apply`.
@@ -93,15 +122,14 @@ export async function apply(ctx, config = {}) {
   const dispose = () => {
     if (disposed) return;
     disposed = true;
-    // 034: LIFO — ресурсы снимаются в обратном порядке монтирования. Это важно
-    // для graceful shutdown: ответчик закрывает сообщения ещё живым транспортом,
-    // а поллеры/WS останавливаются последними (команды/фасад) — иначе закрывать
-    // открытые вопросы было бы нечем. Промисы снятия дожидаться нельзя
-    // (dispose синхронный), поэтому их отклонения гасим, чтобы после stop() не
-    // было unhandledRejection.
-    for (const disposer of disposers.splice(0).reverse()) {
+    // 034: снятие идёт фазами (см. DISPOSE_PHASES), а не просто обратным
+    // порядком монтирования: релею, который монтируется последним, нельзя
+    // останавливать транспорт раньше, чем ответчики закроют сообщения. Промисы
+    // снятия дожидаться нельзя (dispose синхронный), поэтому их отклонения
+    // гасим, чтобы после stop() не было unhandledRejection.
+    for (const entry of orderDisposers(disposers.splice(0))) {
       try {
-        const result = disposer();
+        const result = entry.fn();
         if (result !== null && typeof result?.then === "function") {
           result.then(undefined, (error) => logger.warn(`снятие ресурса фичи упало: ${describeError(error)}`));
         }
@@ -140,18 +168,25 @@ export async function apply(ctx, config = {}) {
         return null;
       }
     },
-    /** Фича просит снять свой ресурс при выгрузке плагина. */
-    onDispose(disposer) {
+    /**
+     * Фича просит снять свой ресурс при выгрузке плагина.
+     * `phase` — одна из DISPOSE_PHASES (034): `closers` закрывают сообщения,
+     * `timers` снимают сторож, `transports` останавливают поллеры/WS,
+     * `commands` — фасад. По умолчанию — `other`.
+     */
+    onDispose(disposer, phase = "other") {
       if (typeof disposer !== "function") return;
+      const effective = DISPOSE_PHASES.includes(phase) ? phase : "other";
       if (disposed) {
         try {
-          disposer();
+          const result = disposer();
+          if (result !== null && typeof result?.then === "function") result.catch(() => {});
         } catch (error) {
           logger.warn(`снятие ресурса фичи упало: ${describeError(error)}`);
         }
         return;
       }
-      disposers.push(disposer);
+      disposers.push({ fn: disposer, phase: effective });
     },
   };
 

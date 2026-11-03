@@ -78,7 +78,7 @@ export const reliabilityFeature = {
     }
 
     reliability.start();
-    deps.onDispose(() => reliability.stop());
+    deps.onDispose(() => reliability.stop(), "timers");
     deps.logger.info("фича reliability: сторож и доставка подключены");
   },
 };
