@@ -64,7 +64,19 @@ export function createApprovals({
   deliver = null,
   deliverFor = null,
   channelOf = null,
+  /** Политика подтверждений (025): решает, можно ли спрашивать удалённо. */
+  policy = null,
+  /** Исход по таймауту: `cancelled` (по умолчанию) или `unavailable`; никогда `allowed-once`. */
+  onTimeout = null,
+  setTimeout: setTimeoutImpl = setTimeout,
+  clearTimeout: clearTimeoutImpl = clearTimeout,
 } = {}) {
+  /** Исход таймаута: только отказ (025). */
+  function timeoutOutcome() {
+    const value = typeof onTimeout === "function" ? onTimeout() : onTimeout;
+    return value === APPROVAL_OUTCOME.unavailable ? APPROVAL_OUTCOME.unavailable : APPROVAL_OUTCOME.cancelled;
+  }
+
   /** Счётчики решений — для `/remote status` (026). */
   const stats = { claimed: 0, allowed: 0, rejected: 0, unavailable: 0, cancelled: 0 };
 
@@ -169,6 +181,14 @@ export function createApprovals({
   /** Выдать исход ожидающему слушателю: ровно один раз. */
   function settle(entry, outcome) {
     if (entry.settled) return;
+    if (entry.timer !== undefined && entry.timer !== null) {
+      try {
+        clearTimeoutImpl(entry.timer);
+      } catch {
+        /* таймер уже сработал */
+      }
+      entry.timer = null;
+    }
     entry.settled = true;
     pending.delete(entry.approval.shortId);
     entry.resolve(outcome);
@@ -244,6 +264,15 @@ export function createApprovals({
       log(`подтверждение ${toolName} (${sessionId ?? "без агента"}): режим выключен — отдаю GUI (next)`);
       return next();
     }
+    // 025: политика решает ДО отправки в канал. Неизвестный инструмент,
+    // denyRemote или не-allowlist — сразу GUI, без кнопок в мессенджере.
+    if (policy !== null && typeof policy?.decide === "function") {
+      const resolution = policy.decide(request);
+      if (resolution.remote !== true) {
+        log(`подтверждение ${toolName}: отдано GUI по политике (${resolution.reason}: ${resolution.message})`);
+        return next();
+      }
+    }
     if (typeof deliver !== "function" && !useBroker && typeof primary?.sendQuestion !== "function") {
       log("подтверждение: транспорт не умеет sendQuestion — отдаю GUI (next)");
       return next();
@@ -269,8 +298,24 @@ export function createApprovals({
 
     /** Ожидание решения + гонка с абортом запроса. */
     const outcome = await new Promise((resolve) => {
-      const entry = { approval, resolve, settled: false, delivered: false };
+      const entry = { approval, resolve, settled: false, delivered: false, timer: null };
       pending.set(approval.shortId, entry);
+
+      // 025: не ответили за TTL — отказ, а не «тихое разрешение». Таймер
+      // снимается в `settle()` при любом другом исходе.
+      if (Number.isFinite(ttlMs) && ttlMs > 0) {
+        const outcomeOnTimeout = timeoutOutcome();
+        entry.timer = setTimeoutImpl(() => {
+          if (entry.settled) return;
+          approval.cancel("timeout", now());
+          if (entry.delivered) {
+            void closeMessage(approval, outcomeSummary(outcomeOnTimeout));
+          }
+          log(`подтверждение ${approval.shortId}: таймаут — ${outcomeOnTimeout} (отказ)`);
+          settle(entry, outcomeOnTimeout);
+        }, ttlMs);
+        entry.timer?.unref?.();
+      }
 
       const onAbort = () => {
         if (entry.settled) return;
