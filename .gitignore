@@ -20,3 +20,6 @@ __pycache__/
 # Локальные кэши проверки Rust-релея (создаются cargo test в песочнице)
 .cargo-home/
 .cargo-target/
+
+# Локальные кэши проверки Swift-приложения (создаются swift test в песочнице)
+.swift-cache/
