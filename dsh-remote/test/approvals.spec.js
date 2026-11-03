@@ -18,12 +18,12 @@ const tick = async (times = 6) => {
 };
 
 /** Транспорт-двойник: запоминает сообщения и умеет «нажать кнопку». */
-function fakeTransport({ failSend = false } = {}) {
+function fakeTransport({ failSend = false, id = "fake" } = {}) {
   const sent = [];
   const closed = [];
   const handlers = new Set();
   return {
-    id: "fake",
+    id,
     sent,
     closed,
     async sendQuestion(question) {
@@ -233,6 +233,30 @@ test("транспорт без onAnswer: next() (ждать решение не
   assert.equal(outcome, "gui");
   assert.equal(nextCalls.length, 1, "next() ровно один раз");
   assert.equal(transport.sent.length, 0, "недоставляемое подтверждение не отправляем");
+});
+
+test("два канала: первый доставил, второй ответил — решают оба", async () => {
+  const first = fakeTransport({ id: "first" });
+  const second = fakeTransport({ id: "second" });
+  const approvals = createApprovals({
+    transports: [first, second],
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    log: () => {},
+  });
+  approvals.attach(fakeContext());
+  const next = async () => "gui";
+
+  const pendingOutcome = approvals.handler(request(), next);
+  await tick();
+  assert.equal(first.sent.length, 1, "подтверждение ушло в первый канал");
+  assert.equal(second.sent.length, 1, "и во второй");
+
+  second.answer({ shortId: second.sent[0].shortId, optionIds: ["o1"] });
+  assert.equal(await pendingOutcome, "allowed-once");
+  await tick();
+
+  assert.equal(second.closed.length, 1, "канал-победитель закрыт");
+  assert.equal(first.closed.length, 1, "проигравший канал тоже закрыт — кнопки не остаются");
 });
 
 test("неизвестная кнопка не решает подтверждение", async () => {
