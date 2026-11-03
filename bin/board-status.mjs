@@ -10,12 +10,33 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-
-import { isNewer, normalizeStatus, snapshotCards } from "../dsh-kanban/lib/watcher-core.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const project = path.resolve(here, "..");
+
+// Плагин доски ставится в профиль DSH, а не в проект: его библиотеку ищем рядом
+// (если набор лежит внутри плагина), в профиле и по переменной окружения.
+async function loadWatcherCore() {
+  const home = process.env.HOME || "";
+  const candidates = [
+    process.env.DSH_KANBAN_PLUGIN && path.join(process.env.DSH_KANBAN_PLUGIN, "lib/watcher-core.js"),
+    path.join(project, "dsh-kanban/lib/watcher-core.js"),
+    path.join(home, ".dsh/profiles/web/node_modules/dsh-kanban/lib/watcher-core.js"),
+    path.join(home, ".dsh/profiles/desktop/node_modules/dsh-kanban/lib/watcher-core.js"),
+    path.join(home, ".dsh/profiles/node_modules/dsh-kanban/lib/watcher-core.js"),
+    path.join(home, "projects/dsh-kanban/dsh-kanban/lib/watcher-core.js")
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return import(pathToFileURL(candidate).href);
+  }
+  throw new Error(
+    `не найден плагин dsh-kanban (watcher-core.js); искал:\n  ${candidates.join("\n  ")}\n` +
+      "поставьте плагин в профиль или задайте DSH_KANBAN_PLUGIN=/путь/к/dsh-kanban"
+  );
+}
+
+const { isNewer, normalizeStatus, snapshotCards } = await loadWatcherCore();
 
 const COLUMNS = [
   ["backlog", "бэклог"],
