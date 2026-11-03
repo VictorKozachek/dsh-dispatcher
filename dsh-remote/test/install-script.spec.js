@@ -182,7 +182,8 @@ function seedProfile(t, { installedVersion = null } = {}) {
     fs.mkdirSync(path.join(oldDir, "lib"), { recursive: true });
     fs.writeFileSync(path.join(oldDir, "package.json"), JSON.stringify({ name: "dsh-remote", version: installedVersion, type: "module" }));
     fs.writeFileSync(path.join(oldDir, "lib", "index.js"), "export const installed = true;\n");
-    fs.writeFileSync(path.join(oldDir, "lib", "store.js"), "export const STATE_VERSION = 2;\n");
+    // Пакет до 032: STATE_VERSION ещё нет — установщик обязан считать его legacy 1.
+    fs.writeFileSync(path.join(oldDir, "lib", "store.js"), "export const LEGACY_STATE_VERSION = 1;\n");
     dependencies["dsh-remote"] = `link:${oldDir}`;
     fs.mkdirSync(path.join(profileDir, "node_modules"), { recursive: true });
     fs.symlinkSync(oldDir, path.join(profileDir, "node_modules", "dsh-remote"));
@@ -336,4 +337,66 @@ test("035: dsh plugin add без переключения версии — фо�
   assert.match(result.stdout, /не переключил версию — обновляю ссылку вручную/);
   const updated = JSON.parse(fs.readFileSync(manifest, "utf8"));
   assert.equal(updated.dependencies["dsh-remote"], `link:${pluginDir}`, "версия фактически переключена");
+});
+
+// --- 035, ревью: legacy-схема старых кэш-пакетов ----------------------------
+
+function seedCache(home, version, { storeJs = true, stateVersion = 2 } = {}) {
+  const dir = path.join(home, "plugin-cache", "dsh-remote", version);
+  fs.mkdirSync(path.join(dir, "lib"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "dsh-remote", version, type: "module" }));
+  fs.writeFileSync(path.join(dir, "lib", "index.js"), "export const legacy = true;\n");
+  if (storeJs) fs.writeFileSync(path.join(dir, "lib", "store.js"), "export const LEGACY_STATE_VERSION = 1;\n");
+  if (stateVersion !== null) {
+    fs.mkdirSync(path.join(home, "remote-control"), { recursive: true });
+    fs.writeFileSync(path.join(home, "remote-control", "state.json"), JSON.stringify({ schemaVersion: stateVersion }));
+  }
+  return dir;
+}
+
+test("035: старый кэш без STATE_VERSION + state v2 — откат заблокирован", (t) => {
+  const { home, manifest } = seedProfile(t, { installedVersion: "0.1.0" });
+  seedCache(home, "0.0.9", { stateVersion: 2 });
+  const before = fs.readFileSync(manifest, "utf8");
+
+  const result = runWithEnv(t, ["--rollback", "0.0.9"], { DSH_HOME: home });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /пакет 0\.0\.9 не поддерживает schemaVersion 2, откат невозможен/);
+  assert.match(result.stdout, /обновите пакет или восстановите state\.json из бэкапа/);
+  assert.equal(fs.readFileSync(manifest, "utf8"), before, "manifest не тронут");
+  assert.equal(fs.readlinkSync(path.join(home, "profiles", "web", "node_modules", "dsh-remote")), path.join(home, "old-plugin"), "link не переключён");
+});
+
+test("035: кэш без lib/store.js — понятная ошибка без traceback", (t) => {
+  const { home, manifest } = seedProfile(t, { installedVersion: "0.1.0" });
+  seedCache(home, "0.0.8", { storeJs: false, stateVersion: 2 });
+  const before = fs.readFileSync(manifest, "utf8");
+
+  const result = runWithEnv(t, ["--rollback", "0.0.8"], { DSH_HOME: home });
+
+  assert.equal(result.status, 1);
+  assert.doesNotMatch(result.stderr, /Traceback|FileNotFoundError/, "без python-traceback");
+  assert.match(result.stderr, /не поддерживает schemaVersion 2, откат невозможен/);
+  assert.equal(fs.readFileSync(manifest, "utf8"), before);
+});
+
+test("035: старый пакет со state v1 откатывается, свежий 0.2.0 со state v2 — тоже", (t) => {
+  const { home, manifest } = seedProfile(t, { installedVersion: "0.1.0" });
+  seedCache(home, "0.1.0", { stateVersion: 1 });
+  let result = runWithEnv(t, ["--rollback", "0.1.0"], { DSH_HOME: home });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(manifest, "utf8")).dependencies["dsh-remote"], `link:${path.join(home, "plugin-cache", "dsh-remote", "0.1.0")}`);
+
+  // Кэш текущей версии (STATE_VERSION=2) и state v2: откат разрешён.
+  const current = path.join(home, "plugin-cache", "dsh-remote", "0.2.0");
+  fs.mkdirSync(path.join(current, "lib"), { recursive: true });
+  fs.writeFileSync(path.join(current, "package.json"), JSON.stringify({ name: "dsh-remote", version: "0.2.0", type: "module" }));
+  fs.writeFileSync(path.join(current, "lib", "index.js"), "export const current = true;\n");
+  fs.copyFileSync(path.join(pluginDir, "lib", "store.js"), path.join(current, "lib", "store.js"));
+  fs.writeFileSync(path.join(home, "remote-control", "state.json"), JSON.stringify({ schemaVersion: 2 }));
+
+  result = runWithEnv(t, ["--rollback", "0.2.0"], { DSH_HOME: home });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /откат выполнен/);
 });

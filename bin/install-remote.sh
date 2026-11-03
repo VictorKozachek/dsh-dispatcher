@@ -98,11 +98,17 @@ print(json.load(open(sys.argv[1], encoding="utf-8")).get("version", ""))
 PY
 )"
 supported_schema() {
+  # Пакеты до 032 не знают STATE_VERSION: для них схема — legacy 1. Отсутствующий
+  # или нечитаемый store.js — тоже legacy 1, без traceback и падения.
   python3 - "$1/lib/store.js" <<'PY'
 import re, sys
-text = open(sys.argv[1], encoding="utf-8").read()
+try:
+    text = open(sys.argv[1], encoding="utf-8").read()
+except Exception:
+    print(1)
+    raise SystemExit(0)
 match = re.search(r"export const STATE_VERSION = (\d+)", text)
-print(match.group(1) if match else "")
+print(int(match.group(1)) if match else 1)
 PY
 }
 
@@ -247,7 +253,7 @@ if [[ -f "$TARGET_DIR/package.json" ]]; then
     say "  переустановите пакет или выберите другую версию"
   fi
   target_schema="$(supported_schema "$TARGET_DIR")"
-  if [[ -f "$STATE_FILE" && -n "$target_schema" ]]; then
+  if [[ -f "$STATE_FILE" ]]; then
     state_schema="$(python3 - "$STATE_FILE" <<'PY'
 import json, sys
 try:
@@ -260,8 +266,13 @@ print(value if isinstance(value, int) else "")
 PY
 )"
     if [[ -n "$state_schema" && "$state_schema" -gt "$target_schema" ]]; then
-      problem "state.json имеет schemaVersion $state_schema, а пакет поддерживает $target_schema"
-      say "  состояние из будущего: обновите плагин или откатите state.json из бэкапа"
+      if [[ "$MODE" == "rollback" ]]; then
+        problem "пакет $ROLLBACK_VERSION не поддерживает schemaVersion $state_schema, откат невозможен"
+        say "  обновите пакет или восстановите state.json из бэкапа"
+      else
+        problem "state.json имеет schemaVersion $state_schema, а пакет поддерживает $target_schema"
+        say "  состояние из будущего: обновите плагин или откатите state.json из бэкапа"
+      fi
       say "  (бэкапы: ${STATE_FILE}.bak-*; установка не выполнена)"
     fi
   fi
