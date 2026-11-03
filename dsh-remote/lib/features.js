@@ -32,6 +32,7 @@ import { telegramFeature } from "./features/telegram.js";
 import { reliabilityFeature } from "./features/reliability.js";
 import { answererFeature } from "./features/answerer.js";
 import { notifyFeature } from "./features/notify.js";
+import { relayFeature } from "./features/relay.js";
 import { panelFeature } from "./features/panel.js";
 
 // Порядок: commands регистрирует фасад remoteTransport и состояние, telegram
@@ -43,6 +44,7 @@ export const features = [
   telegramFeature,
   reliabilityFeature,
   answererFeature,
+  relayFeature,
   notifyFeature,
   panelFeature,
 ];
