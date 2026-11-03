@@ -141,11 +141,18 @@ const STATUS_RANK = { "in-progress": 60, testing: 50, "in-review": 40, ready: 30
  * берём более поздний id (только что выданную). `merged` не считаем вовсе — иначе
  * хвост из слитых карточек с тем же owner («001» вместо «006») закрывал бы текущую.
  */
+/** id задачи из пути рабочего дерева (`.../worktrees/006` → "006"). */
+function worktreeTaskId(cwd) {
+  const match = /(?:^|\/)(?:worktrees|\.worktrees)\/([^/]+)\/?$/.exec(String(cwd ?? ""));
+  return match === null ? null : match[1];
+}
+
 export function findOwnedTask(cwd, sessionId, { log = noop } = {}) {
   if (typeof cwd !== "string" || cwd === "" || typeof sessionId !== "string" || sessionId === "") {
     return null;
   }
 
+  const preferred = worktreeTaskId(cwd);
   const best = { rank: -1, id: null };
 
   for (const tasksDir of taskDirs(cwd)) {
@@ -167,7 +174,9 @@ export function findOwnedTask(cwd, sessionId, { log = noop } = {}) {
       const status = frontMatterField(text, "status") ?? "";
       if (status === "merged") continue;
       const id = frontMatterField(text, "id") ?? name.replace(/\.md$/, "");
-      const rank = STATUS_RANK[status] ?? 0;
+      let rank = STATUS_RANK[status] ?? 0;
+      // cwd внутри worktrees/<id> — это и есть текущая задача сессии.
+      if (preferred !== null && id === preferred) rank += 1000;
       // При равенстве выигрывает более поздний id (свежая задача).
       if (rank > best.rank || (rank === best.rank && id > (best.id ?? ""))) {
         best.rank = rank;
@@ -292,36 +301,39 @@ export function renderRows(question = {}, caps = {}) {
   if (maxOptions === 0) return [];
 
   const options = Array.isArray(question.options) ? question.options : [];
-  const allowFree = question.allowFreeText !== false;
   const labelLimit = Number.isFinite(caps.maxText) ? Math.min(64, caps.maxText) : 64;
-  const rows = [];
+  const button = (option) => ({
+    label: truncate(option?.label ?? "", labelLimit),
+    kind: "option",
+    optionId: option?.id ?? null,
+  });
 
-  // Один ряд резервируем под «Другой ответ…»; «Показать ещё» — только если
-  // варианты не влезают, и тоже ценой одного ряда.
-  let room = Math.max(0, maxOptions - (allowFree ? 1 : 0));
-  let more = options.length > room;
-  if (more) {
-    const afterMore = Math.max(0, room - 1);
-    // Если после ряда «Показать ещё» не остаётся ни одного варианта — раскрывать
-    // нечего: показываем первый вариант вместо бессмысленной кнопки.
-    if (afterMore === 0 && room > 0) more = false;
-    else room = afterMore;
+  // Раскладка по приоритету: варианты → «Показать ещё» (если не всё влезло) →
+  // «Другой ответ…». При одном свободном ряде (maxOptions=1) жертвуем раскрытием:
+  // одна кнопка «Показать ещё» без вариантов бессмысленна.
+  let freeSlots = question.allowFreeText === false ? 0 : 1;
+  // Карточка: «Показать ещё» появляется, когда вариантов больше, чем maxOptions-1
+  // (один ряд всегда оставляем под служебную кнопку).
+  let showMore = options.length > Math.max(1, maxOptions - 1);
+  let optionSlots = Math.max(0, maxOptions - freeSlots - (showMore ? 1 : 0));
+
+  if (maxOptions === 1) {
+    optionSlots = freeSlots === 1 ? 0 : 1;
+    showMore = false;
+  } else if (optionSlots === 0 && options.length > 0) {
+    // Места нет — жертвуем свободным ответом, но варианты не теряем молча:
+    // один вариант + «Показать ещё».
+    freeSlots = 0;
+    optionSlots = Math.max(1, maxOptions - (showMore ? 1 : 0));
   }
 
-  for (const option of options.slice(0, room)) {
-    rows.push([{ label: truncate(option?.label ?? "", labelLimit), kind: "option", optionId: option?.id ?? null }]);
-  }
-  if (more && options.length > room) {
+  const shown = options.slice(0, Math.max(0, optionSlots));
+  const rows = shown.map((option) => [button(option)]);
+  if (showMore && shown.length < options.length) {
     rows.push([{ label: MORE_LABEL, kind: "more", optionId: MORE_OPTION }]);
   }
-  if (allowFree) rows.push([{ label: FREE_TEXT_LABEL, kind: "free", optionId: FREE_TEXT_OPTION }]);
-
-  // Жёсткая гарантия лимита: если рядов всё же больше, первым уходит «Показать
-  // ещё» (раскрытие — не ответ), потом лишние варианты; свободный ответ остаётся.
-  if (rows.length > maxOptions) {
-    const moreIndex = rows.findIndex((row) => row[0]?.kind === "more");
-    if (moreIndex >= 0) rows.splice(moreIndex, 1);
-    while (rows.length > maxOptions) rows.pop();
+  if (freeSlots === 1) {
+    rows.push([{ label: FREE_TEXT_LABEL, kind: "free", optionId: FREE_TEXT_OPTION }]);
   }
-  return rows;
+  return rows.slice(0, maxOptions);
 }

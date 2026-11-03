@@ -9,6 +9,9 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { apply } from "../lib/index.js";
 import { createTelegramTransport, TelegramError } from "../lib/transport/telegram.js";
@@ -844,4 +847,50 @@ test("зависшая правка сообщения не задерживае
   assert.deepEqual(result.answers, [{ id: "q1", selected: ["Да"] }], "ответ пришёл, несмотря на зависшую правку");
   assert.equal(closeCalls, 1, "правку всё же попросили");
   await transport.stop();
+});
+
+test("end-to-end: ответчик кладёт шапку с задачей и ролью в сообщение", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-e2e-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, ".kanban", "tasks"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".kanban", "tasks", "006.md"),
+    '---\nid: "006"\nstatus: in-progress\nowner: session-e2e\n---\n',
+  );
+
+  const { transport, calls } = setup();
+  const hooks = new Map();
+  const ctx = {
+    get: (name) => (name === "sessions" ? { get: () => ({ header: { cwd: dir, agentPreset: "worker" } }) } : null),
+    on: (event, handler, options) => {
+      hooks.set(event, (hooks.get(event) ?? []).concat([{ handler, options }]));
+      return () => {};
+    },
+  };
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({ transport, registry, log: () => {}, now: () => 42 });
+  answerer.attach(ctx);
+
+  const controller = new AbortController();
+  const pending = answerer.handler(
+    {
+      questions: [askItem({ options: [{ label: "Да" }] })],
+      agent: { id: "session-e2e" },
+      signal: controller.signal,
+    },
+    () => assert.fail("next() звать нельзя"),
+  );
+  await settle();
+
+  const send = calls.find((call) => call.method === "sendMessage");
+  assert.match(send.payload.text, /▸ dsh-remote-e2e\S* · task 006 · worker · /, "шапка «откуда» с задачей и ролью");
+  assert.deepEqual(
+    send.payload.reply_markup.inline_keyboard.map((row) => row[0].text),
+    ["Да", "Другой ответ…"],
+    "вариант и свободный ответ",
+  );
+
+  // Завершаем ожидание, чтобы тест не оставлял висящий промис.
+  controller.abort();
+  await assert.rejects(pending, (error) => error.name === "AbortError");
 });

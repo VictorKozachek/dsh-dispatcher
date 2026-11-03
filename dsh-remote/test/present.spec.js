@@ -329,3 +329,39 @@ test("findOwnedTask: реальная раскладка root/worktree — ка�
   assert.equal(context.taskId, "006", "нашли карточку в рабочем дереве проекта");
   assert.equal(MORE_OPTION, "more");
 });
+
+test("renderRows maxOptions=2: переполнение уходит в «Показать ещё», а не теряется", () => {
+  const options = (count) => Array.from({ length: count }, (_, index) => ({ id: `o${index}`, label: `В${index}` }));
+
+  const two = renderRows({ options: options(2), allowFreeText: true }, { maxOptions: 2 });
+  assert.deepEqual(two.map((row) => row[0].kind), ["option", "more"], "второй вариант доступен через «Показать ещё»");
+
+  const three = renderRows({ options: options(3), allowFreeText: true }, { maxOptions: 2 });
+  assert.deepEqual(three.map((row) => row[0].kind), ["option", "more"]);
+
+  const one = renderRows({ options: options(1), allowFreeText: true }, { maxOptions: 2 });
+  assert.deepEqual(one.map((row) => row[0].kind), ["option", "free"], "один вариант влезает вместе со свободным ответом");
+});
+
+test("findOwnedTask на реальной доске 005–008 и в рабочем дереве", (t) => {
+  const root = tempWorkspace(t, {
+    cards: {
+      "005.md": card("005", SESSION_ID),
+      "006.md": card("006", SESSION_ID),
+      "007.md": card("007", SESSION_ID).replace("status: in-progress", "status: testing"),
+      "008.md": card("008", SESSION_ID),
+    },
+  });
+
+  // В корне все свои карточки: берём самую позднюю активную (in-progress 006/008 → 008).
+  assert.equal(findOwnedTask(root, SESSION_ID), "008");
+
+  // cwd внутри worktrees/006 — текущая задача именно 006.
+  const worktree = path.join(root, "worktrees", "006");
+  fs.mkdirSync(path.join(worktree, ".kanban", "tasks"), { recursive: true });
+  fs.writeFileSync(path.join(worktree, ".kanban", "tasks", "006.md"), card("006", SESSION_ID));
+  assert.equal(findOwnedTask(worktree, SESSION_ID), "006", "рабочее дерево важнее tie-break");
+
+  // Reviewer/verifier не владельцы карточки — задачи не присваиваем.
+  assert.equal(findOwnedTask(root, "session-reviewer"), null);
+});
