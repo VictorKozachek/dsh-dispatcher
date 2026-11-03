@@ -205,7 +205,8 @@ test("рестарт: осиротевшие вопросы снимаются �
 
   assert.deepEqual(result, { cancelled: 2, failed: 0 });
   assert.equal(transport.closed.length, 2);
-  for (const { summary } of transport.closed) assert.match(summary, /сессия перезапущена, вопрос снят/);
+  // Причина служебная (silent в 004): без «✅ Отвечено» и без кнопок.
+  for (const { summary } of transport.closed) assert.equal(summary, "restarted");
   assert.deepEqual(reliability.pendingList(), [], "очередь очищена — повторно не спамим");
 });
 
@@ -493,3 +494,264 @@ test("ответчик на give-up возвращает next(): вопрос д
   assert.deepEqual(result, { answers: [{ id: "q1", selected: ["GUI"] }] });
 });
 
+
+// --- регрессии по ревью 008 -------------------------------------------------
+
+/** Таймер, который «срабатывает» сразу: тесты не ждут реальных секунд. */
+const immediateTimer = (callback, _ms) => {
+  callback();
+  return { unref: () => {}, cancel: () => {} };
+};
+
+test("deliver без транспорта не врёт «delivered», а отдаёт give-up", async (t) => {
+  const { reliability } = makeReliability(t, { transport: null });
+  assert.equal(await reliability.deliver({ question: openQuestion() }), "give-up");
+});
+
+test("зависшая отправка ограничена connectTimeoutMs", async (t) => {
+  const transport = { id: "fake", caps: {}, sendQuestion: () => new Promise(() => {}) };
+  const clock = fakeClock();
+  const { reliability } = makeReliability(t, { transport, clock, setTimeout: immediateTimer });
+
+  const started = Date.now();
+  assert.equal(await reliability.deliver({ question: openQuestion() }), "give-up");
+  assert.ok(Date.now() - started < 2_000, "не ждём реальные 30 секунд");
+  assert.equal(reliability.pendingList().length, 1, "вопрос в очереди");
+});
+
+test("аборт останавливает deliver: после аборта ничего не отправляется", async (t) => {
+  const controller = new AbortController();
+  const transport = fakeTransport({ failures: 1 });
+  const clock = fakeClock();
+  const { reliability } = makeReliability(t, {
+    transport,
+    clock,
+    sleep: async (ms) => {
+      clock.sleeps.push(ms);
+      controller.abort(); // человек/система отменили, пока шёл backoff
+    },
+  });
+
+  assert.equal(await reliability.deliver({ question: openQuestion(), signal: controller.signal }), "aborted");
+  assert.equal(transport.calls.send, 1, "второй отправки после аборта нет");
+});
+
+test("рестарт правит реальное сообщение по сохранённому messageId", async (t) => {
+  const clock = fakeClock();
+  const state = createJsonState({ file: path.join(tempDir(t), "state.json"), now: clock.now });
+  state.write({
+    version: 1,
+    pending: [],
+    questions: [{ shortId: "a1", questionId: "q1", chatId: 42, messageId: 500 }],
+  });
+  const edited = [];
+  const cleared = [];
+  const transport = {
+    id: "telegram",
+    caps: {},
+    async editMessage(target, text) { edited.push({ target, text }); },
+    async clearButtons(target) { cleared.push(target); },
+  };
+  const { reliability } = makeReliability(t, { transport, clock, state });
+
+  const result = await reliability.recoverOrphans();
+
+  assert.deepEqual(result, { cancelled: 1, failed: 0 });
+  assert.equal(edited[0].target.messageId, 500);
+  assert.match(edited[0].text, /сессия перезапущена, вопрос снят/);
+  assert.equal(cleared.length, 1, "кнопки сняты");
+  assert.deepEqual(reliability.pendingList(), []);
+});
+
+test("TTL: зависшая правка не блокирует сторож и исход всё равно применяется", async (t) => {
+  const clock = fakeClock();
+  const transport = { id: "fake", caps: {}, closeQuestion: () => new Promise(() => {}), editQuestion: () => new Promise(() => {}) };
+  const outcomes = [];
+  const { reliability } = makeReliability(t, { transport, clock, setTimeout: immediateTimer });
+  const question = openQuestion({ ttlMs: 1000, now: 0 });
+  reliability.watch(question, { onExpire: (info) => outcomes.push(info) });
+
+  clock.advance(1000);
+  await reliability.tick();
+
+  assert.equal(outcomes.length, 1, "исход истечения применён несмотря на зависшую правку");
+  assert.equal(outcomes[0].kind, "abort");
+  assert.equal(question.status, "expired");
+});
+
+test("redact: title, detail и метки вариантов тоже маскируются", async (t) => {
+  const token = "123456789:AAH-bot_token-1234567890abcdefghij";
+  const transport = fakeTransport();
+  const { reliability, files } = makeReliability(t, { transport });
+  const question = openQuestion({ options: [{ label: `Да ${token}` }] });
+  question.title = `Заголовок ${token}`;
+  question.detail = `Детали ${token}`;
+
+  assert.equal(await reliability.deliver({ question }), "delivered");
+
+  const outgoing = transport.sent[0].question;
+  assert.equal(JSON.stringify({ title: outgoing.title, detail: outgoing.detail, options: outgoing.options }).includes(token), false);
+  assert.match(outgoing.title, /<redacted>/);
+  assert.match(outgoing.detail, /<redacted>/);
+  assert.match(outgoing.options[0].label, /<redacted>/);
+
+  const state = reliability.store.read();
+  assert.equal(JSON.stringify(state).includes(token), false, "секрет не попал и в состояние");
+});
+
+test("redact strict: скрываются title, detail и варианты", async (t) => {
+  const token = "123456789:AAH-bot_token-1234567890abcdefghij";
+  const transport = fakeTransport();
+  const { reliability } = makeReliability(t, { transport, redactMode: "strict" });
+  const question = openQuestion({ options: [{ label: `Да ${token}` }] });
+  question.title = `Заголовок ${token}`;
+
+  assert.equal(await reliability.deliver({ question }), "delivered");
+
+  const outgoing = transport.sent[0].question;
+  assert.match(outgoing.title, /вопрос скрыт/);
+  assert.match(outgoing.options[0].label, /вариант скрыт/);
+  assert.equal(JSON.stringify(outgoing).includes(token), false);
+});
+
+test("redact: путь в CamelCase не маскируется, uppercase hex — маскируется", () => {
+  const pathWithUppercase = "/Users/Victor/Projects/DSHDispatcher/Worktree008";
+  assert.equal(redact(pathWithUppercase), pathWithUppercase, "путь не портим");
+  assert.match(redact("hex ABCDEF0123456789ABCDEF0123456789"), /<redacted-hex>/);
+});
+
+test("give-up в ответчике: причина закрытия служебная (кнопки снимаются молча)", async () => {
+  const transport = fakeTransport();
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({
+    transport,
+    registry,
+    log: () => {},
+    now: () => 0,
+    deliver: async () => "give-up",
+  });
+
+  let nextCalls = 0;
+  await answerer.handler(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: SESSION_ID } },
+    () => {
+      nextCalls += 1;
+      return { answers: [] };
+    },
+  );
+
+  assert.equal(nextCalls, 1);
+  assert.ok(transport.closed.length >= 1);
+  assert.equal(transport.closed[0].summary, "undelivered", "служебная причина, без «✅ Отвечено»");
+});
+
+test("TTL через ответчик: abort и empty разблокируют сессию", async () => {
+  for (const [onExpire, expectReject] of [["abort", true], ["empty", false]]) {
+    const clock = fakeClock();
+    const transport = fakeTransport();
+    const registry = createRegistry({ readState: () => ({ global: true }) });
+    const reliability = createReliability({
+      transport,
+      state: createJsonState({ file: path.join(os.tmpdir(), `dsh-remote-ttl-${onExpire}-${Date.now()}.json`) }),
+      logFile: path.join(os.tmpdir(), `dsh-remote-ttl-${onExpire}-${Date.now()}.jsonl`),
+      now: clock.now,
+      sleep: clock.sleep,
+      onExpire,
+      setTimeout: immediateTimer,
+    });
+    const answerer = createAnswerer({ transport, registry, reliability, log: () => {}, now: () => 0 });
+
+    const pending = answerer.handler(
+      { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: SESSION_ID } },
+      () => ({ answers: [{ id: "q1", selected: ["GUI"] }] }),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    // Двигаем время до истечения TTL вопроса (домен ставит 30 минут).
+    clock.advance(31 * 60 * 1000);
+    await reliability.tick();
+
+    if (expectReject) {
+      await assert.rejects(pending, (error) => error.name === "AbortError");
+    } else {
+      const result = await pending;
+      assert.deepEqual(result.answers, [{ id: "q1", selected: [], custom: "(нет ответа)" }]);
+    }
+    reliability.stop();
+  }
+});
+
+test("applyLateAnswer без сессии — dropped, даже когда текст передан", async (t) => {
+  const { reliability } = makeReliability(t);
+  const question = openQuestion();
+  question.cancel("aborted");
+  question.sessionId = null;
+
+  assert.equal(await reliability.applyLateAnswer({ question, answer: { selected: ["Да"] }, text: "поздно" }), "dropped");
+});
+
+test("фича reliability подключена к плагину: сервис, сторож и ответчик", async (t) => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-relfeat-"));
+  t.after(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+  const previousState = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = path.join(stateDir, "state.json");
+  t.after(() => {
+    if (previousState === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previousState;
+  });
+
+  const polls = [];
+  const provided = new Map();
+  const hooks = new Map();
+  const effects = [];
+  const fetchImpl = async (url, init = {}) => {
+    const method = url.split("/").pop();
+    if (method === "getUpdates") {
+      return new Promise((resolve, reject) => {
+        polls.push(resolve);
+        init.signal?.addEventListener?.("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    }
+    return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1, username: "test_bot" } }; } };
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const ctx = {
+    provide: (name, service) => provided.set(name, service),
+    get: (name) => {
+      if (name === "credentials") return { resolve: async () => ({ value: "123456:TEST-TOKEN", source: "file" }) };
+      if (name === "sessionController") return null;
+      return provided.get(name) ?? null;
+    },
+    on: (event, handler, options) => {
+      hooks.set(event, (hooks.get(event) ?? []).concat([{ handler, options }]));
+      return () => {};
+    },
+    effect: (execute) => {
+      const disposable = execute();
+      effects.push(disposable);
+      return () => disposable?.();
+    },
+    logger: () => ({ debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }),
+  };
+
+  const { apply } = await import("../lib/index.js");
+  await apply(ctx, { telegram: { tokenRef: "tg", chatId: 42, allowedUserIds: [7] } });
+
+  const reliability = provided.get("remoteReliability");
+  assert.ok(reliability, "сервис устойчивости зарегистрирован");
+
+  const listeners = hooks.get("user-questions/request") ?? [];
+  assert.equal(listeners.length, 1, "ответчик подписан после reliability");
+
+  for (const effect of effects) effect?.();
+  reliability.stop();
+  await provided.get("remoteTransport")?.stop?.();
+});

@@ -79,8 +79,9 @@ export function abortError(reason = "вопрос снят") {
 const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
 const BOT_TOKEN = /(?<![0-9])(\d{6,}):([A-Za-z0-9_-]{30,})\b/g;
 const API_KEY = /\bsk-[A-Za-z0-9_-]{16,}\b/g;
-const BASE64_RUN = /\b[A-Za-z0-9+/]{40,}={0,2}/g;
-const HEX_RUN = /\b[0-9a-f]{32,}\b/g;
+// Без '/' и '\\': иначе «путь в CamelCase» выглядит как base64 и маскируется.
+const BASE64_RUN = /\b[A-Za-z0-9+]{40,}={0,2}/g;
+const HEX_RUN = /\b[0-9A-Fa-f]{32,}\b/g;
 
 /**
  * Замаскировать секреты в тексте.
@@ -111,7 +112,9 @@ export function findSecrets(text) {
     if (!(/[A-Z]/.test(candidate) && /[a-z]/.test(candidate) && /\d/.test(candidate))) return candidate;
     return mask("<redacted-base64>");
   });
-  value = value.replace(HEX_RUN, (candidate) => (/\d/.test(candidate) ? mask("<redacted-hex>") : candidate));
+  value = value.replace(HEX_RUN, (candidate) => (/\d/.test(candidate) && /^[0-9A-Fa-f]+$/.test(candidate)
+    ? mask("<redacted-hex>")
+    : candidate));
 
   return { text: value, redacted };
 }
@@ -267,6 +270,8 @@ export function createReliability({
   backoffMaxMs = 30_000,
   logMaxBytes = 512 * 1024,
   tickIntervalMs = 15_000,
+  notifyTimeoutMs = 2_000,
+  setTimeout: setTimeoutImpl = setTimeout,
 } = {}) {
   if (!ON_EXPIRE_VALUES.includes(onExpire)) {
     throw new TypeError(`reliability: onExpire должен быть одним из ${ON_EXPIRE_VALUES.join(", ")}`);
@@ -288,6 +293,8 @@ export function createReliability({
   /** Положить недоставленный вопрос в состояние (для повтора/отчёта). */
   function enqueuePending(question, chatId) {
     try {
+      // В очередь — уже замаскированная копия: секрет не должен лежать на диске.
+      const safe = prepareQuestion(question);
       store.update((current) => {
         const exists = current.pending.some((item) => item.shortId === question.shortId);
         if (!exists) {
@@ -296,8 +303,10 @@ export function createReliability({
             questionId: question.questionId ?? null,
             sessionId: question.sessionId ?? null,
             chatId: chatId ?? null,
-            body: question.body ?? "",
-            options: Array.isArray(question.options) ? question.options : [],
+            body: safe.body ?? "",
+            title: safe.title ?? null,
+            detail: safe.detail ?? null,
+            options: Array.isArray(safe.options) ? safe.options : [],
             createdAt: now(),
           });
         }
@@ -308,25 +317,64 @@ export function createReliability({
     }
   }
 
+  /** Гонка отправки с дедлайном и сигналом: зависший send не держит handler. */
+  function raceSend(question, target, { deadline, signal }) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener?.("abort", onAbort);
+        fn(value);
+      };
+      const remaining = Math.max(0, deadline - now());
+      const timer = setTimeoutImpl(() => finish(reject, Object.assign(new Error("доставка не уложилась в timeout"), { name: "DeliveryTimeout" })), remaining);
+      const onAbort = () => finish(reject, abortError("доставка отменена"));
+      signal?.addEventListener?.("abort", onAbort, { once: true });
+      Promise.resolve(transport.sendQuestion(question, target)).then(
+        (value) => finish(resolve, value),
+        (error) => finish(reject, error),
+      );
+    });
+  }
+
   /**
    * Тело вопроса перед отправкой: `warn` — маскируем секреты и отправляем,
    * `strict` — тело не отправляем вовсе («вопрос скрыт»).
    *
-   * Копия, а не мутация: у вопроса домена остаются методы (`accept`, `toAnswer`),
-   * а замаскированным может быть только то, что уходит в мессенджер.
+   * Маскируем **все** исходящие поля: body, title, detail и метки вариантов —
+   * иначе секрет в заголовке уехал бы в мессенджер при любом режиме.
    */
   function prepareQuestion(question) {
-    const body = typeof question?.body === "string" ? question.body : "";
-    const secrets = findSecrets(body);
-    if (!secrets.redacted) return question;
+    const fields = [];
+    for (const key of ["body", "title", "detail"]) {
+      if (typeof question?.[key] === "string") fields.push([key, question[key]]);
+    }
+    const labels = (Array.isArray(question?.options) ? question.options : [])
+      .map((option, index) => [index, typeof option?.label === "string" ? option.label : ""]);
+    const hits = [
+      ...fields.map(([key, value]) => ({ key, value, secrets: findSecrets(value) })).filter((item) => item.secrets.redacted),
+      ...labels.map(([index, value]) => ({ index, value, secrets: findSecrets(value) })).filter((item) => item.secrets.redacted),
+    ];
+    if (hits.length === 0) return question;
 
     const copy = Object.assign(Object.create(Object.getPrototypeOf(question)), question);
     if (redactMode === "strict") {
-      copy.body = "вопрос скрыт: в тексте были секреты";
-      journal.append({ event: "question-hidden", shortId: question.shortId });
+      for (const [key] of fields) copy[key] = "вопрос скрыт: в тексте были секреты";
+      copy.options = Array.isArray(question.options)
+        ? question.options.map((option) => ({ ...option, label: "вариант скрыт" }))
+        : [];
+      journal.append({ event: "question-hidden", shortId: question.shortId, fields: hits.length });
     } else {
-      copy.body = secrets.text;
-      journal.append({ event: "question-redacted", shortId: question.shortId });
+      for (const { key, secrets } of hits.filter((item) => item.key !== undefined)) copy[key] = secrets.text;
+      if (hits.some((item) => item.index !== undefined)) {
+        copy.options = question.options.map((option, index) => {
+          const hit = hits.find((item) => item.index === index);
+          return hit === undefined ? option : { ...option, label: hit.secrets.text };
+        });
+      }
+      journal.append({ event: "question-redacted", shortId: question.shortId, fields: hits.length });
     }
     return copy;
   }
@@ -337,19 +385,29 @@ export function createReliability({
    * Это та точка, где ответчик (002) решает отдать вопрос GUI: ему достаточно
    * на `'give-up'` вернуть `next()`.
    */
-  async function deliver({ question, chatId } = {}) {
+  async function deliver({ question, chatId, signal } = {}) {
     if (question === null || typeof question !== "object") return "give-up";
+    if (typeof transport?.sendQuestion !== "function") {
+      // Отправлять некуда: не врём «delivered», сразу отдаём вопрос GUI.
+      journal.append({ event: "give-up", shortId: question.shortId, reason: "no-transport" });
+      return "give-up";
+    }
     const deadline = now() + connectTimeoutMs;
     const target = chatId === undefined || chatId === null ? undefined : { chatId };
 
     const outgoing = prepareQuestion(question);
 
     for (let attempt = 1; ; attempt += 1) {
+      if (signal?.aborted) return "aborted";
       try {
-        await transport?.sendQuestion?.(outgoing, target);
+        // Отправка может зависнуть: гоним её с дедлайном и сигналом, иначе
+        // handler ждал бы вечно, а вопрос после аборта всё равно уехал бы.
+        const sentValue = await raceSend(outgoing, target, { deadline, signal });
+        rememberOpen(question, { messageId: sentValue?.messageId });
         journal.append({ event: "delivered", shortId: question.shortId, attempt });
         return "delivered";
       } catch (error) {
+        if (error?.name === "AbortError") return "aborted";
         const retryAfter = Number(error?.retryAfterMs ?? 0);
         const backoff = Math.min(backoffMaxMs, backoffBaseMs * 2 ** (attempt - 1));
         const wait = retryAfter > 0 ? retryAfter : backoff;
@@ -373,6 +431,43 @@ export function createReliability({
           return "give-up";
         }
       }
+    }
+  }
+
+  /** Запомнить открытый вопрос в состоянии: после рестарта его надо снять. */
+  function rememberOpen(question, { sessionId = null, messageId } = {}) {
+    try {
+      store.update((current) => {
+        const exists = current.questions.some((item) => item.shortId === question.shortId);
+        if (!exists) {
+          current.questions.push({
+            shortId: question.shortId,
+            questionId: question.questionId ?? null,
+            sessionId: sessionId ?? question.sessionId ?? null,
+            chatId: question.chatId ?? null,
+            messageId: messageId ?? null,
+            createdAt: now(),
+          });
+        } else if (messageId !== undefined) {
+          const entry = current.questions.find((item) => item.shortId === question.shortId);
+          if (entry !== undefined && entry.messageId === null) entry.messageId = messageId;
+        }
+        return current;
+      });
+    } catch (error) {
+      logger(`состояние: открытый вопрос ${question.shortId} не сохранён (${error?.message ?? error})`);
+    }
+  }
+
+  /** Убрать вопрос из открытых (ответили/сняли). */
+  function forgetOpen(shortId) {
+    try {
+      store.update((current) => {
+        current.questions = current.questions.filter((item) => item.shortId !== shortId);
+        return current;
+      });
+    } catch (error) {
+      logger(`состояние: открытый вопрос ${shortId} не снят (${error?.message ?? error})`);
     }
   }
 
@@ -409,14 +504,21 @@ export function createReliability({
    */
   async function recoverOrphans({ reason = "сессия перезапущена, вопрос снят" } = {}) {
     const current = store.read();
-    const orphans = [...current.pending];
+    const orphans = [...current.pending, ...current.questions];
     let cancelled = 0;
     let failed = 0;
 
     for (const orphan of orphans) {
       try {
-        if (typeof transport?.closeQuestion === "function") {
-          await transport.closeQuestion({ shortId: orphan.shortId, questionId: orphan.questionId ?? orphan.shortId }, reason);
+        const question = { shortId: orphan.shortId, questionId: orphan.questionId ?? orphan.shortId };
+        if (orphan.messageId !== null && orphan.messageId !== undefined && typeof transport?.editMessage === "function") {
+          // Реальное сообщение прошлого процесса: правим текст по chatId/messageId.
+          await transport.editMessage({ chatId: orphan.chatId, messageId: orphan.messageId }, reason);
+          if (typeof transport.clearButtons === "function") {
+            await transport.clearButtons({ chatId: orphan.chatId, messageId: orphan.messageId });
+          }
+        } else if (typeof transport?.closeQuestion === "function") {
+          await transport.closeQuestion(question, "restarted");
         }
         cancelled += 1;
         journal.append({ event: "orphan-cancelled", shortId: orphan.shortId });
@@ -430,6 +532,7 @@ export function createReliability({
     try {
       store.update((next) => {
         next.pending = [];
+        next.questions = [];
         return next;
       });
     } catch (error) {
@@ -477,6 +580,7 @@ export function createReliability({
   /** Поставить вопрос под TTL-сторож. `onExpire(info)` — как разблокировать ожидание. */
   function watch(question, { sessionId = null, onExpire: onExpireHook = null, ttlMs: questionTtlMs = ttlMs } = {}) {
     if (question?.shortId === undefined) return false;
+    rememberOpen(question, { sessionId: sessionId ?? question.sessionId ?? null });
     watched.set(question.shortId, {
       question,
       sessionId: sessionId ?? question.sessionId ?? null,
@@ -490,6 +594,7 @@ export function createReliability({
 
   /** Убрать вопрос из-под сторожа (ответили, сняли вручную). */
   function unwatch(shortId) {
+    forgetOpen(shortId);
     return watched.delete(shortId);
   }
 
@@ -507,7 +612,8 @@ export function createReliability({
         watched.delete(shortId);
         question.expire?.(now());
         try {
-          await transport?.closeQuestion?.(question, "expired");
+          // Зависшая правка не должна блокировать сторож: ограничиваем время.
+          await withTimeout(Promise.resolve(transport?.closeQuestion?.(question, "expired")), notifyTimeoutMs);
         } catch (error) {
           logger(`TTL: кнопки вопроса ${shortId} не снялись (${error?.message ?? error})`);
         }
@@ -528,7 +634,8 @@ export function createReliability({
       if (now() >= reminderAt) {
         const due = item.lastPushAt === null || now() - item.lastPushAt >= repushMs;
         if (due) {
-          const pushed = await notify(question, "⏳ осталось 5 минут");
+          const pushed = await withTimeout(notify(question, "⏳ осталось 5 минут"), notifyTimeoutMs)
+            .catch(() => "dropped");
           item.lastPushAt = now();
           if (pushed !== "dropped") result.reminded += 1;
           journal.append({ event: "reminder", shortId, transport: pushed });
@@ -536,6 +643,25 @@ export function createReliability({
       }
     }
     return result;
+  }
+
+  /** Ограничить ожидание: сторож не должен висеть на чужой правке. */
+  function withTimeout(promise, ms) {
+    return new Promise((resolve) => {
+      const timer = setTimeoutImpl(() => resolve("timeout"), ms);
+      timer?.unref?.();
+      Promise.resolve(promise).then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          logger(`TTL: операция не удалась (${error?.message ?? error})`);
+          resolve("failed");
+        },
+      );
+    });
   }
 
   /** Как разблокировать сессию при истечении — по конфигу. */
@@ -600,15 +726,16 @@ export function createReliability({
 
     const id = sessionId ?? question?.sessionId ?? null;
     const prompt = sessionController?.prompt;
-    if (typeof prompt !== "function" || (id === null && text === undefined)) {
+    if (typeof prompt !== "function" || id === null || id === undefined) {
       journal.append({ event: "late-answer", shortId: question?.shortId, outcome: "dropped" });
       return "dropped";
     }
-    const body = text ?? [
+    const rawBody = text ?? [
       `Ответ человека на вопрос ${question?.shortId ?? "?"}`,
       ...(Array.isArray(answer?.selected) ? answer.selected : []),
       ...(answer?.custom === undefined ? [] : [answer.custom]),
     ].join(": ");
+    const body = redact(rawBody);
     try {
       await prompt.call(sessionController, {
         requestId: randomUUID(),

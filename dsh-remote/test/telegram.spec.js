@@ -9,6 +9,9 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { apply } from "../lib/index.js";
 import { createTelegramTransport, TelegramError } from "../lib/transport/telegram.js";
@@ -589,13 +592,24 @@ test("плагин: async apply -> remoteTransport -> answerer подписан 
     logger: () => ({ debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }),
   };
 
+  // Состояние и журнал — во временном каталоге: тест не должен трогать ~/.dsh.
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-plugin-"));
+  const previousState = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = path.join(stateDir, "state.json");
+  t.after(() => {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    if (previousState === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previousState;
+  });
+
   await apply(ctx, {
     telegram: { tokenRef: "tg", chatId: 42, allowedUserIds: [7], pollTimeoutSec: 25 },
   });
 
-  assert.equal(provided.length, 1, "транспорт зарегистрирован ровно один раз");
-  assert.equal(provided[0].name, "remoteTransport");
-  const transport = provided[0].service;
+  const transportEntries = provided.filter((entry) => entry.name === "remoteTransport");
+  assert.equal(transportEntries.length, 1, "транспорт зарегистрирован ровно один раз");
+  assert.ok(provided.some((entry) => entry.name === "remoteReliability"), "устойчивость зарегистрирована");
+  const transport = transportEntries[0].service;
   assert.equal(transport.polling, true, "поллинг запущен после async-привязки");
 
   // Главное: ответчик не пропущен — его needs увидел сервис, подписка встала.

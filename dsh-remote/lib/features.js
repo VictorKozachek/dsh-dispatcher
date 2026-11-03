@@ -24,9 +24,11 @@
  * (её заведёт задача 005) транспорт спит — вопрос уходит в GUI, как и раньше.
  */
 import { telegramFeature } from "./features/telegram.js";
+import { reliabilityFeature } from "./features/reliability.js";
 import { answererFeature } from "./features/answerer.js";
 
 export const features = [
   telegramFeature,
+  reliabilityFeature,
   answererFeature,
 ];

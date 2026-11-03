@@ -121,15 +121,15 @@ function answerSummary(question) {
  * @param {() => number} [options.now] — часы (мс epoch), в тестах подменяются.
  * @returns {{attach: (ctx: object) => () => void, handler: Function, dispose: (reason?: string) => void}}
  */
-export function createAnswerer({ transport, registry, log = noopLog, now = Date.now, deliver = null } = {}) {
+export function createAnswerer({ transport, registry, log = noopLog, now = Date.now, deliver = null, reliability = null } = {}) {
   /**
    * Доставка вопроса: по умолчанию — транспорт, но 008 подставляет сюда
    * `reliability.deliver` с повторами. Сигнал `'give-up'` означает «за
    * `connectTimeoutMs` не доставили» — тогда вопрос достаётся GUI через `next()`.
    */
   const sendOne = typeof deliver === "function"
-    ? async (question) => deliver({ question })
-    : async (question) => transport.sendQuestion(question);
+    ? async (question, signal) => deliver({ question, signal })
+    : async (question, signal) => transport.sendQuestion(question, signal);
   /** Открытые вопросы по короткому id: ждём ответа транспорта. */
   const pending = new Map();
   /** Контекст плагина: из него берём cwd сессии для scope воркспейса. */
@@ -165,6 +165,7 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
   async function closeQuestions(questions, reason, attempted = null) {
     for (const question of questions) {
       pending.delete(question.shortId);
+      reliability?.unwatch?.(question.shortId);
       // Уже отвеченный или закрытый вопрос второй раз не закрываем: сообщение в
       // мессенджере и так снято, а лишний closeQuestion — ложный сигнал транспорту.
       if (!question.cancel(reason, now())) continue;
@@ -211,6 +212,7 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
     if (!entry.question.accept(parsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
     pending.delete(normalized.shortId);
+    reliability?.unwatch?.(normalized.shortId);
     entry.resolve(entry.question);
     void closeMessage(entry.question);
   }
@@ -254,6 +256,9 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       return next();
     }
 
+    /** Ответы, которыми TTL закрыл вопрос (empty/default-first). */
+    const expiredAnswers = new Map();
+
     // Ожидание ответа: по промису на вопрос, ключ — короткий id для кнопок.
     // `catch`-заглушка вешается сразу: если вопрос снимают (аборт, ошибка
     // отправки), промис остаётся неразрешённым, но не должен шуметь как
@@ -266,6 +271,24 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       });
       waited.catch(() => {});
       waiting.push(waited);
+
+      // TTL-сторож (008): по истечении вопрос получает исход из конфига. Abort
+      // отклоняет ожидание (DSH получит ASK_ABORTED), empty/default-first
+      // отдают ответ — иначе сессия ждала бы вечно: таймаута в DSH нет.
+      reliability?.watch?.(question, {
+        sessionId: question.sessionId,
+        onExpire: (info) => {
+          const entry = pending.get(question.shortId);
+          if (entry === undefined) return;
+          pending.delete(question.shortId);
+          if (info?.kind === "abort") {
+            entry.reject(info.error ?? abortError("вопрос истёк по TTL"));
+            return;
+          }
+          expiredAnswers.set(question.shortId, info.answer);
+          entry.resolve(question);
+        },
+      });
     }
 
     // Аборт слушаем ДО отправки: иначе аборт во время sendQuestion оставил бы
@@ -293,7 +316,7 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       try {
         for (const question of questions) {
           attempted.add(question);
-          const outcome = await Promise.race([sendOne(question), aborted]);
+          const outcome = await Promise.race([sendOne(question, request?.signal), aborted]);
           if (outcome === "give-up") {
             // Недоставка за отведённое время: вопрос достаётся GUI, сессия не висит.
             log(`вопрос ${question.shortId}: не доставлен — отдаю GUI (next)`);
@@ -333,8 +356,11 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
 
     for (const question of questions) pending.delete(question.shortId);
+    reliability?.unwatch?.(questions.map((question) => question.shortId));
     log(`вопросов ${questions.length}: ответ получен (${decision.scope})`);
-    return { answers: questions.map((question) => question.toAnswer()) };
+    return {
+      answers: questions.map((question) => expiredAnswers.get(question.shortId) ?? question.toAnswer()),
+    };
   }
 
   /**

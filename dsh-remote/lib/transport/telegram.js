@@ -46,6 +46,8 @@ const ALLOWED_UPDATES = Object.freeze(["message", "callback_query"]);
  */
 const CLOSE_REASONS = new Set([
   "aborted",
+  "undelivered",
+  "restarted",
   "cancelled",
   "canceled",
   "expired",
@@ -621,6 +623,35 @@ export function createTelegramTransport(options = {}) {
         return;
       }
       await closeRecord(shortId, record, text);
+    },
+
+    /**
+     * Правка сообщения по сохранённым id (без записи в памяти).
+     *
+     * Нужна после рестарта: транспорт нового процесса не помнит `sent`, но
+     * `chatId`/`messageId` лежат в состоянии — так «осиротевший» вопрос можно
+     * пометить «сессия перезапущена, вопрос снят».
+     */
+    async editMessage({ chatId: target, messageId } = {}, text) {
+      if (target === undefined || messageId === undefined) return false;
+      await call("editMessageText", {
+        chat_id: target,
+        message_id: messageId,
+        parse_mode: "HTML",
+        text: escapeHtml(text),
+      });
+      return true;
+    },
+
+    /** Снять кнопки по сохранённым id (после рестарта). */
+    async clearButtons({ chatId: target, messageId } = {}) {
+      if (target === undefined || messageId === undefined) return false;
+      await call("editMessageReplyMarkup", {
+        chat_id: target,
+        message_id: messageId,
+        reply_markup: { inline_keyboard: [] },
+      });
+      return true;
     },
 
     /** Подписка на ответы; возвращает отписку. */
