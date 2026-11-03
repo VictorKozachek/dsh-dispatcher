@@ -134,7 +134,9 @@ export function collectNotices({ board, seen = new Set(), lastTodo = null, works
 
   for (const card of cards) {
     if (!NOTIFY_STATUSES.includes(card.status)) continue;
-    const key = `${card.id}:${card.status}:${card.updated}`;
+    // Воркспейс в ключе: два проекта могут иметь карточки с одинаковыми
+    // id/status/updated — это разные уведомления.
+    const key = `${workspace}:${card.id}:${card.status}:${card.updated}`;
     if (seen.has(key)) continue;
     nextSeen.add(key);
     notices.push({
@@ -151,7 +153,7 @@ export function collectNotices({ board, seen = new Set(), lastTodo = null, works
   const todoCount = cards.filter((card) => card.status === "todo").length;
   const minTodo = numberOf(board?.minTodo);
   if (minTodo !== null && lastTodo !== null && todoCount < minTodo && lastTodo >= minTodo) {
-    const key = `todo-low:${minTodo}:${todoCount}`;
+    const key = `${workspace}:todo-low:${minTodo}:${todoCount}`;
     if (!seen.has(key)) {
       nextSeen.add(key);
       notices.push({
@@ -200,6 +202,8 @@ export function createNotifier({
   enabled = true,
   intervalMs = NOTIFY_INTERVAL_MS,
   maxText = 4000,
+  /** Лимит текста в момент отправки: caps канала могут появиться позже старта. */
+  resolveMaxText = null,
   log = noopLog,
   setInterval: setIntervalImpl = setInterval,
   clearInterval: clearIntervalImpl = clearInterval,
@@ -216,18 +220,19 @@ export function createNotifier({
     return {
       seen: new Set(Array.isArray(notify.seen) ? notify.seen.slice(-SEEN_LIMIT) : []),
       byWorkspace: notify.lastTodo !== null && typeof notify.lastTodo === "object" ? { ...notify.lastTodo } : {},
-      baseline: notify.baseline === true,
+      // baseline — по воркспейсам: новый проект не должен «догонять» историей.
+      baselines: notify.baseline !== null && typeof notify.baseline === "object" ? { ...notify.baseline } : {},
     };
   }
 
   /** Записать новое состояние дедупа. */
-  function writeNotifyState({ seen, byWorkspace, baseline }) {
+  function writeNotifyState({ seen, byWorkspace, baselines }) {
     if (typeof store?.update !== "function") return;
     store.update((state) => {
       state.notify = {
         seen: [...seen].slice(-SEEN_LIMIT),
         lastTodo: { ...byWorkspace },
-        baseline: baseline === true,
+        baseline: { ...baselines },
       };
       return state;
     });
@@ -250,7 +255,7 @@ export function createNotifier({
       const byWorkspace = { ...state.byWorkspace };
       // Базовый проход — один раз: запоминаем текущее состояние и молчим,
       // иначе после рестарта плагина приходил бы спам по старым ready/blocked.
-      const baseline = state.baseline !== true;
+      const baselines = state.baselines;
       const sent = [];
 
       for (const workspace of roots) {
@@ -262,25 +267,31 @@ export function createNotifier({
           lastTodo: previousTodo,
           workspace,
         });
-        byWorkspace[workspace] = todoCount;
-        if (baseline) {
-          // Базовый проход: только запоминаем, ничего не шлём.
+        // Первый проход по конкретному воркспейсу — базовый: запоминаем, молчим.
+        if (baselines[workspace] !== true) {
           for (const notice of notices) seen.add(notice.key);
+          byWorkspace[workspace] = todoCount;
+          baselines[workspace] = true;
           continue;
         }
         const quiet = quietHours === false ? false : inQuietHours(now(), quietHours);
+        if (quiet && notices.length > 0) {
+          // Ни ключи, ни lastTodo не обновляем: иначе todo-low «сгорит» тем, что
+          // последнее значение уже стало ниже минимума. После тишины повторим.
+          stats.skippedQuiet += notices.length;
+          for (const notice of notices) log(`уведомления: тихие часы — ${notice.key} отложено`);
+          continue;
+        }
+        byWorkspace[workspace] = todoCount;
         const queue = throttle([], intervalMs, { now });
         for (const notice of notices) {
-          if (quiet) {
-            // Ключ НЕ помечаем: после тихих часов уведомление ещё уйдёт.
-            stats.skippedQuiet += 1;
-            log(`уведомления: тихие часы — ${notice.key} отложено`);
-            continue;
-          }
-          seen.add(notice.key);
           queue.push(async () => {
             try {
-              await send({ kind: notice.kind, text: noticeText(notice, { maxText }) });
+              const limit = typeof resolveMaxText === "function" ? (resolveMaxText() ?? maxText) : maxText;
+              await send({ kind: notice.kind, text: noticeText(notice, { maxText: limit }), workspace: notice.workspace });
+              // Ключ помечаем ТОЛЬКО после успешной отправки: сбой сети/канала
+              // должен повторяться, а не терять уведомление навсегда.
+              seen.add(notice.key);
               stats.sent += 1;
               sent.push(notice);
             } catch (error) {
@@ -292,7 +303,7 @@ export function createNotifier({
         await queue.run();
       }
 
-      writeNotifyState({ seen, byWorkspace, baseline: true });
+      writeNotifyState({ seen, byWorkspace, baselines });
       return sent;
     } finally {
       scanning = false;

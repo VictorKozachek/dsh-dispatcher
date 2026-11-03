@@ -69,10 +69,6 @@ export const notifyFeature = {
       });
     }
 
-    // Лимит текста — из возможностей канала: уведомление не должно резаться
-    // транспортом где попало.
-    const transportCaps = liveTransport()?.caps ?? null;
-
     const notifier = createNotifier({
       store: deps.get("remoteStore"),
       workspaces,
@@ -81,7 +77,12 @@ export const notifyFeature = {
       quietHours: settings.quietHours === undefined ? undefined : settings.quietHours,
       enabled: true,
       intervalMs: Number.isFinite(settings.intervalMs) ? settings.intervalMs : undefined,
-      maxText: Number.isFinite(transportCaps?.maxText) ? transportCaps.maxText : 4000,
+      // Лимит — в момент отправки: на старте канала обычно ещё нет, а caps
+      // появляются/меняются позже.
+      resolveMaxText: () => {
+        const caps = liveTransport()?.caps ?? null;
+        return Number.isFinite(caps?.maxText) ? caps.maxText : 4000;
+      },
       log: (message) => deps.logger.debug(message),
     });
 

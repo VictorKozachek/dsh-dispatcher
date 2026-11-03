@@ -254,3 +254,144 @@ test("фича notify: false в конфиге выключает фичу", asy
   notifyFeature.apply(ctx, { notify: { enabled: false, workspaces: ["/p"] } }, deps);
   assert.equal(provided.has("remoteNotifier"), false, "enabled:false тоже выключает");
 });
+
+// --- регрессии по ревью 014 -------------------------------------------------
+
+test("дедуп учитывает воркспейс: два проекта с одинаковыми id не подавляют друг друга", async (t) => {
+  const one = makeWorkspace(t, [{ id: "001", status: "todo", updated: "t1" }]);
+  const two = makeWorkspace(t, [{ id: "001", status: "todo", updated: "t1" }]);
+  const store = createStore({ file: path.join(one, "state.json") });
+  const sent = [];
+  const notifier = createNotifier({
+    store,
+    workspaces: [one, two],
+    send: async (message) => sent.push(message),
+    now: () => new Date(2026, 10, 3, 12).getTime(),
+    quietHours: false,
+    intervalMs: 0,
+    log: () => {},
+  });
+
+  await notifier.scan(); // baseline обоих
+  writeCard(one, { id: "001", status: "ready", updated: "t2" });
+  writeCard(two, { id: "001", status: "ready", updated: "t2" });
+  await notifier.scan();
+
+  assert.equal(sent.length, 2, "по уведомлению на каждый проект");
+  assert.equal(new Set(sent.map((message) => message.workspace)).size, 2, "разные воркспейсы");
+});
+
+test("тихие часы не теряют todo-low: ночью отложили, днём пришло", async (t) => {
+  const workspace = makeWorkspace(t, [
+    { id: "001", status: "todo", updated: "t1" },
+    { id: "002", status: "todo", updated: "t1" },
+    { id: "003", status: "todo", updated: "t1" },
+  ], { minTodo: 3 });
+  const { notifier, sent, clock } = makeNotifier(t, workspace);
+  await notifier.scan(); // baseline: todo=3
+
+  clock.value = new Date(2026, 10, 3, 23, 30, 0).getTime();
+  writeCard(workspace, { id: "003", status: "backlog", updated: "t2" }); // todo=2
+  await notifier.scan();
+  assert.equal(sent.length, 0, "ночью тихо");
+  assert.ok(notifier.stats.skippedQuiet >= 1, "отложено");
+
+  clock.value = new Date(2026, 10, 4, 9, 0, 0).getTime();
+  await notifier.scan();
+  assert.equal(sent.length, 1, "днём todo-low пришло");
+  assert.match(sent[0].text, /пора выдать/);
+});
+
+test("сбой отправки не помечает уведомление доставленным — следующий scan повторяет", async (t) => {
+  const workspace = makeWorkspace(t, [{ id: "001", status: "todo", updated: "t1" }]);
+  let fail = true;
+  const sent = [];
+  const store = createStore({ file: path.join(workspace, "state.json") });
+  const notifier = createNotifier({
+    store,
+    workspaces: [workspace],
+    send: async (message) => {
+      if (fail) throw new Error("канал не поднят");
+      sent.push(message);
+    },
+    now: () => new Date(2026, 10, 3, 12).getTime(),
+    quietHours: false,
+    intervalMs: 0,
+    log: () => {},
+  });
+
+  await notifier.scan();
+  writeCard(workspace, { id: "001", status: "ready", updated: "t2" });
+  await notifier.scan();
+  assert.equal(notifier.stats.errors, 1, "первая попытка упала");
+
+  fail = false;
+  await notifier.scan();
+  assert.equal(sent.length, 1, "повтор после восстановления канала");
+});
+
+test("новый воркспейс после baseline не спамит историей", async (t) => {
+  const one = makeWorkspace(t, [{ id: "001", status: "ready", updated: "t1" }]);
+  const two = makeWorkspace(t, [
+    { id: "010", status: "ready", updated: "t1" },
+    { id: "011", status: "blocked", updated: "t1", note: "старое" },
+  ]);
+  const store = createStore({ file: path.join(one, "state.json") });
+  const sent = [];
+  let workspaces = [one];
+  const notifier = createNotifier({
+    store,
+    workspaces,
+    send: async (message) => sent.push(message),
+    now: () => new Date(2026, 10, 3, 12).getTime(),
+    quietHours: false,
+    intervalMs: 0,
+    log: () => {},
+  });
+
+  await notifier.scan(); // baseline первого
+  workspaces = [one, two];
+  const second = createNotifier({
+    store,
+    workspaces,
+    send: async (message) => sent.push(message),
+    now: () => new Date(2026, 10, 3, 12, 1).getTime(),
+    quietHours: false,
+    intervalMs: 0,
+    log: () => {},
+  });
+  await second.scan();
+
+  assert.equal(sent.length, 0, "история нового проекта не приходит");
+  writeCard(two, { id: "010", status: "moved", updated: "t2" });
+  writeCard(two, { id: "010", status: "ready", updated: "t3" });
+  await second.scan();
+  assert.equal(sent.length, 1, "а новый переход — приходит");
+  assert.match(sent[0].text, /#010/);
+});
+
+test("resolveMaxText: лимит берётся в момент отправки (caps появились позже)", async (t) => {
+  const workspace = makeWorkspace(t, [{ id: "001", status: "todo", updated: "t1" }]);
+  const store = createStore({ file: path.join(workspace, "state.json") });
+  const sent = [];
+  let caps = null;
+  const notifier = createNotifier({
+    store,
+    workspaces: [workspace],
+    send: async (message) => sent.push(message),
+    now: () => new Date(2026, 10, 3, 12).getTime(),
+    quietHours: false,
+    intervalMs: 0,
+    resolveMaxText: () => caps?.maxText,
+    maxText: 4000,
+    log: () => {},
+  });
+
+  await notifier.scan();
+  caps = { maxText: 40 }; // канал поднялся с маленьким лимитом
+  writeCard(workspace, { id: "001", status: "ready", updated: "t2", note: "очень длинное пояснение ".repeat(10) });
+  await notifier.scan();
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].text.length <= 40, true, `длина ${sent[0].text.length}`);
+});

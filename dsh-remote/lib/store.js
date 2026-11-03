@@ -51,7 +51,7 @@ export function defaultState() {
     recent: [],
     pending: [],
     /** 014: дедуп уведомлений доски: что уже отправлено и сколько было todo. */
-    notify: { seen: [], lastTodo: {}, baseline: false },
+    notify: { seen: [], lastTodo: {}, baseline: {} },
   };
 }
 
@@ -418,7 +418,11 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
       lastTodo: value.notify?.lastTodo !== null && typeof value.notify?.lastTodo === "object"
         ? { ...value.notify.lastTodo }
         : {},
-      baseline: value.notify?.baseline === true,
+      // 014: baseline теперь по воркспейсам (`{project: true}`), старое
+      // логическое значение читаем как «все воркспейсы уже базовые».
+      baseline: value.notify?.baseline !== null && typeof value.notify?.baseline === "object"
+        ? { ...value.notify.baseline }
+        : {},
     },
   };
 }
