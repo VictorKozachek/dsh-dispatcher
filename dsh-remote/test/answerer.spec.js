@@ -416,11 +416,11 @@ test("detach снимает слушатель и подписку на отве
   assert.equal((ctx.hooks.get(EVENT) ?? []).length, 0);
 });
 
-test("фича answerer из реестра: с транспортом слушатель поднимается каркасом", () => {
+test("фича answerer из реестра: с транспортом слушатель поднимается каркасом", async () => {
   const transport = fakeTransport();
   const ctx = fakeContext({ services: { remoteTransport: transport } });
 
-  apply(ctx, {}); // каркас прогоняет реестр фич из lib/features.js
+  await apply(ctx, {}); // каркас прогоняет реестр фич из lib/features.js (apply async)
 
   const list = ctx.hooks.get(EVENT) ?? [];
   assert.equal(list.length, 1, "ответчик подписан на waterfall");
@@ -435,10 +435,10 @@ test("фича answerer из реестра: с транспортом слуш�
   assert.equal(transport.subscribed, false);
 });
 
-test("фича answerer без транспорта не поднимается: вопрос уходит в GUI", () => {
+test("фича answerer без транспорта не поднимается: вопрос уходит в GUI", async () => {
   const ctx = fakeContext();
 
-  assert.doesNotThrow(() => apply(ctx, {}));
+  await assert.doesNotReject(() => apply(ctx, {}));
 
   assert.equal((ctx.hooks.get(EVENT) ?? []).length, 0, "без транспорта слушателя нет");
 });

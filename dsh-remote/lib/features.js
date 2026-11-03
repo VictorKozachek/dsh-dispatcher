@@ -17,11 +17,16 @@
  *   deps.get(name)  — сервис из ctx или null, без исключений;
  *   deps.onDispose  — снятие ресурсов фичи при выгрузке плагина.
  *
- * Пока подключён один ответчик (`./features/answerer.js`). Транспорта у него ещё
- * нет (задача 003), поэтому каркас пропускает фичу с warn, а вопрос уходит в GUI.
+ * Пока подключены две фичи: транспорт (`./features/telegram.js`) и ответчик
+ * (`./features/answerer.js`). **Порядок важен**: ответчик объявляет
+ * `needs: [remoteTransport]`, а каркас проверяет сервисы по порядку реестра,
+ * поэтому транспорт должен зарегистрироваться раньше. Без привязки в состоянии
+ * (её заведёт задача 005) транспорт спит — вопрос уходит в GUI, как и раньше.
  */
+import { telegramFeature } from "./features/telegram.js";
 import { answererFeature } from "./features/answerer.js";
 
 export const features = [
+  telegramFeature,
   answererFeature,
 ];

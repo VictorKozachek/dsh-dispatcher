@@ -103,6 +103,14 @@ function choiceFor(question, event) {
   };
 }
 
+/** Сводка ответа для правки сообщения: выбранные варианты и/или текст. */
+function answerSummary(question) {
+  const selected = Array.isArray(question?.answer?.selected) ? question.answer.selected : [];
+  const custom = typeof question?.answer?.custom === "string" ? question.answer.custom : "";
+  const parts = [...selected, ...(custom === "" ? [] : [custom])];
+  return parts.join(", ");
+}
+
 /**
  * Ответчик.
  *
@@ -161,7 +169,22 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
   }
 
-  /** Ответ транспорта: разнести по ожидающим вопросам и разбудить слушатель. */
+  /** Правка сообщения после ответа: в фоне, ошибка не мешает ответу. */
+  async function closeMessage(question) {
+    try {
+      await transport?.closeQuestion?.(question, answerSummary(question));
+    } catch (error) {
+      log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
+    }
+  }
+
+  /**
+   * Ответ транспорта: разнести по ожидающим вопросам, разбудить слушатель и
+   * поправить сообщение в мессенджере.
+   *
+   * Слушатель будим **до** правки: медленный (или зависший) editMessageText не
+   * должен задерживать ответ сессии. Правка — украшение, ответ — смысл.
+   */
   function onTransportAnswer(event) {
     const normalized = normalizeAnswerEvent(event);
     if (normalized === null) {
@@ -181,6 +204,7 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     if (!entry.question.accept(parsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
     pending.delete(normalized.shortId);
     entry.resolve(entry.question);
+    void closeMessage(entry.question);
   }
 
   /**
