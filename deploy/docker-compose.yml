@@ -1,0 +1,62 @@
+# Self-host релея DSH: релей + Caddy с автоматическим TLS.
+#
+#   cp deploy/.env.example deploy/.env   # заполнить RELAY_DOMAIN и RELAY_AGENT_TOKEN
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# Caddy слушает 80/443 на хосте, релей доступен только внутри сети compose
+# (никаких портов наружу — TLS терминирует Caddy).
+
+name: dsh-relay
+
+services:
+  relay:
+    build:
+      context: ..
+      dockerfile: deploy/relay.Dockerfile
+    # Необязательные переменные (allowlist, TTL, TZ) приходят только из .env:
+    # так пустое/закомментированное значение не превращается в пустую строку,
+    # которую релей принял бы за «allowlist пуст» (все устройства запрещены).
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      RELAY_BIND: 0.0.0.0:8080
+      RELAY_DATABASE_URL: sqlite:///data/relay.db?mode=rwc
+      # Секрет обязателен: без него compose откажется стартовать с понятным
+      # сообщением (см. deploy/README.md «Быстрый старт»).
+      RELAY_AGENT_TOKEN: "${RELAY_AGENT_TOKEN:?RELAY_AGENT_TOKEN обязателен — см. deploy/.env.example}"
+    volumes:
+      - relay_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-H", "X-Relay-Version: 1", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    networks: [internal]
+
+  caddy:
+    image: caddy:2.8-alpine
+    depends_on:
+      relay:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      RELAY_DOMAIN: "${RELAY_DOMAIN:?RELAY_DOMAIN обязателен — домен, указывающий на этот сервер}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    networks: [internal]
+
+volumes:
+  relay_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:
