@@ -632,6 +632,31 @@ export function createTelegramTransport(options = {}) {
     },
 
     /**
+     * Правка текста вопроса (напоминание/пометка) в его сообщении.
+     *
+     * Ищем запись по `shortId` (процесс отправлял вопрос сам) или берём
+     * `chatId`/`messageId` из вопроса (их сохраняет reliability в состоянии).
+     * Возвращаем `true` только если правка реально ушла: reliability по этому
+     * результату решает, делать ли фолбэк — молча «проглотить» нельзя.
+     */
+    async editQuestion(question, text) {
+      const shortId = question?.shortId;
+      const record = typeof shortId === "string" ? sent.get(shortId) : undefined;
+      const target = record?.chatId ?? question?.chatId ?? chatId;
+      const messageIds = Array.isArray(record?.messageIds) && record.messageIds.length > 0
+        ? record.messageIds
+        : (Number.isFinite(question?.messageId) ? [question.messageId] : []);
+      if (messageIds.length === 0) return false;
+      await call("editMessageText", {
+        chat_id: target,
+        message_id: messageIds[0],
+        parse_mode: "HTML",
+        text: escapeHtml(text),
+      });
+      return true;
+    },
+
+    /**
      * Правка сообщения по сохранённым id (без записи в памяти).
      *
      * Нужна после рестарта: транспорт нового процесса не помнит `sent`, но

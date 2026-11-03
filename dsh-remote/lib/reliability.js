@@ -605,15 +605,21 @@ export function createReliability({
    * новое сообщение (карточка это разрешает при `caps.editAfterAnswer === false`).
    */
   async function notify(question, text) {
+    // Правку проверяем по результату, а не по наличию метода: фасад 005 есть
+    // всегда, но если за ним нет живого канала, правка «успешно» ничего не делает.
     if (typeof transport?.editQuestion === "function") {
       try {
-        await transport.editQuestion(question, text);
-        return "edited";
+        const edited = await transport.editQuestion(question, text);
+        if (edited !== false) return "edited";
+        logger(`уведомление ${question.shortId}: транспорт не смог править сообщение`);
       } catch (error) {
         logger(`уведомление ${question.shortId}: правка не удалась (${error?.message ?? error})`);
       }
     }
-    if (typeof transport?.sendQuestion === "function") {
+    // Новое сообщение вместо правки разрешено только там, где правка невозможна
+    // по возможностям транспорта (caps.editAfterAnswer === false).
+    const caps = transport?.caps ?? {};
+    if (caps.editAfterAnswer === false && typeof transport?.sendQuestion === "function") {
       try {
         await transport.sendQuestion({
           shortId: randomUUID().slice(0, 8),
@@ -676,6 +682,13 @@ export function createReliability({
         watched.delete(shortId);
         forgetOpen(shortId);
         question.expire?.(now());
+        // §7.3: по TTL сообщение помечается «⌛ ждёт ответа», и только потом
+        // снимаются кнопки. Silent-close сам текст не меняет.
+        try {
+          await withTimeout(Promise.resolve(transport?.editQuestion?.(question, "⌛ ждёт ответа")), notifyTimeoutMs);
+        } catch (error) {
+          logger(`TTL: пометка вопроса ${shortId} не удалась (${error?.message ?? error})`);
+        }
         try {
           // Зависшая правка не должна блокировать сторож: ограничиваем время.
           await withTimeout(Promise.resolve(transport?.closeQuestion?.(question, "expired")), notifyTimeoutMs);

@@ -295,9 +295,10 @@ test("TTL: onExpire 'empty' и 'default-first' дают ответ, а не ош
   }
 });
 
-test("TTL: без правки напоминание уходит коротким новым сообщением", async (t) => {
+test("TTL: транспорт без правки (caps.editAfterAnswer=false) шлёт короткое напоминание", async (t) => {
   const clock = fakeClock();
   const transport = fakeTransport({ edit: false });
+  transport.caps = { ...transport.caps, editAfterAnswer: false };
   const { reliability } = makeReliability(t, { clock, transport });
   const question = openQuestion({ ttlMs: 10 * 60 * 1000, now: 0 });
   reliability.watch(question);
@@ -308,6 +309,19 @@ test("TTL: без правки напоминание уходит коротк�
   assert.equal(transport.sent.length, 1);
   assert.match(transport.sent[0].question.body, /⏳ осталось 5 минут/);
   assert.deepEqual(transport.sent[0].question.options, []);
+});
+
+test("TTL: с правкой, но без метода editQuestion новое сообщение не шлётся", async (t) => {
+  const clock = fakeClock();
+  const transport = fakeTransport({ edit: false }); // caps.editAfterAnswer остаётся true
+  const { reliability } = makeReliability(t, { clock, transport });
+  const question = openQuestion({ ttlMs: 10 * 60 * 1000, now: 0 });
+  reliability.watch(question);
+
+  clock.advance(10 * 60 * 1000 - REMINDER_MS);
+  await reliability.tick();
+
+  assert.equal(transport.sent.length, 0, "§7.3: никакого нового уведомления, когда правка ожидается");
 });
 
 test("сторож включается через setInterval с unref и выключается", () => {
@@ -1127,4 +1141,76 @@ test("redact: base64 после слэша маскируется, путь — 
   assert.match(redact("ключ: /QWxhZGRpbjpvcGVu/c2FtZQ1hZWxsbw/QWxhZGRpbjpvcG"), /<redacted-base64>/);
   assert.equal(redact("/Users/Victor/Projects/DSHDispatcher/Worktree008"), "/Users/Victor/Projects/DSHDispatcher/Worktree008");
   assert.equal(redact("/Users/Victor/Projects/2026/11/03/DSH/Worktree008"), "/Users/Victor/Projects/2026/11/03/DSH/Worktree008");
+});
+
+test("настоящий telegram: напоминание — правка сообщения, а не новое", async (t) => {
+  const clock = fakeClock();
+  const calls = [];
+  const fetchImpl = async (url) => {
+    const method = url.split("/").pop();
+    calls.push(method);
+    if (method === "getUpdates") return new Promise(() => {});
+    if (method === "sendMessage") return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 900 } }; } };
+    return { ok: true, status: 200, async json() { return { ok: true, result: true }; } };
+  };
+  const transport = createTelegramTransport({
+    token: "123456:TEST-TOKEN",
+    chatId: 42,
+    allowedUserIds: [7],
+    fetch: fetchImpl,
+    jitter: () => 0,
+    now: () => clock.now(),
+    sleep: async () => {},
+    log: () => {},
+    persistOffset: () => {},
+  });
+  const { reliability } = makeReliability(t, { clock, transport });
+  const question = openQuestion({ ttlMs: 10 * 60 * 1000, now: 0 });
+  await transport.sendQuestion(question);
+  reliability.watch(question);
+
+  clock.advance(10 * 60 * 1000 - REMINDER_MS);
+  await reliability.tick();
+
+  const sends = calls.filter((method) => method === "sendMessage");
+  assert.equal(sends.length, 1, "нового сообщения нет — только исходная отправка");
+  const edits = calls.filter((method) => method === "editMessageText");
+  assert.equal(edits.length, 1, "напоминание ушло правкой (§7.3)");
+});
+
+test("настоящий telegram: по TTL сообщение помечается «⌛ ждёт ответа» и кнопки снимаются", async (t) => {
+  const clock = fakeClock();
+  const payloads = [];
+  const fetchImpl = async (url, init = {}) => {
+    const method = url.split("/").pop();
+    payloads.push({ method, payload: init.body === undefined ? null : JSON.parse(init.body) });
+    if (method === "getUpdates") return new Promise(() => {});
+    if (method === "sendMessage") return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 900 } }; } };
+    return { ok: true, status: 200, async json() { return { ok: true, result: true }; } };
+  };
+  const transport = createTelegramTransport({
+    token: "123456:TEST-TOKEN",
+    chatId: 42,
+    allowedUserIds: [7],
+    fetch: fetchImpl,
+    jitter: () => 0,
+    now: () => clock.now(),
+    sleep: async () => {},
+    log: () => {},
+    persistOffset: () => {},
+  });
+  const { reliability } = makeReliability(t, { clock, transport });
+  const question = openQuestion({ ttlMs: 10 * 60 * 1000, now: 0 });
+  await transport.sendQuestion(question);
+  reliability.watch(question);
+
+  clock.advance(10 * 60 * 1000 + 1);
+  await reliability.tick();
+
+  const edits = payloads.filter(({ method }) => method === "editMessageText");
+  assert.ok(edits.length >= 1, "текст сообщения отредактирован");
+  assert.match(edits.at(-1).payload.text, /⌛ ждёт ответа/, "пометка по TTL");
+  const markup = payloads.filter(({ method }) => method === "editMessageReplyMarkup");
+  assert.ok(markup.length >= 1, "кнопки сняты");
+  assert.equal(payloads.filter(({ method }) => method === "sendMessage").length, 1, "новых сообщений нет");
 });
