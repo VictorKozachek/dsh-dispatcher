@@ -22,6 +22,9 @@
  * при чтении — как в реестре задачи 002: сессия → воркспейс → глобально.
  */
 
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { createRegistry } from "./domain/registry.js";
 import { credentialRef, createCredentialAccess } from "./store.js";
 
@@ -46,8 +49,195 @@ const HELP_TEXT = [
   "  /remote status     — привязка, режим, источник токена",
   "  /remote test       — отправить тестовый вопрос в мессенджер",
   "  /remote who        — сессия, воркспейс и эффективный режим",
+  "  /remote doctor     — проверка привязки, канала и состояния (ok/warn/fail)",
   "  /remote disconnect — отвязать бота и выключить режим",
 ].join("\n");
+
+/**
+ * Версия плагина из `package.json` (для `doctor`).
+ * @returns строка версии или null.
+ */
+export function readPluginVersion() {
+  try {
+    const file = fileURLToPath(new URL("../package.json", import.meta.url));
+    const pkg = JSON.parse(fs.readFileSync(file, "utf8"));
+    return typeof pkg.version === "string" && pkg.version !== "" ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Отчёт `doctor` человеческим текстом: пункт, деталь и что делать.
+ * @param checks - список `{level: ok|warn|fail, title, detail, hint?}`.
+ * @returns текст для команды.
+ */
+export function formatDoctorReport(checks) {
+  const list = Array.isArray(checks) ? checks : [];
+  const lines = list.map((check) => {
+    const head = `[${check.level}] ${check.title}: ${check.detail ?? ""}`;
+    return check.hint === undefined || check.hint === "" ? head : `${head}\n      → ${check.hint}`;
+  });
+  const failed = list.filter((check) => check.level === "fail").length;
+  const warned = list.filter((check) => check.level === "warn").length;
+  const summary = failed > 0
+    ? `есть проблемы: ${failed} fail, ${warned} warn — сделайте шаги из подсказок`
+    : warned > 0
+      ? `работает, но есть предупреждения: ${warned}`
+      : "всё в порядке";
+  return [...lines, "", summary].join("\n");
+}
+
+/**
+ * Проверки `doctor` на инжектируемых сервисах: без сети и без реальных часов.
+ *
+ * Уровни: `ok` — всё нормально, `warn` — работает, но стоит поправить, `fail` —
+ * без этого удалённый режим не заработает. Каждый пункт с подсказкой «что
+ * делать», иначе диагностика бесполезна.
+ *
+ * @param options - `{store, credentials, transport, telegramCallImpl, version, now}`.
+ * @returns список проверок.
+ */
+export async function runDoctorChecks({
+  store = null,
+  credentials = null,
+  transport = null,
+  telegramCallImpl = null,
+  version = null,
+  now = () => Date.now(),
+} = {}) {
+  const checks = [];
+  const add = (level, title, detail, hint) => {
+    checks.push({ level, title, detail: String(detail ?? ""), ...(hint === undefined ? {} : { hint }) });
+  };
+
+  add(
+    version === null ? "warn" : "ok",
+    "плагин",
+    version === null ? "версия не прочитана из package.json" : `dsh-remote ${version}`,
+    version === null ? "переустановите пакет: bin/install-remote.sh" : undefined,
+  );
+
+  // --- токен ---------------------------------------------------------------
+  let token = null;
+  const access = credentials;
+  if (access === null || typeof access?.availableFor !== "function") {
+    add("fail", "токен", "ctx.credentials недоступен", "задайте секрет или токен в окружении");
+  } else if (!access.availableFor(TELEGRAM_TOKEN_REF)) {
+    add("fail", "токен", `нет ссылки ${TELEGRAM_TOKEN_REF}`, "получите токен у @BotFather и выполните /remote connect");
+  } else {
+    try {
+      token = await access.resolve(TELEGRAM_TOKEN_REF);
+    } catch {
+      token = null;
+    }
+    if (typeof token !== "string" || token === "") {
+      add("fail", "токен", `${TELEGRAM_TOKEN_REF} не разрешился`, "проверьте секрет: /remote connect");
+      token = null;
+    } else {
+      const info = typeof access.describe === "function" ? await access.describe(TELEGRAM_TOKEN_REF).catch(() => null) : null;
+      const source = typeof info?.source === "string" ? info.source : "unknown";
+      const readonly = info?.writable === false ? ", только чтение" : "";
+      add("ok", "токен", `${TELEGRAM_TOKEN_REF} найден (источник: ${source}${readonly})`);
+    }
+  }
+
+  // --- getMe ---------------------------------------------------------------
+  if (token !== null && typeof telegramCallImpl === "function") {
+    try {
+      const me = await telegramCallImpl(token, "getMe", {});
+      const username = me?.result?.username ?? me?.username ?? null;
+      add(
+        typeof username === "string" && username !== "" ? "ok" : "warn",
+        "getMe",
+        typeof username === "string" && username !== "" ? `бот @${username} на связи` : "Telegram ответил без username",
+        typeof username === "string" && username !== "" ? undefined : "проверьте токен у @BotFather",
+      );
+    } catch (error) {
+      add("fail", "getMe", `Telegram не ответил: ${humanError(error, token)}`, "проверьте сеть и токен; токен можно перевыпустить у @BotFather");
+    }
+  } else if (token !== null) {
+    add("warn", "getMe", "проверка вне плагина недоступна");
+  }
+
+  // --- поллеры -------------------------------------------------------------
+  const lock = typeof store?.lockState === "function" ? store.lockState() : null;
+  if (lock === null) {
+    add("warn", "поллеры", "состояние не подключено", "проверьте установку плагина");
+  } else if (lock.held !== true) {
+    add("ok", "поллеры", "lock свободен");
+  } else if (lock.mine === true) {
+    add("ok", "поллеры", `lock держит этот процесс (pid ${lock.holder?.pid ?? "?"})`);
+  } else {
+    add(
+      "warn",
+      "поллеры",
+      `lock держит pid ${lock.holder?.pid ?? "?"}`,
+      "второй поллер получит 409 Conflict: остановите лишний процесс (или дождитесь завершения connect)",
+    );
+  }
+
+  // --- канал ---------------------------------------------------------------
+  if (transport === null) {
+    add("warn", "канал", "транспорт не поднят", "привяжите бота: /remote connect");
+  } else {
+    const lastError = transport.lastError ?? null;
+    const updateId = transport.lastUpdateId ?? null;
+    if (lastError !== null) {
+      add("warn", "канал", `последняя ошибка: ${humanError(lastError, token)}`, "проверьте сеть и токен; поллинг повторяется сам с backoff");
+    } else if (Number.isFinite(updateId) && updateId >= 0) {
+      add("ok", "канал", `поллинг работает, последний update_id ${updateId}`);
+    } else {
+      add("ok", "канал", "транспорт поднят");
+    }
+  }
+
+  // --- состояние и права ---------------------------------------------------
+  const statePath = typeof store?.paths?.file === "string" ? store.paths.file : null;
+  if (statePath === null) {
+    add("warn", "состояние", "state.json не найден", "оно появится после /remote connect");
+  } else {
+    let text = null;
+    let mode = null;
+    try {
+      text = fs.readFileSync(statePath, "utf8");
+      mode = fs.statSync(statePath).mode & 0o777;
+    } catch (error) {
+      const missing = error?.code === "ENOENT";
+      add(missing ? "warn" : "fail", "состояние", missing ? "файла ещё нет" : `не прочитан: ${humanError(error)}`, "оно появится после /remote connect");
+    }
+    if (text !== null) {
+      // Права проверяем независимо от содержимого: битый JSON — отдельная
+      // проблема, но файл с 644 не должен проходить незамеченным.
+      if (mode !== null) {
+        add(
+          mode === 0o600 ? "ok" : "warn",
+          "права",
+          `state.json: ${mode.toString(8)}`,
+          mode === 0o600 ? undefined : `должно быть 600: chmod 600 ${statePath}`,
+        );
+      }
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        add("fail", "состояние", "битый JSON", "удалите файл и выполните /remote connect заново");
+      }
+      if (parsed !== null && typeof parsed === "object") {
+        const binding = parsed.bindings ?? null;
+        add(
+          binding === null ? "warn" : "ok",
+          "состояние",
+          binding === null ? "привязки нет" : `привязка: ${binding.transport ?? "telegram"} @${binding.botUsername ?? "?"}`,
+          binding === null ? "выполните /remote connect" : undefined,
+        );
+      }
+    }
+  }
+
+  void now;
+  return checks;
+}
 
 /** `{kind:'success', text}` — то, что команда возвращает человеку. */
 function success(text) {
@@ -531,6 +721,19 @@ export function createRemoteCommands({
   }
 
   /** `/remote disconnect` — отвязать бота и выключить режим. */
+  /** `/remote doctor` — диагностика: токен, getMe, поллеры, канал, состояние. */
+  async function doctor() {
+    const checks = await runDoctorChecks({
+      store,
+      credentials,
+      transport: liveTransport(),
+      telegramCallImpl: (token, method) => telegramCall(token, method),
+      version: readPluginVersion(),
+      now,
+    });
+    return success(formatDoctorReport(checks));
+  }
+
   async function disconnect(invocation) {
     const confirm = await askStep(invocation, {
       id: "remote-disconnect-confirm",
@@ -599,6 +802,8 @@ export function createRemoteCommands({
           return await testChannel(invocation);
         case "who":
           return who(invocation);
+        case "doctor":
+          return await doctor();
         case "disconnect":
           return await disconnect(invocation);
         case "help":

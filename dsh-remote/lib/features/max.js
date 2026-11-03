@@ -132,6 +132,14 @@ export const maxFeature = {
       deps.logger.warn(`фича max: сервис ${TRANSPORT_SERVICE} не зарегистрирован (${error?.message ?? error})`);
     }
 
+    // Реестр каналов (012): ответчик может публиковать вопрос в несколько
+    // транспортов; без этой строки config.transports тихо остался бы одним.
+    try {
+      ctx?.get?.("remoteTransports")?.set?.("max", transport);
+    } catch (error) {
+      deps.logger.debug(`фича max: реестр каналов недоступен (${describeError(error)})`);
+    }
+
     deps.onDispose(() => {
       void transport.stop();
     });

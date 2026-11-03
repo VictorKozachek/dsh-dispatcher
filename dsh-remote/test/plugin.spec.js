@@ -125,10 +125,11 @@ test("каркас: имя плагина, пустой inject и фичи с к
   // Порядок не косметика: транспорт поднимается первым, иначе ответчик с
   // `needs: [remoteTransport]` пропускается, не дождавшись сервиса.
   // Порядок: commands регистрирует фасад и состояние, telegram кладёт транспорт в
-  // фасад, answerer подписывается на questions последним, panel (009) — рядом с ним.
+  // фасад, reliability даёт ответчику deliver/TTL, answerer подписывается последним,
+  // panel (009) — рядом с ним.
   assert.deepEqual(
     features.map((feature) => feature.name),
-    ["commands", "max", "telegram", "answerer", "panel"],
+    ["commands", "max", "telegram", "reliability", "answerer", "panel"],
   );
 });
 
