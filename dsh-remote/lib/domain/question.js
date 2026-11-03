@@ -101,6 +101,9 @@ export class RemoteQuestion {
     this.workspace = context.workspace ?? null;
     this.role = context.role ?? null;
     this.taskId = context.taskId ?? null;
+    /** 015: канал проекта (`chatId` + опциональный `threadId` топика). */
+    this.chatId = context.chatId ?? null;
+    this.threadId = context.threadId ?? null;
     this.title = typeof item.header === "string" && item.header !== "" ? item.header : null;
     this.body = typeof item.question === "string" ? item.question : "";
     /** Подробности вопроса: рендерятся рядом с телом (шапка и текст — задача 006). */
@@ -112,6 +115,11 @@ export class RemoteQuestion {
     this.createdAt = now;
     this.expiresAt = now + ttlMs;
     this.status = QUESTION_STATUS.pending;
+    /**
+     * Куда вопрос доставлен: по записи на канал.
+     * @type {{transport: string, messageId: (string|number|null), chatId: (string|number|null)}[]}
+     */
+    this.deliveries = [];
     /** @type {{selected: string[], custom?: string}|undefined} */
     this.answer = undefined;
     this.answeredBy = undefined;
@@ -129,6 +137,34 @@ export class RemoteQuestion {
 
   get isOpen() {
     return this.status === QUESTION_STATUS.open;
+  }
+
+  /**
+   * Запомнить доставку в канал (задача 012: вопрос публикуется в несколько).
+   *
+   * Один канал — одна запись: повторная доставка в тот же транспорт обновляет
+   * `messageId`/`chatId`, а не плодит дубли (иначе закрытие прошло бы дважды).
+   *
+   * @param {{transport: string, messageId?: (string|number|null), chatId?: (string|number|null)}} delivery
+   * @returns {{transport: string, messageId: any, chatId: any}}
+   */
+  addDelivery(delivery = {}) {
+    const transport = String(delivery.transport ?? "");
+    if (transport === "") throw new TypeError("addDelivery: нужен id транспорта");
+    const record = {
+      transport,
+      messageId: delivery.messageId ?? null,
+      chatId: delivery.chatId ?? null,
+    };
+    const index = this.deliveries.findIndex((item) => item.transport === transport);
+    if (index >= 0) this.deliveries[index] = record;
+    else this.deliveries.push(record);
+    return record;
+  }
+
+  /** Доставки в конкретный канал (обычно одна). */
+  deliveriesOf(transportId) {
+    return this.deliveries.filter((delivery) => delivery.transport === transportId);
   }
 
   /**
@@ -232,6 +268,9 @@ export class RemoteQuestion {
       createdAt: this.createdAt,
       expiresAt: this.expiresAt,
       status: this.status,
+      chatId: this.chatId,
+      threadId: this.threadId,
+      deliveries: this.deliveries,
       answer: this.answer,
       answeredBy: this.answeredBy,
     };

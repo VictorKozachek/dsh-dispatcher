@@ -1,0 +1,5 @@
+target/
+.cargo-home/
+*.db
+*.db-shm
+*.db-wal
