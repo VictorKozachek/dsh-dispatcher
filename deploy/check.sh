@@ -29,13 +29,16 @@ grep -q 'restart: unless-stopped' docker-compose.yml || fail "compose без res
 grep -q 'sqlite:///data/relay.db' docker-compose.yml || fail "compose без тома БД"
 
 if command -v docker >/dev/null 2>&1; then
-  if docker compose -f docker-compose.yml --env-file .env.example config -q 2>/dev/null; then
-    echo "check: docker compose config ok"
-  else
-    echo "check: docker compose config пропущен (нет демона?)" >&2
+  # `config` не требует демона: если он падает — это ошибка в compose, а не
+  # отсутствие Docker. Молча пропускать нельзя.
+  if ! OUTPUT=$(docker compose -f docker-compose.yml --env-file .env.example config -q 2>&1); then
+    echo "check: docker compose config FAILED:" >&2
+    echo "$OUTPUT" >&2
+    exit 1
   fi
+  echo "check: docker compose config ok"
 else
-  echo "check: docker CLI нет — compose config пропущен"
+  echo "check: docker CLI нет — compose config пропущен" >&2
 fi
 
 echo "check: OK"

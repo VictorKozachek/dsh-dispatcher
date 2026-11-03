@@ -13,16 +13,18 @@ services:
     build:
       context: ..
       dockerfile: deploy/relay.Dockerfile
+    # Необязательные переменные (allowlist, TTL, TZ) приходят только из .env:
+    # так пустое/закомментированное значение не превращается в пустую строку,
+    # которую релей принял бы за «allowlist пуст» (все устройства запрещены).
+    env_file:
+      - path: .env
+        required: false
     environment:
       RELAY_BIND: 0.0.0.0:8080
       RELAY_DATABASE_URL: sqlite:///data/relay.db?mode=rwc
       # Секрет обязателен: без него compose откажется стартовать с понятным
       # сообщением (см. deploy/README.md «Быстрый старт»).
       RELAY_AGENT_TOKEN: "${RELAY_AGENT_TOKEN:?RELAY_AGENT_TOKEN обязателен — см. deploy/.env.example}"
-      RELAY_ALLOWED_DEVICES: "${RELAY_ALLOWED_DEVICES:-}"
-      RELAY_QUESTION_TTL_SECONDS: "${RELAY_QUESTION_TTL_SECONDS:-1800}"
-      RELAY_PAIRING_TTL_SECONDS: "${RELAY_PAIRING_TTL_SECONDS:-600}"
-      TZ: "${TZ:-UTC}"
     volumes:
       - relay_data:/data
     restart: unless-stopped

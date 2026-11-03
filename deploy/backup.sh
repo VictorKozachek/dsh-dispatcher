@@ -40,7 +40,9 @@ else
   docker compose -f "$COMPOSE_FILE" exec -T relay sqlite3 /data/relay.db ".backup /data/relay-backup.db"
   docker compose -f "$COMPOSE_FILE" cp relay:/data/relay-backup.db "$DB_COPY"
   docker compose -f "$COMPOSE_FILE" exec -T relay rm -f /data/relay-backup.db
-  RELAY_VERSION=$(curl -fsS -H 'X-Relay-Version: 1' "${RELAY_BASE_URL:-http://127.0.0.1:8080}/healthz" 2>/dev/null \
+  # Релей не публикует 8080 на хост — спрашиваем версию изнутри контейнера.
+  RELAY_VERSION=$(docker compose -f "$COMPOSE_FILE" exec -T relay \
+    curl -fsS -H 'X-Relay-Version: 1' http://127.0.0.1:8080/healthz 2>/dev/null \
     | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' || true)
   RELAY_VERSION=${RELAY_VERSION:-unknown}
 fi

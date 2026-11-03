@@ -10,7 +10,11 @@
 
 ## Что нужно
 
-- VPS или домашний сервер с Docker 24+ и Compose v2, 1 ГБ RAM (релей + Caddy).
+- VPS или домашний сервер с Docker 24+ и Compose v2 (поддерживает
+  `env_file.required: false`), 1 ГБ RAM (релей + Caddy).
+- Сборка образа: Rust 1.82+ (в Dockerfile `rust:1.82-slim`); MSRV зависимостей
+  проверяется при первой сборке — при обновлении `relay/Cargo.lock` поднимите
+  базовый образ.
 - **Домен**, A/AAAA-запись которого указывает на сервер (например
   `relay.example.com`). Без домена Caddy не выпустит сертификат.
 - Открытые порты **80 и 443** (80 нужен для ACME HTTP-01 и редиректа на HTTPS).
@@ -81,8 +85,13 @@ RELAY_ALLOWED_DEVICES=<deviceId>,<deviceId>
 ```
 
 и перезапустите релей: `docker compose -f deploy/docker-compose.yml up -d`.
-`deviceId` виден в `GET /v1/health` (счётчик) и в логах привязки; после
-ограничения чужие устройства получают `403` (в том числе на WebSocket).
+Пустая/закомментированная переменная означает «списка нет» (разрешены все
+привязанные устройства) — релей одинаково понимает отсутствие переменной и
+пустую строку, а compose передаёт её только когда она задана в `.env`
+(`env_file` вместо подстановки пустой строки). `deviceId` виден в ответе
+`POST /v1/devices`/`POST /v1/pair` и в логах привязки (в `GET /v1/health` только
+счётчик устройств). После ограничения чужие устройства получают `403` (в том
+числе на WebSocket).
 
 ## Обновление
 
@@ -122,9 +131,16 @@ deploy/backup.sh
 deploy/restore.sh deploy/backups/relay-20261103T031700Z.tar.gz
 ```
 
-Скрипт проверяет sha256 архива (если есть `.sha256`), `PRAGMA integrity_check` и
-sha256 базы из `manifest.json`, делает резервную копию текущей базы, кладёт
-восстановленную в том и ждёт `/healthz`. Локальный режим — `RELAY_DB_FILE=...`.
+Скрипт сверяет sha256 **самого архива** с хешем из `.sha256` (путь в файле
+игнорируется — бэкап можно переименовать и перенести на другой сервер),
+проверяет `PRAGMA integrity_check` и sha256 базы из `manifest.json`, делает
+резервную копию текущей базы, кладёт восстановленную в том и ждёт `/healthz`.
+Подменённый архив при «живом» `.sha256` отвергается. Локальный режим —
+`RELAY_DB_FILE=...`.
+
+В docker-режиме том называется `<project>_relay_data` (по умолчанию
+`dsh-relay_relay_data`); если вы задали `COMPOSE_PROJECT_NAME` или переименовали
+каталог, передайте `RELAY_VOLUME=<volume>` (посмотреть: `docker volume ls`).
 
 Проверка «после восстановления всё живо»:
 
@@ -158,13 +174,19 @@ curl -fsS -X DELETE -H 'X-Relay-Version: 1' \
 deploy/check.sh     # bash -n всех скриптов, обязательные файлы и ключи, compose config
 ```
 
+`docker compose config` в `check.sh` — обязательная проверка: если compose-файл
+сломан, скрипт падает (а не пишет «пропущен»). Для сборки образа из корня
+репозитория лежит `.dockerignore` — в демон не уезжают `.git`, `worktrees/`,
+`apps/`, `docs/`, `relay/target/` и бэкапы.
+
 Если Docker-демона нет (как в песочнице разработки), скрипты всё равно проверяются
 локальным релеем:
 
 ```bash
 cd relay && cargo build --release && cd ..
 RELAY_BIN=$PWD/relay/target/release/dsh-relay deploy/test-local.sh
-# smoke + backup + отказ битому архиву + restore + healthz — один прогон
+# smoke + allowlist (пустой/непустой) + backup + переименование/подмена архива
+# + restore + healthz — один прогон
 ```
 
 Полный ручной путь без Docker (если `test-local.sh` не подходит):

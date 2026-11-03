@@ -25,7 +25,19 @@ WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dsh-restore.XXXXXX")
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 if [ -f "$ARCHIVE.sha256" ]; then
-  (cd "$(dirname "$ARCHIVE")" && sha256sum -c "$(basename "$ARCHIVE").sha256")
+  # В .sha256 может быть записан путь с момента бэкапа (часто абсолютный). Путь
+  # игнорируем: берём только хеш и сверяем с тем архивом, который восстанавливаем.
+  EXPECTED_ARCHIVE_SHA=$(awk 'NR==1 {print $1}' "$ARCHIVE.sha256")
+  ACTUAL_ARCHIVE_SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
+  case "$EXPECTED_ARCHIVE_SHA" in
+    [0-9a-fA-F]*) ;;
+    *) echo "restore: в $ARCHIVE.sha256 нет хеша" >&2; exit 1;;
+  esac
+  if [ "$EXPECTED_ARCHIVE_SHA" != "$ACTUAL_ARCHIVE_SHA" ]; then
+    echo "restore: sha256 архива не совпал (ожидался $EXPECTED_ARCHIVE_SHA, получен $ACTUAL_ARCHIVE_SHA) — восстановление отменено" >&2
+    exit 1
+  fi
+  echo "restore: sha256 архива ok"
 else
   echo "restore: предупреждение — нет $ARCHIVE.sha256, проверяю только базу" >&2
 fi

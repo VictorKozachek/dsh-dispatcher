@@ -62,12 +62,9 @@ impl Config {
             );
             token
         });
-        let allowed_devices = std::env::var("RELAY_ALLOWED_DEVICES").ok().map(|raw| {
-            raw.split(',')
-                .map(|item| item.trim().to_string())
-                .filter(|item| !item.is_empty())
-                .collect()
-        });
+        // Пустая строка — «списка нет»: иначе `RELAY_ALLOWED_DEVICES=` из
+        // compose запретил бы все устройства.
+        let allowed_devices = parse_allowed_devices(std::env::var("RELAY_ALLOWED_DEVICES").ok());
         Ok(Self {
             bind: std::env::var("RELAY_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string()),
             database_url: std::env::var("RELAY_DATABASE_URL")
@@ -78,6 +75,22 @@ impl Config {
             pairing_ttl: Duration::from_secs(env_secs("RELAY_PAIRING_TTL_SECONDS", 600)),
             long_poll_max: Duration::from_secs(env_secs("RELAY_LONG_POLL_MAX_SECONDS", 25)),
         })
+    }
+}
+
+/// Разобрать allowlist устройств: пустая/пробельная строка — это «списка нет»
+/// (иначе `RELAY_ALLOWED_DEVICES=` из compose запретил бы все устройства).
+pub fn parse_allowed_devices(raw: Option<String>) -> Option<HashSet<String>> {
+    let value = raw?;
+    let items: HashSet<String> = value
+        .split(',')
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect();
+    if items.is_empty() {
+        None
+    } else {
+        Some(items)
     }
 }
 
@@ -218,4 +231,25 @@ async fn version_guard(
 #[allow(dead_code)]
 fn _assert_error_shape() -> Response {
     routes::error_response(StatusCode::BAD_REQUEST, "bad-request", "x", false, None).into_response()
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+    use super::parse_allowed_devices;
+
+    #[test]
+    fn empty_allowlist_means_no_restriction() {
+        assert_eq!(parse_allowed_devices(None), None);
+        assert_eq!(parse_allowed_devices(Some(String::new())), None);
+        assert_eq!(parse_allowed_devices(Some("   ".to_string())), None);
+        assert_eq!(parse_allowed_devices(Some(" , ,".to_string())), None);
+    }
+
+    #[test]
+    fn non_empty_allowlist_is_parsed_and_trimmed() {
+        let parsed = parse_allowed_devices(Some(" dev-1, dev-2 ,".to_string())).expect("список");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains("dev-1"));
+        assert!(parsed.contains("dev-2"));
+    }
 }
