@@ -18,3 +18,4 @@ import "./registry.spec.js";
 import "./answerer.spec.js";
 import "./telegram.spec.js";
 import "./routing.spec.js";
+import "./present.spec.js";

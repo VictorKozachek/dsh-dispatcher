@@ -9,6 +9,9 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { apply } from "../lib/index.js";
 import { createAnswerer } from "../lib/answerer.js";
@@ -441,4 +444,58 @@ test("фича answerer без транспорта не поднимается:
   await assert.doesNotReject(() => apply(ctx, {}));
 
   assert.equal((ctx.hooks.get(EVENT) ?? []).length, 0, "без транспорта слушателя нет");
+});
+
+test("вопрос получает роль и задачу из контекста сессии (006)", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-ctx-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, ".kanban", "tasks"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".kanban", "tasks", "006.md"),
+    "---\nid: \"006\"\nstatus: in-progress\nowner: session-ctx\n---\n",
+  );
+
+  const transport = fakeTransport();
+  const ctx = fakeContext({ services: { sessions: { get: () => ({ header: { cwd: dir, agentPreset: "worker" } }) } } });
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({ transport, registry, log: () => {}, now: () => 1_000 });
+  answerer.attach(ctx);
+
+  const controller = new AbortController();
+  const pending = runWaterfall(ctx, EVENT, {
+    questions: [item()],
+    agent: { id: "session-ctx" },
+    signal: controller.signal,
+  }, () => assert.fail("next() звать нельзя"));
+  await tick();
+
+  const question = transport.sent[0];
+  assert.equal(question.workspace, dir);
+  assert.equal(question.role, "worker");
+  assert.equal(question.taskId, "006");
+
+  controller.abort();
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+});
+
+test("служебные кнопки free/more не ломают вопрос (006)", async () => {
+  const { ctx, transport, answerer } = setup();
+  answerer.attach(ctx);
+
+  const pending = runWaterfall(ctx, EVENT, request(), () => assert.fail("next()"));
+  await tick();
+  const { shortId } = transport.sent[0];
+
+  // «Другой ответ…» — не ответ: вопрос остаётся открытым, ответа нет.
+  transport.answer({ shortId, optionIds: ["free"] });
+  assert.equal(transport.sent[0].isOpen, true, "после «Другого ответа» вопрос открыт");
+
+  // «Показать ещё» — тоже не ответ.
+  transport.answer({ shortId, optionIds: ["more"] });
+  assert.equal(transport.sent[0].isOpen, true);
+
+  // Свободный текст, пришедший следом, засчитывается.
+  transport.answer({ shortId, text: "своё" });
+  const result = await pending;
+  assert.deepEqual(result.answers, [{ id: "q1", selected: [], custom: "своё" }]);
 });

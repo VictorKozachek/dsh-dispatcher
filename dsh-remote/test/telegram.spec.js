@@ -9,6 +9,9 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { apply } from "../lib/index.js";
 import { createTelegramTransport, TelegramError } from "../lib/transport/telegram.js";
@@ -182,25 +185,26 @@ test("отправка вопроса: HTML, кнопки по одной в р�
   const send = calls.find((call) => call.method === "sendMessage");
   assert.equal(send.payload.chat_id, 42);
   assert.equal(send.payload.parse_mode, "HTML");
-  assert.match(send.payload.text, /a &lt; b &amp; c/, "HTML экранируется");
-  assert.match(send.payload.text, /<b>Деплой<\/b>/, "заголовок жирным");
+  assert.match(send.payload.text, /a &lt; b &amp; c/, "HTML экранируется целиком");
+  assert.match(send.payload.text, /Деплой/, "заголовок вопроса в тексте");
+  assert.match(send.payload.text, /▸/, "шапка «откуда» из present (006)");
   assert.deepEqual(send.payload.reply_markup.inline_keyboard, [
     [{ text: "Да", callback_data: `q:${SHORT}:o1` }],
     [{ text: "Нет", callback_data: `q:${SHORT}:o2` }],
-  ]);
+    [{ text: "Другой ответ…", callback_data: `q:${SHORT}:free` }],
+  ], "варианты по одному в ряд + свободный ответ последним");
   assert.equal(sent.messageId, 101);
 });
 
-test("длинный текст режется на несколько сообщений, кнопки — на последнем", async () => {
-  const { transport, calls } = setup({ caps: { maxText: 10 } });
-  await transport.sendQuestion(question({ title: "", body: "слово ".repeat(10).trim(), options: [{ id: "o1", label: "Да" }] }));
+test("длинный текст усечён под caps.maxText с маркером", async () => {
+  const { transport, calls } = setup({ caps: { maxText: 80 } });
+  await transport.sendQuestion(question({ title: "", body: "слово ".repeat(40).trim(), options: [{ id: "o1", label: "Да" }] }));
 
   const sends = calls.filter((call) => call.method === "sendMessage");
-  assert.ok(sends.length > 1, "текст разбит");
-  for (const send of sends.slice(0, -1)) {
-    assert.equal(send.payload.reply_markup, undefined, "кнопки только на последнем");
-  }
-  assert.ok(sends.at(-1).payload.reply_markup.inline_keyboard.length === 1);
+  assert.equal(sends.length, 1, "present (006) усекает, а не шлёт несколько сообщений");
+  assert.ok(sends[0].payload.text.length <= 80, `длина ${sends[0].payload.text.length} > 80`);
+  assert.match(sends[0].payload.text, /…обрезано/);
+  assert.ok(sends[0].payload.reply_markup.inline_keyboard.length >= 1, "кнопки в том же сообщении");
 });
 
 test("полный цикл: вопрос → кнопка → ответ в onAnswer, «часики» погашены", async () => {
@@ -705,8 +709,8 @@ function assertValidHtml(text, limit) {
   assert.equal(open, close, `теги не сбалансированы: ${JSON.stringify(text)}`);
 }
 
-test("длинный текст с & и < режется без разрыва сущностей и тегов", async () => {
-  const { transport, calls } = setup({ caps: { maxText: 12 } });
+test("HTML-спецсимволы экранируются целиком, сущности не рвутся", async () => {
+  const { transport, calls } = setup({ caps: { maxText: 400 } });
 
   await transport.sendQuestion({
     shortId: SHORT,
@@ -717,9 +721,10 @@ test("длинный текст с & и < режется без разрыва �
   });
 
   const sends = calls.filter((call) => call.method === "sendMessage");
-  assert.ok(sends.length > 1, "текст разбит на несколько сообщений");
-  for (const send of sends) assertValidHtml(send.payload.text, 12);
-  assert.equal(sends.at(-1).payload.reply_markup.inline_keyboard.length, 1, "кнопки на последнем");
+  assert.equal(sends.length, 1);
+  assertValidHtml(sends[0].payload.text, 400);
+  assert.match(sends[0].payload.text, /Заголовок с &lt; &gt; &amp;/);
+  assert.match(sends[0].payload.text, /хвост &amp; &lt; &gt;/, "detail тоже экранирован");
 });
 
 test("полный цикл: ответчик + telegram — ответ правит сообщение и снимает кнопки", async () => {
@@ -808,7 +813,7 @@ test("вопрос из одних пробелов уходит заглушк�
 
   const sends = calls.filter((call) => call.method === "sendMessage");
   assert.equal(sends.length, 1, "сообщение всё равно отправлено");
-  assert.equal(sends[0].payload.text, "(пустой вопрос)");
+  assert.match(sends[0].payload.text, /\(пустой вопрос\)/);
 });
 
 test("зависшая правка сообщения не задерживает ответ сессии", async () => {
@@ -842,4 +847,50 @@ test("зависшая правка сообщения не задерживае
   assert.deepEqual(result.answers, [{ id: "q1", selected: ["Да"] }], "ответ пришёл, несмотря на зависшую правку");
   assert.equal(closeCalls, 1, "правку всё же попросили");
   await transport.stop();
+});
+
+test("end-to-end: ответчик кладёт шапку с задачей и ролью в сообщение", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-e2e-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, ".kanban", "tasks"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".kanban", "tasks", "006.md"),
+    '---\nid: "006"\nstatus: in-progress\nowner: session-e2e\n---\n',
+  );
+
+  const { transport, calls } = setup();
+  const hooks = new Map();
+  const ctx = {
+    get: (name) => (name === "sessions" ? { get: () => ({ header: { cwd: dir, agentPreset: "worker" } }) } : null),
+    on: (event, handler, options) => {
+      hooks.set(event, (hooks.get(event) ?? []).concat([{ handler, options }]));
+      return () => {};
+    },
+  };
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({ transport, registry, log: () => {}, now: () => 42 });
+  answerer.attach(ctx);
+
+  const controller = new AbortController();
+  const pending = answerer.handler(
+    {
+      questions: [askItem({ options: [{ label: "Да" }] })],
+      agent: { id: "session-e2e" },
+      signal: controller.signal,
+    },
+    () => assert.fail("next() звать нельзя"),
+  );
+  await settle();
+
+  const send = calls.find((call) => call.method === "sendMessage");
+  assert.match(send.payload.text, /▸ dsh-remote-e2e\S* · task 006 · worker · /, "шапка «откуда» с задачей и ролью");
+  assert.deepEqual(
+    send.payload.reply_markup.inline_keyboard.map((row) => row[0].text),
+    ["Да", "Другой ответ…"],
+    "вариант и свободный ответ",
+  );
+
+  // Завершаем ожидание, чтобы тест не оставлял висящий промис.
+  controller.abort();
+  await assert.rejects(pending, (error) => error.name === "AbortError");
 });
