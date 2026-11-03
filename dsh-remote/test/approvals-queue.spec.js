@@ -194,3 +194,35 @@ test("повторный ответ после решения не переиг�
   assert.equal(transport.closed.length, closedAfterFirst, "повторно не закрываем и не меняем исход");
   assert.equal(approval.outcome, APPROVAL_OUTCOME.allowedOnce, "исход остался прежним");
 });
+
+test("мультиканал: текст из второго канала — подсказка туда же, а не в первый", async () => {
+  const telegram = fakeTransport("telegram");
+  const max = fakeTransport("max");
+  const { handler, next } = setup({ transports: [telegram, max] });
+  const pending = handler(request(), next);
+  await tick();
+  const shortId = max.sent[0].question.shortId;
+
+  max.answer({ shortId, optionIds: [], text: "да, разрешаю" });
+  await tick();
+
+  assert.equal(max.sent.length, 2, "подсказка пришла в MAX — туда, где человек писал");
+  assert.match(max.sent[1].question.body, /кнопк/);
+  assert.equal(telegram.sent.length, 1, "в Telegram подсказку не отправляли");
+  assert.equal(telegram.closed.length, 0);
+
+  max.answer({ shortId, optionIds: ["o1"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+});
+
+test("совместимость: ответ с optionId-массивом считается кнопкой", async () => {
+  const { transport, handler, next } = setup();
+  const pending = handler(request(), next);
+  await tick();
+  const shortId = transport.sent[0].question.shortId;
+
+  transport.answer({ shortId, optionId: ["o1"] });
+
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce, "массив optionId решает подтверждение");
+  assert.equal(transport.sent.length, 1, "подсказка не отправлялась");
+});

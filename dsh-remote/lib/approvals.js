@@ -53,6 +53,7 @@ export const APPROVAL_REQUEST_EVENT = "approval/request";
  * @param {Function|null} [options.deliver] — доставка через reliability (008).
  * @param {Function|null} [options.deliverFor] — доставка на конкретный канал.
  * @param {Function|null} [options.channelOf] — канал проекта (015).
+ * @param {object|null} [options.audit] — журнал решений (`lib/audit.js`, задача 026).
  */
 export function createApprovals({
   transport = null,
@@ -64,6 +65,7 @@ export function createApprovals({
   deliver = null,
   deliverFor = null,
   channelOf = null,
+  audit = null,
 } = {}) {
   /** Счётчики решений — для `/remote status` (026). */
   const stats = { claimed: 0, allowed: 0, rejected: 0, unavailable: 0, cancelled: 0 };
@@ -193,11 +195,21 @@ export function createApprovals({
    * Свободный текст у подтверждений не принимается: решение — только кнопка.
    * Неизвестная кнопка не роняет ожидание: сообщение остаётся с кнопками.
    */
-  /** Подсказка «решение — кнопкой»: свободный текст не считается ответом (027). */
-  async function sendHint(approval) {
-    if (typeof primary?.sendQuestion !== "function") return;
+  /**
+   * Подсказка «решение — кнопкой»: свободный текст не считается ответом (027).
+   * Шлём её через тот канал, откуда пришёл текст: в мультиканале человек пишет
+   * в MAX, и просьба нажать кнопку должна прийти туда же, а не в primary.
+   */
+  async function sendHint(approval, sourceTransport = null) {
+    const transport = sourceTransport ?? primary;
+    if (typeof transport?.sendQuestion !== "function") return;
+    const delivery = Array.isArray(approval.deliveries)
+      ? approval.deliveries.find((item) => item.transport === transport.id)
+      : undefined;
+    const chatId = delivery?.chatId ?? approval.chatId ?? null;
+    const threadId = approval.threadId ?? null;
     try {
-      await primary.sendQuestion(
+      await transport.sendQuestion(
         {
           kind: "approval-hint",
           shortId: `h${approval.shortId}`.slice(0, 8),
@@ -207,12 +219,12 @@ export function createApprovals({
           options: [],
           multiSelect: false,
           allowFreeText: false,
-          chatId: approval.chatId ?? null,
-          threadId: approval.threadId ?? null,
+          chatId,
+          threadId,
         },
         {
-          ...(approval.chatId === null ? {} : { chatId: approval.chatId }),
-          ...(approval.threadId === null ? {} : { threadId: approval.threadId }),
+          ...(chatId === null ? {} : { chatId }),
+          ...(threadId === null ? {} : { threadId }),
         },
       );
     } catch (error) {
@@ -239,11 +251,13 @@ export function createApprovals({
     const text = typeof event.text === "string" ? event.text.trim() : "";
     const hasOption = Array.isArray(event.optionIds)
       ? event.optionIds.length > 0
-      : typeof event.optionId === "string" && event.optionId !== "";
+      : Array.isArray(event.optionId)
+        ? event.optionId.length > 0
+        : typeof event.optionId === "string" && event.optionId !== "";
     if (!hasOption) {
       if (text !== "") {
         log(`подтверждение ${shortId}: свободный текст не считается ответом — прошу нажать кнопку`);
-        void sendHint(entry.approval);
+        void sendHint(entry.approval, sourceTransport);
       } else {
         log(`подтверждение ${shortId}: ответ без кнопки — игнорирую`);
       }
@@ -266,8 +280,42 @@ export function createApprovals({
     // 027: запомнить канал-победитель — проигравший закроется пометкой.
     entry.approval.answeredVia = sourceTransport?.id ?? entry.approval.answeredVia ?? null;
     statsFor(outcome);
+    record(entry.approval, {
+      outcome,
+      decision: "remote",
+      channel: sourceTransport?.id ?? null,
+      chatId: typeof event.chatId === "string" || typeof event.chatId === "number" ? String(event.chatId) : entry.approval.chatId,
+      answeredBy: typeof event.answeredBy === "string" && event.answeredBy !== "" ? event.answeredBy : null,
+    });
     void closeMessage(entry.approval, outcomeSummary(outcome), sourceTransport);
     settle(entry, outcome);
+  }
+
+  /**
+   * Записать решение в журнал (026).
+   *
+   * Пишем только метаданные: id подтверждения, инструмент, исход, канал, кто/где
+   * и сколько ждали. `reason`/`displayReason` не пишем — это может быть текст
+   * команды, а журналу тела не нужны. `decision`: `remote` — человек ответил
+   * кнопкой, `gui` — отдали GUI (доставка не удалась), `timeout` — снято без
+   * ответа (аборт запроса; TTL-политика — задача 025).
+   */
+  function record(approval, { outcome, decision, channel = null, chatId = null, answeredBy = null }) {
+    if (audit === null) return;
+    audit.append({
+      kind: "approval",
+      questionId: approval.id,
+      toolName: approval.toolName,
+      callId: approval.callId ?? undefined,
+      outcome,
+      channel: channel ?? undefined,
+      chatId: chatId ?? undefined,
+      answeredBy: answeredBy ?? undefined,
+      sessionId: approval.sessionId ?? undefined,
+      workspace: approval.workspace ?? undefined,
+      waitedMs: Math.max(0, now() - approval.createdAt),
+      decision,
+    });
   }
 
   function statsFor(outcome) {
@@ -294,7 +342,6 @@ export function createApprovals({
       log("подтверждение без toolName — не наш запрос, отдаю GUI (next)");
       return next();
     }
-    if (request?.signal?.aborted === true) return APPROVAL_OUTCOME.cancelled;
 
     const sessionId = typeof request?.agent?.id === "string" ? request.agent.id : null;
     const workspace = workspaceOf(sessionId);
@@ -305,18 +352,14 @@ export function createApprovals({
       log(`реестр режима: ${error?.message ?? error} — считаю режим выключенным`);
     }
     if (!decision.enabled) {
+      // Выключенный режим не логируем: плагин не забирает запрос, и журнал не
+      // должен собирать инструменты действий, которые удалённо не подтверждали.
       log(`подтверждение ${toolName} (${sessionId ?? "без агента"}): режим выключен — отдаю GUI (next)`);
       return next();
     }
-    if (typeof deliver !== "function" && !useBroker && typeof primary?.sendQuestion !== "function") {
-      log("подтверждение: транспорт не умеет sendQuestion — отдаю GUI (next)");
-      return next();
-    }
-    if (subscribable.length === 0) {
-      log("подтверждение: транспорт не умеет onAnswer — отдаю GUI (next)");
-      return next();
-    }
 
+    // Модель создаём ДО проверок транспорта: иначе «отдано GUI» и «снято по
+    // аборту» не попадали бы в журнал (а карточка 026 требует каждое решение).
     const marks = marksOf(sessionId);
     const channel = channelFor(workspace, primary?.id ?? null);
     const queueNumber = ++queueCounter;
@@ -333,6 +376,25 @@ export function createApprovals({
       log,
     });
 
+    if (request?.signal?.aborted === true) {
+      approval.cancel("aborted", now());
+      stats.cancelled += 1;
+      record(approval, { outcome: APPROVAL_OUTCOME.cancelled, decision: "timeout" });
+      return APPROVAL_OUTCOME.cancelled;
+    }
+    if (typeof deliver !== "function" && !useBroker && typeof primary?.sendQuestion !== "function") {
+      approval.cancel("no-transport", now());
+      record(approval, { outcome: APPROVAL_OUTCOME.unavailable, decision: "gui" });
+      log("подтверждение: транспорт не умеет sendQuestion — отдаю GUI (next)");
+      return next();
+    }
+    if (subscribable.length === 0) {
+      approval.cancel("no-onanswer", now());
+      record(approval, { outcome: APPROVAL_OUTCOME.unavailable, decision: "gui" });
+      log("подтверждение: транспорт не умеет onAnswer — отдаю GUI (next)");
+      return next();
+    }
+
     /** Ожидание решения + гонка с абортом запроса. */
     const outcome = await new Promise((resolve) => {
       const entry = { approval, resolve, settled: false, delivered: false };
@@ -342,6 +404,11 @@ export function createApprovals({
         if (entry.settled) return;
         approval.cancel("aborted", now());
         stats.cancelled += 1;
+        record(approval, {
+          outcome: APPROVAL_OUTCOME.cancelled,
+          decision: "timeout",
+          channel: entry.channelId ?? null,
+        });
         // Сообщение могло ещё не уйти: закрывать нечего, но если доставка уже
         // началась — снимем кнопки, как только она завершится (ниже, в then).
         if (entry.delivered) {
@@ -364,6 +431,11 @@ export function createApprovals({
       const failToGui = () => {
         if (entry.settled) return;
         approval.cancel("delivery-failed", now());
+        record(approval, {
+          outcome: APPROVAL_OUTCOME.unavailable,
+          decision: "gui",
+          channel: entry.channelId ?? null,
+        });
         settle(entry, "next");
       };
 
@@ -382,6 +454,7 @@ export function createApprovals({
           return;
         }
         entry.delivered = true;
+        entry.channelId = result?.winner?.id ?? primary?.id ?? null;
         approval.markOpen();
         stats.claimed += 1;
         // Аборт мог выиграть гонку, пока сообщение доставлялось: снимаем его сразу,
@@ -455,6 +528,11 @@ export function createApprovals({
     for (const entry of [...pending.values()]) {
       if (!entry.approval.cancel(reason, now())) continue;
       stats.cancelled += 1;
+      record(entry.approval, {
+        outcome: APPROVAL_OUTCOME.cancelled,
+        decision: "timeout",
+        channel: entry.channelId ?? null,
+      });
       void closeMessage(entry.approval, outcomeSummary(APPROVAL_OUTCOME.cancelled));
       settle(entry, APPROVAL_OUTCOME.cancelled);
     }
