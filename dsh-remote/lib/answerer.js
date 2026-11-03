@@ -32,6 +32,7 @@
  */
 
 import { createQuestion } from "./domain/question.js";
+import { FREE_TEXT_OPTION, MORE_OPTION, resolveContext } from "./present.js";
 
 const noopLog = () => {};
 
@@ -84,6 +85,12 @@ function normalizeAnswerEvent(event) {
  * иначе в ответ уехало бы два взаимоисключающих значения.
  */
 function choiceFor(question, event) {
+  // Служебные кнопки представления (006): «Другой ответ…» ждёт свободный текст
+  // (его принесёт следующее сообщение), «Показать ещё» — раскрытие вариантов.
+  // Это не ответ, поэтому вопрос остаётся открытым и не получает ошибку.
+  if (event.optionIds.length === 1 && event.optionIds[0] === FREE_TEXT_OPTION) return { awaitingText: true };
+  if (event.optionIds.length === 1 && event.optionIds[0] === MORE_OPTION) return { showMore: true };
+
   const labels = new Map(question.options.map((option) => [option.id, option.label]));
   const selected = [];
   for (const id of event.optionIds) {
@@ -229,6 +236,14 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       return;
     }
     const parsed = choiceFor(entry.question, normalized);
+    if (parsed.awaitingText === true) {
+      log(`вопрос ${normalized.shortId}: «Другой ответ…» — ждём свободный текст`);
+      return;
+    }
+    if (parsed.showMore === true) {
+      log(`вопрос ${normalized.shortId}: «Показать ещё» — раскрытие вариантов пока не поддержано транспортом`);
+      return;
+    }
     if (parsed.error !== undefined) {
       log(`ответ на ${normalized.shortId} отклонён: ${parsed.error}`);
       return;
@@ -254,6 +269,15 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
 
     const sessionId = typeof request?.agent?.id === "string" ? request.agent.id : null;
     const workspace = workspaceOf(sessionId);
+    // Маркировка (006): роль и задача, которую ведёт эта сессия. Ошибки чтения
+    // контекста не должны мешать вопросу — тогда просто без задачи.
+    let questionContext = { role: null, taskId: null };
+    try {
+      const resolved = resolveContext({ sessionId, ctx: context, log });
+      questionContext = { role: resolved.role ?? null, taskId: resolved.taskId ?? null };
+    } catch (error) {
+      log(`вопрос: контекст сессии не прочитан (${error?.message ?? error})`);
+    }
     let decision = { enabled: false, scope: null };
     try {
       decision = registry?.resolve?.({ sessionId, workspace }) ?? decision;
@@ -272,7 +296,14 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     const questions = [];
     try {
       for (const item of items) {
-        questions.push(createQuestion(item, { sessionId, workspace, now: now(), log }));
+        questions.push(createQuestion(item, {
+          sessionId,
+          workspace,
+          role: questionContext.role,
+          taskId: questionContext.taskId,
+          now: now(),
+          log,
+        }));
       }
     } catch (error) {
       log(`вопрос: разобрать запрос не удалось (${error?.message ?? error}) — отдаю GUI`);

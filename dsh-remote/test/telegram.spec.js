@@ -185,25 +185,26 @@ test("отправка вопроса: HTML, кнопки по одной в р�
   const send = calls.find((call) => call.method === "sendMessage");
   assert.equal(send.payload.chat_id, 42);
   assert.equal(send.payload.parse_mode, "HTML");
-  assert.match(send.payload.text, /a &lt; b &amp; c/, "HTML экранируется");
-  assert.match(send.payload.text, /<b>Деплой<\/b>/, "заголовок жирным");
+  assert.match(send.payload.text, /a &lt; b &amp; c/, "HTML экранируется целиком");
+  assert.match(send.payload.text, /Деплой/, "заголовок вопроса в тексте");
+  assert.match(send.payload.text, /▸/, "шапка «откуда» из present (006)");
   assert.deepEqual(send.payload.reply_markup.inline_keyboard, [
     [{ text: "Да", callback_data: `q:${SHORT}:o1` }],
     [{ text: "Нет", callback_data: `q:${SHORT}:o2` }],
-  ]);
+    [{ text: "Другой ответ…", callback_data: `q:${SHORT}:free` }],
+  ], "варианты по одному в ряд + свободный ответ последним");
   assert.equal(sent.messageId, 101);
 });
 
-test("длинный текст режется на несколько сообщений, кнопки — на последнем", async () => {
-  const { transport, calls } = setup({ caps: { maxText: 10 } });
-  await transport.sendQuestion(question({ title: "", body: "слово ".repeat(10).trim(), options: [{ id: "o1", label: "Да" }] }));
+test("длинный текст усечён под caps.maxText с маркером", async () => {
+  const { transport, calls } = setup({ caps: { maxText: 80 } });
+  await transport.sendQuestion(question({ title: "", body: "слово ".repeat(40).trim(), options: [{ id: "o1", label: "Да" }] }));
 
   const sends = calls.filter((call) => call.method === "sendMessage");
-  assert.ok(sends.length > 1, "текст разбит");
-  for (const send of sends.slice(0, -1)) {
-    assert.equal(send.payload.reply_markup, undefined, "кнопки только на последнем");
-  }
-  assert.ok(sends.at(-1).payload.reply_markup.inline_keyboard.length === 1);
+  assert.equal(sends.length, 1, "present (006) усекает, а не шлёт несколько сообщений");
+  assert.ok(sends[0].payload.text.length <= 80, `длина ${sends[0].payload.text.length} > 80`);
+  assert.match(sends[0].payload.text, /…обрезано/);
+  assert.ok(sends[0].payload.reply_markup.inline_keyboard.length >= 1, "кнопки в том же сообщении");
 });
 
 test("полный цикл: вопрос → кнопка → ответ в onAnswer, «часики» погашены", async () => {
@@ -606,11 +607,14 @@ test("плагин: async apply -> remoteTransport -> answerer подписан 
     telegram: { tokenRef: "tg", chatId: 42, allowedUserIds: [7], pollTimeoutSec: 25 },
   });
 
+  // Команды (005) регистрируют фасад и состояние, reliability — свой сервис.
   const transportEntries = provided.filter((entry) => entry.name === "remoteTransport");
   assert.equal(transportEntries.length, 1, "транспорт зарегистрирован ровно один раз");
+  assert.ok(provided.some((entry) => entry.name === "remoteStore"), "состояние зарегистрировано как сервис");
   assert.ok(provided.some((entry) => entry.name === "remoteReliability"), "устойчивость зарегистрирована");
-  const transport = transportEntries[0].service;
-  assert.equal(transport.polling, true, "поллинг запущен после async-привязки");
+  const facade = transportEntries[0].service;
+  assert.equal(facade.current?.polling, true, "поллинг запущен после async-привязки");
+  const transport = facade.current;
 
   // Главное: ответчик не пропущен — его needs увидел сервис, подписка встала.
   const listeners = hooks.get("user-questions/request") ?? [];
@@ -632,16 +636,17 @@ test("фича telegram заявляет имя и не требует серв�
 test("выгрузка во время credentials.resolve: поллинг не поднимается", async () => {
   let releaseResolve;
   const provided = [];
-  const ctx = { provide: (name, service) => provided.push({ name, service }) };
-  const { deps, disposers } = fakeDeps({
-    services: {
-      credentials: {
+  const ctx = {
+    provide: (name, service) => provided.push({ name, service }),
+    get: (name) => (name === "credentials"
+      ? {
         resolve: () => new Promise((resolve) => {
           releaseResolve = resolve;
         }),
-      },
-    },
-  });
+      }
+      : null),
+  };
+  const { deps, disposers } = fakeDeps();
 
   const pending = telegramFeature.apply(
     ctx,
@@ -673,11 +678,9 @@ test("фича telegram без привязки спит: ни транспор�
 test("фича telegram без токена в credentials спит с предупреждением", async () => {
   const ctx = {
     provide: () => assert.fail("без токена сервис не регистрируется"),
+    get: (name) => (name === "credentials" ? { resolve: async () => undefined } : null),
   };
-  const { deps, logs, disposers } = fakeDeps({
-    // Настоящий провайдер: асинхронный resolve -> {value, source} | undefined.
-    services: { credentials: { resolve: async () => undefined } },
-  });
+  const { deps, logs, disposers } = fakeDeps();
 
   await telegramFeature.apply(ctx, { telegram: { tokenRef: "tg", chatId: 42 } }, deps);
 
@@ -688,10 +691,9 @@ test("фича telegram без токена в credentials спит с пред�
 test("фича telegram без chatId спит с предупреждением", async () => {
   const ctx = {
     provide: () => assert.fail("без chatId сервис не регистрируется"),
+    get: (name) => (name === "credentials" ? { resolve: async () => ({ value: "123456:TEST-TOKEN", source: "file" }) } : null),
   };
-  const { deps, logs } = fakeDeps({
-    services: { credentials: { resolve: async () => ({ value: "123456:TEST-TOKEN", source: "file" }) } },
-  });
+  const { deps, logs } = fakeDeps();
 
   await telegramFeature.apply(ctx, { telegram: { tokenRef: "tg" } }, deps);
 
@@ -719,8 +721,8 @@ function assertValidHtml(text, limit) {
   assert.equal(open, close, `теги не сбалансированы: ${JSON.stringify(text)}`);
 }
 
-test("длинный текст с & и < режется без разрыва сущностей и тегов", async () => {
-  const { transport, calls } = setup({ caps: { maxText: 12 } });
+test("HTML-спецсимволы экранируются целиком, сущности не рвутся", async () => {
+  const { transport, calls } = setup({ caps: { maxText: 400 } });
 
   await transport.sendQuestion({
     shortId: SHORT,
@@ -731,9 +733,10 @@ test("длинный текст с & и < режется без разрыва �
   });
 
   const sends = calls.filter((call) => call.method === "sendMessage");
-  assert.ok(sends.length > 1, "текст разбит на несколько сообщений");
-  for (const send of sends) assertValidHtml(send.payload.text, 12);
-  assert.equal(sends.at(-1).payload.reply_markup.inline_keyboard.length, 1, "кнопки на последнем");
+  assert.equal(sends.length, 1);
+  assertValidHtml(sends[0].payload.text, 400);
+  assert.match(sends[0].payload.text, /Заголовок с &lt; &gt; &amp;/);
+  assert.match(sends[0].payload.text, /хвост &amp; &lt; &gt;/, "detail тоже экранирован");
 });
 
 test("полный цикл: ответчик + telegram — ответ правит сообщение и снимает кнопки", async () => {
@@ -822,7 +825,7 @@ test("вопрос из одних пробелов уходит заглушк�
 
   const sends = calls.filter((call) => call.method === "sendMessage");
   assert.equal(sends.length, 1, "сообщение всё равно отправлено");
-  assert.equal(sends[0].payload.text, "(пустой вопрос)");
+  assert.match(sends[0].payload.text, /\(пустой вопрос\)/);
 });
 
 test("зависшая правка сообщения не задерживает ответ сессии", async () => {
@@ -856,4 +859,95 @@ test("зависшая правка сообщения не задерживае
   assert.deepEqual(result.answers, [{ id: "q1", selected: ["Да"] }], "ответ пришёл, несмотря на зависшую правку");
   assert.equal(closeCalls, 1, "правку всё же попросили");
   await transport.stop();
+});
+
+test("end-to-end: ответчик кладёт шапку с задачей и ролью в сообщение", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-e2e-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(dir, ".kanban", "tasks"), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, ".kanban", "tasks", "006.md"),
+    '---\nid: "006"\nstatus: in-progress\nowner: session-e2e\n---\n',
+  );
+
+  const { transport, calls } = setup();
+  const hooks = new Map();
+  const ctx = {
+    get: (name) => (name === "sessions" ? { get: () => ({ header: { cwd: dir, agentPreset: "worker" } }) } : null),
+    on: (event, handler, options) => {
+      hooks.set(event, (hooks.get(event) ?? []).concat([{ handler, options }]));
+      return () => {};
+    },
+  };
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({ transport, registry, log: () => {}, now: () => 42 });
+  answerer.attach(ctx);
+
+  const controller = new AbortController();
+  const pending = answerer.handler(
+    {
+      questions: [askItem({ options: [{ label: "Да" }] })],
+      agent: { id: "session-e2e" },
+      signal: controller.signal,
+    },
+    () => assert.fail("next() звать нельзя"),
+  );
+  await settle();
+
+  const send = calls.find((call) => call.method === "sendMessage");
+  assert.match(send.payload.text, /▸ dsh-remote-e2e\S* · task 006 · worker · /, "шапка «откуда» с задачей и ролью");
+  assert.deepEqual(
+    send.payload.reply_markup.inline_keyboard.map((row) => row[0].text),
+    ["Да", "Другой ответ…"],
+    "вариант и свободный ответ",
+  );
+
+  // Завершаем ожидание, чтобы тест не оставлял висящий промис.
+  controller.abort();
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+});
+
+test("фича telegram: config + токен в окружении без ctx.credentials", async (t) => {
+  /** getUpdates висит, пока не отменят: транспорт должен подняться и не мешать тесту. */
+  const hangingTelegramFetch = async (url, init = {}) => {
+    const method = url.split("/").pop();
+    if (method === "getUpdates") {
+      return new Promise((resolve, reject) => {
+        init.signal?.addEventListener?.("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    }
+    return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1, username: "test_bot" } }; } };
+  };
+  const tokenRef = "DSH_REMOTE_TEST_TOKEN";
+  const previous = process.env[tokenRef];
+  process.env[tokenRef] = "123456:TEST-TOKEN";
+  t.after(() => {
+    if (previous === undefined) delete process.env[tokenRef];
+    else process.env[tokenRef] = previous;
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = hangingTelegramFetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const provided = [];
+  const ctx = {
+    provide: (name, service) => provided.push({ name, service }),
+    // ctx.credentials нет вовсе — токен должен прийти из окружения.
+    get: () => null,
+  };
+  const { deps } = fakeDeps();
+
+  await telegramFeature.apply(ctx, { telegram: { tokenRef, chatId: 42, allowedUserIds: [7] } }, deps);
+
+  const entry = provided.find((item) => item.name === "remoteTransport");
+  assert.ok(entry, "транспорт поднят из env-fallback");
+  assert.equal(entry.service.polling, true);
+  await entry.service.stop();
 });

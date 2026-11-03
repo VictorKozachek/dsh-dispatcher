@@ -108,6 +108,7 @@ function fakeTransport({ failures = 0, retryAfterMs = 0, edit = true } = {}) {
     transport.editQuestion = async (question, text) => {
       calls.edit += 1;
       edited.push({ question, text });
+      return true;
     };
   }
   return transport;

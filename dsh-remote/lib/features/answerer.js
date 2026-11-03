@@ -15,14 +15,26 @@ import { createRegistry } from "../domain/registry.js";
 /** Имя сервиса транспорта: его объявит задача 003 (`dsh-remote/lib/transport`). */
 export const TRANSPORT_SERVICE = "remoteTransport";
 
+/** Имя сервиса состояния: его объявляет фича commands (005). */
+export const STATE_SERVICE = "remoteStore";
+
 export const answererFeature = {
   name: "answerer",
   needs: [TRANSPORT_SERVICE],
   apply(ctx, config, deps) {
+    // Состояние — сервис `remoteStore` (005). Без него режим считаем выключенным:
+    // лучше отдать вопрос в GUI, чем увести его в мессенджер «на всякий случай».
+    const store = deps.get(STATE_SERVICE);
     const registry = createRegistry({
-      // Задача 005 подставит сюда чтение состояния; до тех пор настройка пуста,
-      // то есть удалённый режим выключен и вопрос уходит в GUI.
-      readState: () => ({}),
+      readState: () => {
+        try {
+          const state = typeof store?.read === "function" ? store.read() : null;
+          return state?.enabled ?? {};
+        } catch (error) {
+          deps.logger.warn(`answerer: состояние не прочитано (${error?.message ?? error})`);
+          return {};
+        }
+      },
       log: (message) => deps.logger.debug(message),
     });
 

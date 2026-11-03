@@ -610,7 +610,9 @@ export function createReliability({
     if (typeof transport?.editQuestion === "function") {
       try {
         const edited = await transport.editQuestion(question, text);
-        if (edited !== false) return "edited";
+        // Только явный `true`: фасад без живого канала возвращает undefined,
+        // и это не повод считать напоминание доставленным.
+        if (edited === true) return "edited";
         logger(`уведомление ${question.shortId}: транспорт не смог править сообщение`);
       } catch (error) {
         logger(`уведомление ${question.shortId}: правка не удалась (${error?.message ?? error})`);

@@ -124,8 +124,12 @@ test("каркас: имя плагина, пустой inject и фичи с к
   }
   // Порядок не косметика: транспорт поднимается первым, иначе ответчик с
   // `needs: [remoteTransport]` пропускается, не дождавшись сервиса.
-  // Порядок важен: транспорт → устойчивость (TTL/deliver) → ответчик.
-  assert.deepEqual(features.map((feature) => feature.name), ["telegram", "reliability", "answerer"]);
+  // Порядок: commands регистрирует фасад и состояние, telegram кладёт транспорт в
+  // фасад, reliability даёт ответчику deliver и TTL, answerer подписывается последним.
+  assert.deepEqual(
+    features.map((feature) => feature.name),
+    ["commands", "telegram", "reliability", "answerer"],
+  );
 });
 
 test("apply поднимается на пустом ctx без сервисов и не бросает", async () => {
