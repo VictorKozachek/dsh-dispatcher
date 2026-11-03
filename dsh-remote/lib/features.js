@@ -17,6 +17,11 @@
  *   deps.get(name)  — сервис из ctx или null, без исключений;
  *   deps.onDispose  — снятие ресурсов фичи при выгрузке плагина.
  *
- * Пока реестр пуст: каркас задачи 001 поднимается и ничего не делает.
+ * Пока подключён один ответчик (`./features/answerer.js`). Транспорта у него ещё
+ * нет (задача 003), поэтому каркас пропускает фичу с warn, а вопрос уходит в GUI.
  */
-export const features = [];
+import { answererFeature } from "./features/answerer.js";
+
+export const features = [
+  answererFeature,
+];

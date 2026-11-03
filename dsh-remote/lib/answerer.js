@@ -324,7 +324,8 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     for (const entry of pending.values()) {
       entry.question.cancel(reason, now());
       try {
-        transport?.closeQuestion?.(entry.question, reason);
+        const closing = transport?.closeQuestion?.(entry.question, reason);
+        if (closing !== null && typeof closing?.then === "function") closing.catch(() => {});
       } catch (error) {
         log(`вопрос ${entry.question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
       }

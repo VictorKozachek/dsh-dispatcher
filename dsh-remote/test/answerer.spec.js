@@ -10,6 +10,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { apply } from "../lib/index.js";
 import { createAnswerer } from "../lib/answerer.js";
 import { createRegistry } from "../lib/domain/registry.js";
 import { QUESTION_STATUS } from "../lib/domain/question.js";
@@ -370,4 +371,31 @@ test("detach снимает слушатель и подписку на отве
 
   assert.equal(transport.subscribed, false);
   assert.equal((ctx.hooks.get(EVENT) ?? []).length, 0);
+});
+
+test("фича answerer из реестра: с транспортом слушатель поднимается каркасом", () => {
+  const transport = fakeTransport();
+  const ctx = fakeContext({ services: { remoteTransport: transport } });
+
+  apply(ctx, {}); // каркас прогоняет реестр фич из lib/features.js
+
+  const list = ctx.hooks.get(EVENT) ?? [];
+  assert.equal(list.length, 1, "ответчик подписан на waterfall");
+  assert.equal(list[0].options?.prepend, true, "и стоит первым");
+  assert.equal(transport.subscribed, true, "и слушает ответы транспорта");
+
+  // Выгрузка плагина: disposer эффекта снимает подписку на вопрос и на ответы.
+  for (const { disposable } of ctx.effects) {
+    if (typeof disposable === "function") disposable();
+  }
+  assert.equal((ctx.hooks.get(EVENT) ?? []).length, 0);
+  assert.equal(transport.subscribed, false);
+});
+
+test("фича answerer без транспорта не поднимается: вопрос уходит в GUI", () => {
+  const ctx = fakeContext();
+
+  assert.doesNotThrow(() => apply(ctx, {}));
+
+  assert.equal((ctx.hooks.get(EVENT) ?? []).length, 0, "без транспорта слушателя нет");
 });
