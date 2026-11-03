@@ -129,7 +129,11 @@ export class RemoteApproval {
     this.displayReason =
       typeof request.displayReason === "string" && request.displayReason !== "" ? request.displayReason : null;
 
-    this.title = APPROVAL_TITLE;
+    /** 027: номер в очереди подтверждений — виден человеку и в журнале. */
+    this.queueNumber = Number.isInteger(context.queueNumber) && context.queueNumber > 0
+      ? context.queueNumber
+      : null;
+    this.title = this.queueNumber === null ? APPROVAL_TITLE : `${APPROVAL_TITLE} #${this.queueNumber}`;
     /** Тело сообщения: инструмент и причина — то, по чему человек принимает решение. */
     this.body = renderBody(this);
     /** callId — второй строкой: помогает искать то же действие в журнале сессии. */
