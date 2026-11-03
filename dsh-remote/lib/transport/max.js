@@ -356,7 +356,8 @@ export function createMaxTransport(options = {}) {
         timeout: pollTimeoutSec,
         limit: 100,
         ...(marker === null ? {} : { marker }),
-        types: "message_created,message_callback,bot_started,bot_added",
+        // `types` в MAX описан как string[], а кодирование массива в GET не
+        // документировано — не рискуем форматом и фильтруем типы на клиенте.
       },
       signal,
     });
@@ -371,6 +372,20 @@ export function createMaxTransport(options = {}) {
     for (const update of Array.isArray(response?.updates) ? response.updates : []) {
       await handleUpdate(update);
     }
+  }
+
+  /** Клавиатура вопроса (attachments MAX) — общая для отправки и правок. */
+  function buildKeyboard(question) {
+    const shortId = question?.shortId;
+    const rows = caps.inlineButtons ? renderRows(question, caps) : [];
+    const buttons = rows.map((row) => row.map((button) => {
+      const optionId = button.optionId
+        ?? (button.kind === "free" ? FREE_TEXT_OPTION : button.kind === "more" ? MORE_OPTION : null);
+      return optionId === null
+        ? null
+        : { type: "callback", text: button.label, payload: callbackData(shortId, optionId) };
+    }).filter((button) => button !== null)).filter((row) => row.length > 0);
+    return { type: "inline_keyboard", payload: { buttons } };
   }
 
   const transport = {
@@ -455,17 +470,8 @@ export function createMaxTransport(options = {}) {
       const query = targetChat !== null ? { chat_id: targetChat } : { user_id: userId };
 
       const text = clipEscaped(escapeHtml(renderBody(question, caps)), caps.maxText);
-      const rows = caps.inlineButtons ? renderRows(question, caps) : [];
-      const buttons = rows.map((row) => row.map((button) => {
-        const optionId = button.optionId
-          ?? (button.kind === "free" ? FREE_TEXT_OPTION : button.kind === "more" ? MORE_OPTION : null);
-        return optionId === null
-          ? null
-          : { type: "callback", text: button.label, payload: callbackData(shortId, optionId) };
-      }).filter((button) => button !== null)).filter((row) => row.length > 0);
-      const attachments = buttons.length === 0
-        ? undefined
-        : [{ type: "inline_keyboard", payload: { buttons } }];
+      const keyboard = buildKeyboard(question);
+      const attachments = keyboard.payload.buttons.length === 0 ? undefined : [keyboard];
 
       const labels = new Map(
         (Array.isArray(question.options) ? question.options : []).map((option) => [String(option?.id), String(option?.label ?? option?.id ?? "")]),
@@ -490,21 +496,34 @@ export function createMaxTransport(options = {}) {
      * Правка сообщения по сохранённым `chatId`/`messageId` — после рестарта,
      * когда in-memory `sent` пуст (нужно 008: recover и TTL-пометка).
      */
-    async editMessage({ chatId: target, messageId } = {}, text) {
+    async editMessage({ chatId: target, messageId } = {}, text, attachments) {
       if (messageId === undefined || messageId === null) return false;
       await editQueue.push(() => request("PUT", "/messages", {
         query: { message_id: messageId },
-        body: { text: escapeHtml(text), format: "html" },
+        body: {
+          text: escapeHtml(text),
+          format: "html",
+          ...(Array.isArray(attachments) ? { attachments } : {}),
+        },
       })).run();
       return true;
     },
 
-    /** Снять кнопки по сохранённым id (после рестарта). */
-    async clearButtons({ messageId } = {}) {
+    /**
+     * Снять кнопки по сохранённым id (после рестарта).
+     *
+     * Текст **не трогаем**: recover (008) сначала правит его на «сессия
+     * перезапущена…», и только потом снимает кнопки. Если нужен новый текст —
+     * передайте его вторым аргументом.
+     */
+    async clearButtons({ messageId } = {}, text) {
       if (messageId === undefined || messageId === null) return false;
       await editQueue.push(() => request("PUT", "/messages", {
         query: { message_id: messageId },
-        body: { text: "⌛ ждёт ответа", format: "html", attachments: [] },
+        body: {
+          ...(typeof text === "string" && text !== "" ? { text: escapeHtml(text), format: "html" } : {}),
+          attachments: [],
+        },
       })).run();
       return true;
     },
@@ -514,8 +533,15 @@ export function createMaxTransport(options = {}) {
       const record = sent.get(question?.shortId);
       if (record === undefined) {
         // После рестарта записи нет, но reliability сохраняет id в состоянии.
+        // Кнопки восстанавливаем из вопроса: напоминание/TTL-пометка не должны
+        // «съесть» клавиатуру.
         const messageId = question?.messageId;
-        if (messageId !== undefined && messageId !== null) return transport.editMessage({ messageId }, text);
+        if (messageId !== undefined && messageId !== null) {
+          const attachments = Array.isArray(question?.options) && question.options.length > 0
+            ? [buildKeyboard(question)]
+            : undefined;
+          return transport.editMessage({ messageId }, text, attachments);
+        }
         return false;
       }
       await editQueue.push(() => request("PUT", "/messages", {
@@ -534,7 +560,10 @@ export function createMaxTransport(options = {}) {
       const record = sent.get(question?.shortId);
       if (record === undefined) {
         const messageId = question?.messageId;
-        if (messageId !== undefined && messageId !== null) await transport.clearButtons({ messageId });
+        if (messageId !== undefined && messageId !== null) {
+          const text = QUIET_REASONS.has(summary) ? "⌛ ждёт ответа" : `✅ Отвечено: ${escapeHtml(summary)}`;
+          await transport.clearButtons({ messageId }, text);
+        }
         return;
       }
       const quiet = QUIET_REASONS.has(summary);

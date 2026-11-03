@@ -511,3 +511,130 @@ test("фича max: marker читается и пишется через сос�
   const updateCalls = calls.filter((item) => new URL(item.url).pathname === "/updates");
   assert.equal(new URL(updateCalls.at(-1).url).searchParams.get("marker"), "77", "рестарт продолжил с marker");
 });
+
+// --- регрессии по второму ревью 011 -----------------------------------------
+
+test("clearButtons не трогает текст: recover сохраняет «сессия перезапущена»", async (t) => {
+  const { transport, calls } = setup(t);
+
+  await transport.editMessage({ chatId: 42, messageId: "mid.9" }, "сессия перезапущена, вопрос снят");
+  await transport.clearButtons({ chatId: 42, messageId: "mid.9" });
+
+  const puts = calls.filter((item) => item.key === "PUT /messages");
+  assert.equal(puts.length, 2);
+  assert.equal(puts[1].body.text, undefined, "второй запрос текст не меняет");
+  assert.deepEqual(puts[1].body.attachments, [], "но снимает кнопки");
+});
+
+test("clearButtons с явным текстом: human-summary после рестарта", async (t) => {
+  const { transport, calls } = setup(t);
+
+  await transport.closeQuestion({ shortId: "dddddddd", messageId: "mid.10" }, "Да");
+
+  const put = calls.filter((item) => item.key === "PUT /messages").at(-1);
+  assert.match(put.body.text, /✅ Отвечено: Да/);
+  assert.deepEqual(put.body.attachments, []);
+});
+
+test("closeQuestion после рестарта: quiet-причина даёт «⌛», а не human-текст", async (t) => {
+  const { transport, calls } = setup(t);
+
+  await transport.closeQuestion({ shortId: "eeeeeeee", messageId: "mid.11" }, "send-failed");
+
+  const put = calls.filter((item) => item.key === "PUT /messages").at(-1);
+  assert.equal(put.body.text, "⌛ ждёт ответа");
+});
+
+test("editQuestion после рестарта сохраняет кнопки из вопроса", async (t) => {
+  const { transport, calls } = setup(t);
+  const restored = {
+    shortId: "ffffffff",
+    messageId: "mid.12",
+    options: [{ id: "o1", label: "Да" }, { id: "o2", label: "Нет" }],
+  };
+
+  assert.equal(await transport.editQuestion(restored, "⏳ осталось 5 минут"), true);
+
+  const put = calls.filter((item) => item.key === "PUT /messages").at(-1);
+  assert.match(put.body.text, /осталось 5 минут/);
+  assert.equal(put.body.attachments?.[0]?.type, "inline_keyboard");
+  assert.deepEqual(
+    put.body.attachments[0].payload.buttons.map((row) => row[0].payload),
+    ["q:ffffffff:o1", "q:ffffffff:o2", "q:ffffffff:free"],
+  );
+});
+
+test("GET /updates не передаёт types (формат массива в GET не документирован)", async (t) => {
+  const { transport, calls } = setup(t, { routes: { updates: [] } });
+
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  const call = calls.find((item) => item.key === "GET /updates");
+  assert.ok(call);
+  assert.equal(call.url.searchParams.has("types"), false, "типы фильтруются на клиенте");
+  assert.equal(call.url.searchParams.get("timeout"), "30");
+});
+
+test("marker пишется атомарно: битый файл не ломает старт, запись заменяет его", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-max-marker2-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const stateFile = path.join(dir, "state.json");
+  const markerPath = path.join(dir, "max-marker.json");
+  fs.writeFileSync(markerPath, '{"marker": 12'); // битый / частичный файл
+
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    calls.push({ url, parsed, init });
+    if (parsed.pathname === "/updates") {
+      if (calls.filter((item) => item.parsed.pathname === "/updates").length === 1) {
+        return { ok: true, status: 200, async json() { return { updates: [], marker: 99 }; } };
+      }
+      return new Promise((resolve, reject) => {
+        init.signal?.addEventListener?.("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    }
+    return { ok: true, status: 200, async json() { return { ok: true }; } };
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const previous = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = stateFile;
+  t.after(() => {
+    if (previous === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previous;
+  });
+
+  const { maxFeature } = await import("../lib/features/max.js");
+  const provided = new Map();
+  const ctx = {
+    provide: (name, service) => provided.set(name, service),
+    get: (name) => (name === "credentials" ? { resolve: async () => ({ value: TOKEN, source: "file" }) } : provided.get(name) ?? null),
+  };
+  const disposers = [];
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: () => null,
+    onDispose: (disposer) => disposers.push(disposer),
+  };
+
+  await maxFeature.apply(ctx, { max: { chatId: 42 } }, deps);
+  await settle();
+  for (const dispose of [...disposers].reverse()) await dispose?.();
+
+  const first = calls.find((item) => item.parsed.pathname === "/updates");
+  assert.equal(first.parsed.searchParams.has("marker"), false, "битый marker не используется");
+  assert.equal(JSON.parse(fs.readFileSync(markerPath, "utf8")).marker, 99, "файл заменён валидным");
+});

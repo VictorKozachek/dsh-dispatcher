@@ -44,10 +44,19 @@ function readMarker(file, log) {
 }
 
 function writeMarker(file, marker, log) {
+  // tmp + rename, как state: при падении не остаётся битого файла, из которого
+  // позиция уже не восстановится.
+  const tmp = `${file}.${process.pid}.tmp`;
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(file, JSON.stringify({ marker }), { mode: 0o600 });
+    fs.writeFileSync(tmp, JSON.stringify({ marker }), { mode: 0o600 });
+    fs.renameSync(tmp, file);
   } catch (error) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* временный файл уже убран */
+    }
     log(`фича max: marker не сохранён (${error?.message ?? error})`);
   }
 }
