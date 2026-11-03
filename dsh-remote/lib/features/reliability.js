@@ -35,6 +35,7 @@ export const reliabilityFeature = {
       sessionController: ctx?.get?.("sessionController") ?? deps.get("sessionController") ?? null,
       onExpire: config?.onExpire,
       redactMode: config?.redactMode,
+      metrics: deps.get("remoteMetrics") ?? null,
       log,
     });
 
