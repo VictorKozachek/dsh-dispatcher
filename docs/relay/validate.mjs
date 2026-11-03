@@ -73,6 +73,25 @@ function walk(schema, value, root, where, errors) {
     return;
   }
 
+  if (Array.isArray(schema.allOf)) {
+    for (const branch of schema.allOf) walk(branch, value, root, where, errors);
+  }
+
+  if (Array.isArray(schema.anyOf)) {
+    const matching = schema.anyOf.filter((branch) => {
+      const branchErrors = [];
+      walk(branch, value, root, where, branchErrors);
+      return branchErrors.length === 0;
+    }).length;
+    if (matching === 0) errors.push(`${where}: ни один вариант anyOf не подошёл`);
+  }
+
+  if (schema.not !== undefined) {
+    const innerErrors = [];
+    walk(schema.not, value, root, where, innerErrors);
+    if (innerErrors.length === 0) errors.push(`${where}: запрещённая конструкция (not)`);
+  }
+
   if (Array.isArray(schema.oneOf)) {
     const outcomes = schema.oneOf.map((branch) => {
       const branchErrors = [];

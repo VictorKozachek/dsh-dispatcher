@@ -27,11 +27,15 @@ const VALID = {
   "device-create.response.json": "Device",
   "pair.request.json": "PairRequest",
   "pair.response.json": "PairResponse",
-  "questions.list.response.json": "QuestionList",
+  "question.publish.request.json": "QuestionPublishRequest",
   "question.encrypted.json": "Question",
+  "questions.list.response.json": "QuestionList",
   "answer.request.json": "AnswerRequest",
+  "answer.encrypted.request.json": "AnswerRequest",
   "answer.response.json": "Answer",
   "event.message.json": "Event",
+  "event.question-created.json": "Event",
+  "health.response.json": "Health",
   "error.response.json": "Error",
 };
 
@@ -129,10 +133,117 @@ test("версия и совместимость зафиксированы", ()
   assert.match(compatibility, /426 unsupported-version/);
   assert.match(compatibility, /Sunset/);
   assert.match(compatibility, /90 дней/);
-  assert.equal(schema.components.schemas.Error.properties.error.properties.code.enum.includes("unsupported-version"), true);
+  // Код ошибки — открытый набор (ответы аддитивные), но докумен тирует unsupported-version.
+  assert.equal(typeof schema.components.schemas.Error.properties.error.properties.code.pattern, "string");
 });
 
 test("front matter карточек задач не ломает контракт (дым): parseFrontMatter доступен", () => {
   // Косвенный дым: утилита совместима с ESM-тестами и не требует состояния.
   assert.equal(parseFrontMatter("---\nid: 1\n---\n").id, "1");
+});
+
+test("таблица эндпоинтов в PROTOCOL.md совпадает со схемой по методам", () => {
+  const protocol = readText("PROTOCOL.md");
+  const schema = loadSchema();
+  const rows = [...protocol.matchAll(/^\| `(GET|POST|PUT|DELETE|PATCH) (\/v1\/[^`]+)`/gm)]
+    .map((match) => ({ method: match[1].toLowerCase(), path: match[2].split("?")[0] }));
+
+  const fromSchema = [];
+  for (const [endpoint, methods] of Object.entries(schema.paths)) {
+    for (const method of Object.keys(methods)) fromSchema.push(`${method} ${endpoint}`);
+  }
+  const fromDoc = rows.map((row) => `${row.method} ${row.path}`);
+  assert.deepEqual([...fromDoc].sort(), [...fromSchema].sort(), "методы и пути совпадают");
+});
+
+test("обязательные поля сущностей совпадают с документацией", () => {
+  const schema = loadSchema();
+  const expected = {
+    Device: ["deviceId", "platform", "createdAt"],
+    DeviceCreateRequest: ["platform", "publicKey"],
+    PairRequest: ["pairCode", "deviceId"],
+    PairResponse: ["deviceToken", "device", "confirmedAt"],
+    Question: ["id", "shortId", "createdAt", "expiresAt"],
+    AnswerRequest: ["questionId", "answeredAt", "idempotencyKey"],
+    Answer: ["questionId", "answeredAt", "idempotencyKey"],
+    Event: ["type", "at"],
+    Health: ["ok", "version", "at"],
+    Error: ["error"],
+  };
+  for (const [name, required] of Object.entries(expected)) {
+    assert.deepEqual([...schema.components.schemas[name].required].sort(), [...required].sort(), name);
+  }
+  const protocol = readText("PROTOCOL.md");
+  // publicKey и confirmedAt документированы — их отсутствие в таблице и было расхождением.
+  assert.match(protocol, /publicKey/);
+  assert.match(protocol, /confirmedAt/);
+});
+
+test("ответы аддитивны: незнакомые поля, коды ошибок и типы событий принимаются", () => {
+  const schema = loadSchema();
+  const device = { ...readJson("device-create.response.json"), futureField: { nested: true } };
+  assert.equal(validate(schema.components.schemas.Device, device, { root: schema }).ok, true, "Device: лишнее поле ок");
+
+  const answer = { ...readJson("answer.response.json"), futureField: 1 };
+  assert.equal(validate(schema.components.schemas.Answer, answer, { root: schema }).ok, true, "Answer: лишнее поле ок");
+
+  const error = { error: { code: "brand-new-code", message: "новый код", retryable: false } };
+  assert.equal(validate(schema.components.schemas.Error, error, { root: schema }).ok, true, "незнакомый error.code ок");
+
+  const event = { type: "deploy.finished", at: "2026-11-03T18:00:00Z", payload: { ok: true } };
+  assert.equal(validate(schema.components.schemas.Event, event, { root: schema }).ok, true, "незнакомый event.type ок");
+});
+
+test("запросы строгие: лишнее поле в запросе отвергается", () => {
+  const schema = loadSchema();
+  for (const [name, file] of [
+    ["DeviceCreateRequest", "device-create.request.json"],
+    ["PairRequest", "pair.request.json"],
+    ["AnswerRequest", "answer.request.json"],
+  ]) {
+    const payload = { ...readJson(file), extra: true };
+    const result = validate(schema.components.schemas[name], payload, { root: schema });
+    assert.equal(result.ok, false, `${name}: лишнее поле должно отвергаться`);
+    assert.match(result.errors.join("; "), /лишнее поле extra/);
+  }
+});
+
+test("e2e: открытые поля в зашифрованных вопросах и ответах отсутствуют", () => {
+  const schema = loadSchema();
+  const question = readJson("question.encrypted.json");
+  for (const field of ["body", "title", "detail", "options"]) {
+    assert.equal(field in question, false, `в e2e-вопросе нет ${field}`);
+  }
+  assert.equal(question.optionCount, 2, "сервер видит только число вариантов");
+  assert.equal(validate(schema.components.schemas.Question, question, { root: schema }).ok, true);
+
+  const answer = readJson("answer.encrypted.request.json");
+  for (const field of ["selected", "custom"]) {
+    assert.equal(field in answer, false, `в e2e-ответе нет ${field}`);
+  }
+  assert.equal(validate(schema.components.schemas.AnswerRequest, answer, { root: schema }).ok, true);
+
+  const leaks = [
+    ["Question", { ...question, options: [{ id: "o1", label: "Да" }] }],
+    ["Question", { ...question, title: "утечка" }],
+    ["AnswerRequest", { ...answer, selected: ["o1"] }],
+    ["AnswerRequest", { ...answer, custom: "утечка" }],
+  ];
+  for (const [name, payload] of leaks) {
+    assert.equal(validate(schema.components.schemas[name], payload, { root: schema }).ok, false, `${name}: открытое поле вместе с enc`);
+  }
+});
+
+test("каждая схема из paths покрыта хотя бы одним примером", () => {
+  const schema = loadSchema();
+  const covered = new Set(Object.values(VALID));
+  for (const [endpoint, methods] of Object.entries(schema.paths)) {
+    for (const [method, contract] of Object.entries(methods)) {
+      for (const ref of [contract.request, contract.response]) {
+        if (ref === null) continue;
+        const name = ref.split("/").pop();
+        assert.ok(covered.has(name), `${method.toUpperCase()} ${endpoint}: для ${name} нет примера`);
+      }
+    }
+  }
 });

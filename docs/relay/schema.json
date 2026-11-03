@@ -2,14 +2,20 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://dsh-dispatcher.local/relay/v1.json",
   "title": "DSH Relay Protocol v1",
-  "description": "Контракт плагина dsh-remote с релеем. Документ: docs/relay/PROTOCOL.md",
+  "description": "Контракт плагина dsh-remote с релеем. Документ: docs/relay/PROTOCOL.md. Запросы — строгие (additionalProperties:false), ответы — аддитивные (additionalProperties:true): клиент обязан игнорировать незнакомые поля.",
   "version": "1.0.0",
   "paths": {
     "/v1/devices": { "post": { "request": "#/components/schemas/DeviceCreateRequest", "response": "#/components/schemas/Device" } },
     "/v1/devices/{id}": { "delete": { "request": null, "response": null } },
     "/v1/pair": { "post": { "request": "#/components/schemas/PairRequest", "response": "#/components/schemas/PairResponse" } },
-    "/v1/questions": { "post": { "request": "#/components/schemas/QuestionPublishRequest", "response": "#/components/schemas/Question" }, "get": { "request": null, "response": "#/components/schemas/QuestionList" } },
-    "/v1/answers": { "post": { "request": "#/components/schemas/AnswerRequest", "response": "#/components/schemas/Answer" }, "get": { "request": null, "response": "#/components/schemas/Answer" } },
+    "/v1/questions": {
+      "post": { "request": "#/components/schemas/QuestionPublishRequest", "response": "#/components/schemas/Question" },
+      "get": { "request": null, "response": "#/components/schemas/QuestionList" }
+    },
+    "/v1/answers": {
+      "post": { "request": "#/components/schemas/AnswerRequest", "response": "#/components/schemas/Answer" },
+      "get": { "request": null, "response": "#/components/schemas/Answer" }
+    },
     "/v1/events": { "get": { "request": null, "response": "#/components/schemas/Event" } },
     "/v1/health": { "get": { "request": null, "response": "#/components/schemas/Health" } },
     "/v1/heartbeat": { "post": { "request": null, "response": null } }
@@ -17,19 +23,22 @@
   "components": {
     "schemas": {
       "Version": { "type": "integer", "const": 1 },
+      "Timestamp": { "type": "string", "minLength": 20, "maxLength": 30 },
       "Device": {
+        "description": "Ответ: аддитивный (незнакомые поля игнорируются клиентом).",
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["deviceId", "platform", "createdAt"],
         "properties": {
           "deviceId": { "type": "string", "minLength": 8, "maxLength": 64 },
           "platform": { "type": "string", "enum": ["ios", "android", "web"] },
-          "createdAt": { "type": "string", "minLength": 20, "maxLength": 30 },
+          "createdAt": { "$ref": "#/components/schemas/Timestamp" },
           "pushToken": { "type": "string", "maxLength": 512 },
           "label": { "type": "string", "maxLength": 120 }
         }
       },
       "DeviceCreateRequest": {
+        "description": "Запрос: строгий. publicKey — ключ устройства для e2e (base64, X25519/Ed25519).",
         "type": "object",
         "additionalProperties": false,
         "required": ["platform", "publicKey"],
@@ -53,15 +62,16 @@
       },
       "PairResponse": {
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["deviceToken", "device", "confirmedAt"],
         "properties": {
           "deviceToken": { "type": "string", "minLength": 32, "maxLength": 512 },
           "device": { "$ref": "#/components/schemas/Device" },
-          "confirmedAt": { "type": "string", "minLength": 20, "maxLength": 30 }
+          "confirmedAt": { "$ref": "#/components/schemas/Timestamp" }
         }
       },
       "EncEnvelope": {
+        "description": "Единственное, что видит сервер от содержимого: шифртекст и служебные поля.",
         "type": "object",
         "additionalProperties": false,
         "required": ["enc", "nonce", "keyId", "alg", "plainSize"],
@@ -83,12 +93,26 @@
         }
       },
       "Question": {
+        "description": "Вопрос: либо открытый (body+options), либо e2e (enc), но не оба. В e2e сервер не видит ни тело, ни варианты, ни title/detail.",
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "shortId", "options", "createdAt", "expiresAt"],
+        "required": ["id", "shortId", "createdAt", "expiresAt"],
         "oneOf": [
-          { "required": ["body"] },
-          { "required": ["enc"] }
+          {
+            "description": "Открытый режим: тело и варианты видны серверу.",
+            "required": ["body", "options"],
+            "not": { "required": ["enc"] }
+          },
+          {
+            "description": "E2E: только конверт; тело/заголовок/варианты отсутствуют.",
+            "required": ["enc"],
+            "not": { "required": ["body"] },
+            "allOf": [
+              { "not": { "required": ["title"] } },
+              { "not": { "required": ["detail"] } },
+              { "not": { "required": ["options"] } }
+            ]
+          }
         ],
         "properties": {
           "id": { "type": "string", "minLength": 8, "maxLength": 64 },
@@ -100,10 +124,11 @@
           "body": { "type": "string", "maxLength": 4000 },
           "detail": { "type": "string", "maxLength": 2000 },
           "options": { "type": "array", "minItems": 0, "maxItems": 10, "items": { "$ref": "#/components/schemas/QuestionOption" } },
+          "optionCount": { "type": "integer", "minimum": 0, "maximum": 10 },
           "multiSelect": { "type": "boolean" },
           "allowFreeText": { "type": "boolean" },
-          "createdAt": { "type": "string", "minLength": 20, "maxLength": 30 },
-          "expiresAt": { "type": "string", "minLength": 20, "maxLength": 30 },
+          "createdAt": { "$ref": "#/components/schemas/Timestamp" },
+          "expiresAt": { "$ref": "#/components/schemas/Timestamp" },
           "enc": { "$ref": "#/components/schemas/EncEnvelope" },
           "version": { "$ref": "#/components/schemas/Version" }
         }
@@ -119,73 +144,92 @@
       },
       "QuestionList": {
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["questions", "nextSince"],
         "properties": {
           "questions": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/Question" } },
-          "nextSince": { "type": "string", "minLength": 20, "maxLength": 30 }
+          "nextSince": { "$ref": "#/components/schemas/Timestamp" }
         }
       },
       "AnswerRequest": {
+        "description": "Ответ: selected — идентификаторы вариантов (не подписи); в e2e вместо selected/custom — enc.",
         "type": "object",
         "additionalProperties": false,
-        "required": ["questionId", "selected", "answeredBy", "answeredAt", "idempotencyKey"],
+        "required": ["questionId", "answeredAt", "idempotencyKey"],
+        "oneOf": [
+          { "required": ["selected"], "not": { "required": ["enc"] } },
+          {
+            "required": ["enc"],
+            "not": { "required": ["selected"] },
+            "allOf": [{ "not": { "required": ["custom"] } }]
+          }
+        ],
         "properties": {
           "questionId": { "type": "string", "minLength": 8, "maxLength": 64 },
-          "selected": { "type": "array", "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": 120 } },
+          "selected": { "type": "array", "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": 8 } },
           "custom": { "type": "string", "maxLength": 2000 },
-          "answeredBy": { "type": "string", "maxLength": 64 },
-          "answeredAt": { "type": "string", "minLength": 20, "maxLength": 30 },
+          "answeredAt": { "$ref": "#/components/schemas/Timestamp" },
           "idempotencyKey": { "type": "string", "pattern": "^[0-9a-fA-F-]{16,64}$" },
           "enc": { "$ref": "#/components/schemas/EncEnvelope" },
           "version": { "$ref": "#/components/schemas/Version" }
         }
       },
       "Answer": {
+        "description": "Ответ: аддитивный. answeredBy на проводе нет — устройство идентифицируется токеном.",
         "type": "object",
-        "additionalProperties": false,
-        "required": ["questionId", "selected", "answeredBy", "answeredAt", "idempotencyKey"],
+        "additionalProperties": true,
+        "required": ["questionId", "answeredAt", "idempotencyKey"],
+        "oneOf": [
+          { "required": ["selected"], "not": { "required": ["enc"] } },
+          {
+            "required": ["enc"],
+            "not": { "required": ["selected"] },
+            "allOf": [{ "not": { "required": ["custom"] } }]
+          }
+        ],
         "properties": {
           "questionId": { "type": "string", "minLength": 8, "maxLength": 64 },
-          "selected": { "type": "array", "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": 120 } },
+          "selected": { "type": "array", "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": 8 } },
           "custom": { "type": "string", "maxLength": 2000 },
-          "answeredBy": { "type": "string", "maxLength": 64 },
-          "answeredAt": { "type": "string", "minLength": 20, "maxLength": 30 },
-          "idempotencyKey": { "type": "string", "pattern": "^[0-9a-fA-F-]{16,64}$" }
+          "answeredAt": { "$ref": "#/components/schemas/Timestamp" },
+          "idempotencyKey": { "type": "string", "pattern": "^[0-9a-fA-F-]{16,64}$" },
+          "enc": { "$ref": "#/components/schemas/EncEnvelope" }
         }
       },
       "Event": {
+        "description": "Событие: аддитивное. Незнакомый type клиент игнорирует, а не падает.",
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["type", "at"],
         "properties": {
-          "type": { "type": "string", "enum": ["question.created", "question.answered", "question.expired", "pairing.confirmed", "device.revoked", "heartbeat"] },
-          "at": { "type": "string", "minLength": 20, "maxLength": 30 },
+          "type": { "type": "string", "pattern": "^[a-z][a-z0-9._-]{1,40}$" },
+          "at": { "$ref": "#/components/schemas/Timestamp" },
           "questionId": { "type": "string", "maxLength": 64 },
           "payload": { "type": "object" }
         }
       },
       "Health": {
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["ok", "version", "at"],
         "properties": {
           "ok": { "type": "boolean" },
           "version": { "type": "string", "minLength": 1, "maxLength": 16 },
-          "at": { "type": "string", "minLength": 20, "maxLength": 30 }
+          "at": { "$ref": "#/components/schemas/Timestamp" }
         }
       },
       "Error": {
+        "description": "Ошибка: code — открытый набор (см. PROTOCOL.md §5), новые коды допустимы.",
         "type": "object",
-        "additionalProperties": false,
+        "additionalProperties": true,
         "required": ["error"],
         "properties": {
           "error": {
             "type": "object",
-            "additionalProperties": false,
+            "additionalProperties": true,
             "required": ["code", "message"],
             "properties": {
-              "code": { "type": "string", "enum": ["bad-request", "unauthorized", "forbidden", "not-found", "conflict", "expired", "payload-too-large", "unsupported-version", "rate-limited", "internal"] },
+              "code": { "type": "string", "pattern": "^[a-z][a-z-]{2,40}$" },
               "message": { "type": "string", "minLength": 1, "maxLength": 400 },
               "retryable": { "type": "boolean" },
               "details": { "type": "object" }
