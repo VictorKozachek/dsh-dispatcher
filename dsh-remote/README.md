@@ -18,6 +18,7 @@ waterfall `user-questions/request`.
   состояние и журналы в `~/.dsh/remote-control/`.
 
 Подробности: [docs/user-guide.md](../docs/user-guide.md) — пошагово для человека,
+[docs/RUNBOOK.md](../docs/RUNBOOK.md) — эксплуатация, инциденты и SLO,
 [docs/approvals.md](../docs/approvals.md) — политика подтверждений,
 [docs/CONCEPT.md](../docs/CONCEPT.md) — концепция, `.kanban/specs/001.md` и
 `.kanban/specs/004.md` — спеки.

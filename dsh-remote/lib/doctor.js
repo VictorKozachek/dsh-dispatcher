@@ -34,6 +34,24 @@ export function createCheck({ id, status = "ok", detail = "", action = undefined
   };
 }
 
+/**
+ * Id проверок doctor, которые умеют возвращать `fail` (задача 036).
+ *
+ * Контракт с RUNBOOK: у каждого такого кода есть раздел в `docs/RUNBOOK.md`
+ * (маркер `<!-- doctor-fail: <id> -->`), соответствие проверяется тестом. Если
+ * добавляешь новую fail-проверку — добавь id сюда и раздел в RUNBOOK.
+ * У `credentials` id в отчёте — `credentials:<ref>`, здесь базовый.
+ */
+export const DOCTOR_FAIL_IDS = Object.freeze([
+  "token",
+  "getme",
+  "state",
+  "credentials",
+  "relay",
+  "schema",
+  "timers",
+]);
+
 /** Худший статус из списка: ok < warn < fail. */
 export function worstStatus(checks) {
   let worst = "ok";
