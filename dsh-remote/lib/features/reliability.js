@@ -35,6 +35,15 @@ export const reliabilityFeature = {
       sessionController: ctx?.get?.("sessionController") ?? deps.get("sessionController") ?? null,
       onExpire: config?.onExpire,
       redactMode: config?.redactMode,
+      // 034: после рестарта вопрос мёртвой сессии снимаем сразу (а не ждём).
+      isSessionAlive: (sessionId) => {
+        try {
+          const sessions = typeof ctx?.get === "function" ? ctx.get("sessions") : null;
+          return typeof sessions?.get === "function" ? sessions.get(sessionId) != null : null;
+        } catch {
+          return null;
+        }
+      },
       metrics: deps.get("remoteMetrics") ?? null,
       log,
     });
@@ -69,7 +78,7 @@ export const reliabilityFeature = {
     }
 
     reliability.start();
-    deps.onDispose(() => reliability.stop());
+    deps.onDispose(() => reliability.stop(), "timers");
     deps.logger.info("фича reliability: сторож и доставка подключены");
   },
 };

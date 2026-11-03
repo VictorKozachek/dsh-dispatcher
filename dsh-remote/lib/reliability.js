@@ -33,6 +33,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+import { rotateIfNeeded } from "./rotate.js";
 import { randomUUID } from "node:crypto";
 
 const noop = () => {};
@@ -203,12 +205,12 @@ export function createJsonState({ file, now = () => Date.now(), logger = noop } 
  * `log.jsonl` без секретов: записи — только служебные поля, значения проходят
  * через `redact`, тела вопросов не пишутся. Ротация по размеру (`.1`).
  */
-export function createJournalLog({ file, maxBytes = 512 * 1024, now = () => Date.now(), logger = noop } = {}) {
+export function createJournalLog({ file, maxBytes = 5 * 1024 * 1024, keep = 5, now = () => Date.now(), logger = noop } = {}) {
   function append(entry) {
     const line = JSON.stringify(redactEntry({ at: now(), ...entry }));
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      rotateIfNeeded(file, maxBytes, line);
+      rotateIfNeeded(fs, file, line.length + 1, { maxBytes, keep, log: logger });
       fs.appendFileSync(file, `${line}\n`, { mode: 0o600 });
       try {
         fs.chmodSync(file, 0o600);
@@ -219,21 +221,6 @@ export function createJournalLog({ file, maxBytes = 512 * 1024, now = () => Date
     } catch (error) {
       logger(`журнал: запись не удалась (${error?.message ?? error})`);
       return false;
-    }
-  }
-
-  function rotateIfNeeded(target, limit, incoming) {
-    let size = 0;
-    try {
-      size = fs.statSync(target).size;
-    } catch {
-      return;
-    }
-    if (size + incoming.length + 1 <= limit) return;
-    try {
-      fs.renameSync(target, `${target}.1`);
-    } catch (error) {
-      logger(`журнал: ротация не удалась (${error?.message ?? error})`);
     }
   }
 
@@ -276,6 +263,7 @@ export function createReliability({
   now = () => Date.now(),
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   setInterval: setIntervalImpl = setInterval,
+  clearInterval: clearIntervalImpl = clearInterval,
   logger = noop,
   onExpire = "abort",
   redactMode = "warn",
@@ -289,10 +277,14 @@ export function createReliability({
   tickIntervalMs = 15_000,
   notifyTimeoutMs = 2_000,
   setTimeout: setTimeoutImpl = setTimeout,
+  /** 034: жив ли ещё агент/сессия вопроса (для recover: «мертва» → снимаем). */
+  isSessionAlive = null,
   /** 012: (transportId) => transport, чтобы TTL/напоминания шли во все каналы. */
   transportFor = null,
   /** 031: метрики повторов доставки. */
   metrics = null,
+  /** 033: предел очереди pending в state.json. */
+  maxPending = 200,
 } = {}) {
   if (!ON_EXPIRE_VALUES.includes(onExpire)) {
     throw new TypeError(`reliability: onExpire должен быть одним из ${ON_EXPIRE_VALUES.join(", ")}`);
@@ -330,6 +322,14 @@ export function createReliability({
       store.update((raw) => {
         const current = normalizeState(raw);
         const exists = current.pending.some((item) => item.shortId === question.shortId);
+        // 033: очередь не растёт бесконечно — старейший вытесняется с записью в журнал.
+        let dropped = null;
+        if (!exists && current.pending.length >= Math.max(1, Math.floor(maxPending))) {
+          dropped = current.pending.shift() ?? null;
+          if (dropped !== null) {
+            journal.append({ event: "pending-dropped", shortId: dropped.shortId, reason: "max-pending" });
+          }
+        }
         if (!exists) {
           current.pending.push({
             shortId: question.shortId,
@@ -636,7 +636,21 @@ export function createReliability({
    */
   async function recoverOrphans({ reason = "сессия перезапущена, вопрос снят" } = {}) {
     const current = normalizeState(store.read());
-    const orphans = [...current.pending, ...current.questions];
+    // 034: один и тот же вопрос мог остаться и в `pending`, и в `questions` —
+    // закрываем сообщение один раз, а не дважды (повторная правка сбивала бы
+    // счётчики и могла гоняться с закрытием из другого канала).
+    const seen = new Set();
+    const orphans = [];
+    for (const item of [...current.pending, ...current.questions]) {
+      const shortId = typeof item?.shortId === "string" ? item.shortId : null;
+      if (shortId === null) {
+        orphans.push(item);
+        continue;
+      }
+      if (seen.has(shortId)) continue;
+      seen.add(shortId);
+      orphans.push(item);
+    }
     let cancelled = 0;
     let failed = 0;
 
@@ -672,6 +686,18 @@ export function createReliability({
           journal.append({ event: "orphan-failed", shortId: orphan.shortId });
         }
         continue;
+      }
+      let alive = null;
+      if (typeof isSessionAlive === "function" && typeof orphan.sessionId === "string" && orphan.sessionId !== "") {
+        try {
+          alive = isSessionAlive(orphan.sessionId) !== false;
+        } catch {
+          alive = null;
+        }
+      }
+      if (alive === false) {
+        journal.append({ event: "orphan-session-dead", shortId: orphan.shortId });
+        logger(`рестарт: сессия ${orphan.sessionId} уже мертва — вопрос ${orphan.shortId} снимаю, не жду`);
       }
       try {
         const live = channel();
@@ -898,11 +924,53 @@ export function createReliability({
     timer?.unref?.();
   }
 
-  /** Остановить сторож. */
-  function stop() {
-    if (timer === null) return;
-    clearInterval(timer);
-    timer = null;
+  /**
+   * Остановить сторож (034): снять таймер, убрать вопросы со сторожа, сбросить
+   * состояние на диск. Идемпотентно: повторный вызов ничего не делает.
+   *
+   * Сообщения в каналах здесь не закрываются — это делает ответчик (024/002),
+   * который владеет вопросом и знает про каналы; здесь только TTL-таймеры и
+   * состояние восстановления.
+   *
+   * @param {string} [reason] — причина снятия (для статуса вопроса/журнала).
+   * @returns {{cancelled: number, watched: number, pending: number, timers: number}}
+   */
+  function stop(reason = "detached") {
+    const hadTimer = timer !== null;
+    if (hadTimer) {
+      clearIntervalImpl(timer);
+      timer = null;
+    }
+    const snapshot = [...watched.entries()];
+    for (const [shortId, item] of snapshot) {
+      try {
+        item.question?.cancel?.(reason, now());
+      } catch (error) {
+        logger(`остановка: вопрос ${shortId} не снят (${error?.message ?? error})`);
+      }
+      watched.delete(shortId);
+      forgetOpen(shortId);
+    }
+    flushState();
+    return {
+      cancelled: snapshot.length,
+      watched: snapshot.length,
+      pending: pendingList().length,
+      timers: hadTimer ? 1 : 0,
+    };
+  }
+
+  /** Записать текущее состояние на диск (после снятия вопросов/очереди). */
+  function flushState() {
+    try {
+      if (typeof store?.write === "function" && typeof store?.read === "function") {
+        store.write(store.read());
+      } else {
+        write(read());
+      }
+    } catch (error) {
+      logger(`состояние: не сброшено на диск (${error?.message ?? error})`);
+    }
   }
 
   // --- поздний ответ -------------------------------------------------------
@@ -989,6 +1057,7 @@ export function createReliability({
     tick,
     start,
     stop,
+    flushState,
     applyLateAnswer,
     healthCheck,
     journal,

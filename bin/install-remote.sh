@@ -175,12 +175,6 @@ fi
 
 already=0
 up_to_date=0
-if [[ "$MODE" == "update" ]]; then
-  installed="$(installed_version)"
-  if [[ -n "$installed" && "$installed" == "$CURRENT_VERSION" ]]; then
-    up_to_date=1
-  fi
-fi
 if (( profile_ready == 1 )); then
   if python3 - "$MANIFEST" "$PLUGIN_NAME" <<'PY'
 import json
@@ -194,6 +188,15 @@ sys.exit(0 if sys.argv[2] in deps and sys.argv[2] in bundles else 1)
 PY
   then
     already=1
+  fi
+
+  # «Уже установлено» — и версия совпадает, и пакет объявлен в deps+bundles:
+  # иначе --update должен доустановить, а не молчать.
+  if [[ "$MODE" == "update" ]]; then
+    installed="$(installed_version)"
+    if [[ -n "$installed" && "$installed" == "$CURRENT_VERSION" ]] && (( already == 1 )); then
+      up_to_date=1
+    fi
   fi
 
   # Ручной ряд в патч-слое профиля: двойной монтаж.
@@ -210,9 +213,27 @@ fi
 TARGET_DIR="$PLUGIN_DIR"
 ROLLBACK_TARGET=""
 if [[ "$MODE" == "rollback" ]]; then
-  ROLLBACK_TARGET="$CACHE_ROOT/$ROLLBACK_VERSION"
-  TARGET_DIR="$ROLLBACK_TARGET"
-  if [[ ! -f "$ROLLBACK_TARGET/package.json" ]]; then
+  if [[ ! "$ROLLBACK_VERSION" =~ ^[0-9A-Za-z._-]+$ ]] || [[ "$ROLLBACK_VERSION" == *".."* ]]; then
+    problem "недопустимая версия '$ROLLBACK_VERSION': разрешены буквы, цифры, '.', '-', '_'"
+    ROLLBACK_TARGET=""
+    TARGET_DIR="$PLUGIN_DIR"
+  else
+    ROLLBACK_TARGET="$CACHE_ROOT/$ROLLBACK_VERSION"
+    TARGET_DIR="$ROLLBACK_TARGET"
+    if [[ -e "$ROLLBACK_TARGET" && -d "$CACHE_ROOT" ]]; then
+      cache_real="$(cd "$CACHE_ROOT" && pwd -P)"
+      target_real="$(cd "$ROLLBACK_TARGET" && pwd -P)"
+      case "$target_real" in
+        "$cache_real"/*) ;;
+        *)
+          problem "версия '$ROLLBACK_VERSION' указывает вне кэша ($target_real)"
+          ROLLBACK_TARGET=""
+          TARGET_DIR="$PLUGIN_DIR"
+          ;;
+      esac
+    fi
+  fi
+  if [[ -n "$ROLLBACK_TARGET" && ! -f "$ROLLBACK_TARGET/package.json" ]]; then
     problem "версия $ROLLBACK_VERSION не найдена в кэше: $CACHE_ROOT"
     cached="$(ls -1 "$CACHE_ROOT" 2>/dev/null | tr '\n' ' ' || true)"
     say "  доступные версии: ${cached:-нет}"
@@ -283,6 +304,8 @@ say ""
 
 if (( DRY_RUN == 1 )); then
   say "dry-run: ничего не изменено."
+  # Машинный план должен быть однозначен: проблемы -> ненулевой код и здесь.
+  if (( problems > 0 )); then exit 1; fi
   exit 0
 fi
 
@@ -345,6 +368,12 @@ if [[ "${DSH_INSTALL_NO_DSH:-0}" != "1" ]] && command -v dsh >/dev/null 2>&1; th
   err=""
   if err="$(dsh plugin --profile "$PROFILE" add "$PLUGIN_DIR" 2>&1)"; then
     printf '%s\n' "$err"
+    # dsh мог не переключить link при уже объявленной зависимости: проверяем
+    # фактическую версию и при расхождении обновляем ссылку сами.
+    if [[ "$MODE" == "update" && "$(installed_version)" != "$CURRENT_VERSION" ]]; then
+      say "dsh plugin add не переключил версию — обновляю ссылку вручную"
+      manual=1
+    fi
   elif [[ "$err" == *"managed exclusively"* ]]; then
     say "профиль '$PROFILE' управляется приложением — ставлю пакет сам"
     manual=1

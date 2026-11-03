@@ -64,7 +64,7 @@ test("--dry-run на пустом DSH_HOME: печатает план и нич�
   const home = tempHome(t);
   const result = run(t, ["--dry-run"], home);
 
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 1, "dry-run с проблемами возвращает 1 как машинный план");
   assert.match(result.stdout, /план:/);
   assert.match(result.stdout, /dry-run: ничего не изменено/);
   assert.match(result.stderr, /профиль 'web' не инициализирован/);
@@ -134,7 +134,7 @@ test("файл исполняемый и запускается без bash (р�
     env: { ...process.env, DSH_HOME: home },
   });
 
-  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.status, 1, "dry-run с проблемами возвращает 1");
   assert.match(result.stdout, /dry-run: ничего не изменено/);
 });
 
@@ -274,4 +274,66 @@ test("035: несовместимый schemaVersion блокирует уста�
   assert.match(result.stdout, /состояние из будущего/);
   assert.equal(fs.readFileSync(manifest, "utf8"), before, "установка не тронула профиль");
   assert.equal(fs.existsSync(path.join(home, "plugin-cache")), false);
+});
+
+// --- 035, ревью: обход кэша, неполная установка, фейковый dsh ----------------
+
+test("035: --rollback отклоняет version traversal и ссылку вне кэша", (t) => {
+  const { home, manifest } = seedProfile(t, { installedVersion: "0.1.0" });
+  const before = fs.readFileSync(manifest, "utf8");
+
+  const traversal = runWithEnv(t, ["--rollback", "../../outside"], { DSH_HOME: home });
+  assert.equal(traversal.status, 1);
+  assert.match(traversal.stderr, /недопустимая версия/);
+  assert.equal(fs.readFileSync(manifest, "utf8"), before);
+
+  // Симлинк из кэша наружу: realpath обязан отклонить.
+  const outside = path.join(home, "outside-plugin");
+  fs.mkdirSync(outside, { recursive: true });
+  fs.writeFileSync(path.join(outside, "package.json"), JSON.stringify({ name: "dsh-remote", version: "0.0.5" }));
+  fs.mkdirSync(path.join(home, "plugin-cache", "dsh-remote"), { recursive: true });
+  fs.symlinkSync(outside, path.join(home, "plugin-cache", "dsh-remote", "0.0.5"));
+
+  const symlink = runWithEnv(t, ["--rollback", "0.0.5"], { DSH_HOME: home });
+  assert.equal(symlink.status, 1);
+  assert.match(symlink.stderr, /вне кэша/);
+  assert.equal(fs.readFileSync(manifest, "utf8"), before);
+});
+
+test("035: --update при той же версии, но без bundle — доустанавливает", (t) => {
+  const { home, manifest, oldDir } = seedProfile(t, { installedVersion: pluginVersion });
+  // Имитируем поломку: версия та же, но бандла в профиле нет, ссылки node_modules нет.
+  fs.writeFileSync(manifest, JSON.stringify({
+    name: "web-profile",
+    dependencies: { "dsh-remote": `link:${oldDir}` },
+    dsh: { profile: { bundles: [] } },
+  }, null, 2));
+  fs.rmSync(path.join(home, "profiles", "web", "node_modules"), { recursive: true, force: true });
+
+  const result = runWithEnv(t, ["--update"], { DSH_HOME: home });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stdout, /обновление не требуется/, "нельзя молчать при неполной установке");
+  const updated = JSON.parse(fs.readFileSync(manifest, "utf8"));
+  assert.equal(updated.dependencies["dsh-remote"], `link:${pluginDir}`);
+  assert.deepEqual(updated.dsh.profile.bundles, ["dsh-remote"], "бандл восстановлен");
+});
+
+test("035: dsh plugin add без переключения версии — фолбэк на ручную ссылку", (t) => {
+  const { home, manifest } = seedProfile(t, { installedVersion: "0.1.0" });
+  const bin = path.join(home, "fake-bin");
+  fs.mkdirSync(bin, { recursive: true });
+  const fakeDsh = path.join(bin, "dsh");
+  fs.writeFileSync(fakeDsh, "#!/bin/sh\nexit 0\n");
+  fs.chmodSync(fakeDsh, 0o755);
+
+  const result = spawnSync("bash", [script, "--update"], {
+    encoding: "utf8",
+    env: { ...process.env, DSH_HOME: home, PATH: `${bin}:${process.env.PATH}` },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /не переключил версию — обновляю ссылку вручную/);
+  const updated = JSON.parse(fs.readFileSync(manifest, "utf8"));
+  assert.equal(updated.dependencies["dsh-remote"], `link:${pluginDir}`, "версия фактически переключена");
 });

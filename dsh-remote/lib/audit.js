@@ -25,11 +25,11 @@ import { statePaths } from "./store.js";
 /** Имя журнала рядом с `state.json`. */
 export const AUDIT_FILE_NAME = "audit.jsonl";
 
-/** Размер, после которого журнал уезжает в `.1` (256 КиБ — это тысячи решений). */
-export const DEFAULT_MAX_BYTES = 256 * 1024;
+/** Размер, после которого журнал уезжает в `.1` (5 МиБ, задача 033). */
+export const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 
-/** Сколько ротированных файлов держим: 3 × 256 КиБ — история без бесконечного роста. */
-export const DEFAULT_KEEP_ROTATED = 3;
+/** Сколько ротированных файлов держим: 5 × 5 МиБ — история без бесконечного роста. */
+export const DEFAULT_KEEP_ROTATED = 5;
 
 /** Что пишем: только подтверждения (вопросы — история сессии в DSH). */
 export const AUDIT_KIND_APPROVAL = "approval";
@@ -207,6 +207,14 @@ export function createAudit({
       /* старого файла нет — и хорошо */
     }
     fsImpl.renameSync(paths.file, rotatedFiles[0]);
+    // 033: в журналах бывают id пользователей — ротированные файлы тоже 600.
+    for (const target of rotatedFiles) {
+      try {
+        fsImpl.chmodSync(target, 0o600);
+      } catch (error) {
+        if (error?.code !== "ENOENT") log(`аудит: chmod 600 для ${target} не удался (${error?.message ?? error})`);
+      }
+    }
     log(`аудит: журнал превысил ${maxBytes} байт — ротация в ${rotatedFiles[0]}`);
   }
 

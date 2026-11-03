@@ -75,7 +75,7 @@ export const answererFeature = {
       log: (message) => deps.logger.debug(message),
     });
 
-    deps.onDispose(answerer.attach(ctx));
+    deps.onDispose(answerer.attach(ctx), "closers");
     // Метрика гибрида доступна командам (`/remote status`) как сервис.
     try {
       ctx.provide?.("remoteAnswerer", { stats: answerer.stats });

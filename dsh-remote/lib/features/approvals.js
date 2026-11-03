@@ -112,7 +112,7 @@ export const approvalsFeature = {
       log: (message) => deps.logger.debug(message),
     });
 
-    deps.onDispose(approvals.attach(ctx));
+    deps.onDispose(approvals.attach(ctx), "closers");
 
     try {
       ctx.provide?.(APPROVALS_SERVICE, {
