@@ -25,8 +25,10 @@
  */
 import { telegramFeature } from "./features/telegram.js";
 import { answererFeature } from "./features/answerer.js";
+import { panelFeature } from "./features/panel.js";
 
 export const features = [
   telegramFeature,
   answererFeature,
+  panelFeature,
 ];

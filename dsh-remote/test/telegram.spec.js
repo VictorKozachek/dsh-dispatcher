@@ -597,8 +597,10 @@ test("плагин: async apply -> remoteTransport -> answerer подписан 
     telegram: { tokenRef: "tg", chatId: 42, allowedUserIds: [7], pollTimeoutSec: 25 },
   });
 
-  assert.equal(provided.length, 1, "транспорт зарегистрирован ровно один раз");
-  assert.equal(provided[0].name, "remoteTransport");
+  const transportEntries = provided.filter((entry) => entry.name === "remoteTransport");
+  assert.equal(transportEntries.length, 1, "транспорт зарегистрирован ровно один раз");
+  assert.ok(provided.some((entry) => entry.name === "remotePanel"), "панель зарегистрирована рядом");
+  assert.equal(transportEntries[0].name, "remoteTransport");
   const transport = provided[0].service;
   assert.equal(transport.polling, true, "поллинг запущен после async-привязки");
 
