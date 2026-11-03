@@ -35,6 +35,7 @@ import {
 } from "./doctor.js";
 import { RELAY_TOKEN_REF } from "./transport/relay.js";
 import { createAudit } from "./audit.js";
+import { DEFAULT_KEEP, vacuum } from "./rotate.js";
 import { formatStats } from "./metrics.js";
 import { randomUUID } from "node:crypto";
 
@@ -64,6 +65,7 @@ const HELP_TEXT = [
   "  /remote who        — сессия, воркспейс и эффективный режим",
   "  /remote doctor [--json] — проверка привязки, канала и состояния (ok/warn/fail; JSON для скриптов)",
   "  /remote stats [--json] — метрики: вопросы, подтверждения, доставки, латентность, очереди",
+  "  /remote vacuum [--dry-run] — очистить старые ротированные журналы (хранить 5)",
   "  /remote channel <проект> <chatId> [threadId] — канал проекта (топик форума)",
   "    --force          — если бот действительно в другом чате (чужой чат иначе отвергается)",
   "    --transport=<id> — канал для конкретного канала (telegram, max); по умолчанию — транспорт привязки",
@@ -1191,6 +1193,8 @@ export function createRemoteCommands({
           return await doctor(invocation, flags);
         case "stats":
           return await stats(invocation, flags);
+        case "vacuum":
+          return await vacuumCommand(invocation, flags);
         case "channel":
           return channelCommand(invocation, flags, rest, flagValues);
         case "disconnect":

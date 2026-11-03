@@ -29,6 +29,9 @@ export const STATE_VERSION = 1;
 /** Сколько последних вопросов держим в `recent`. */
 export const RECENT_LIMIT = 20;
 
+/** Сколько недоставленных вопросов держим в `pending` (033). */
+export const PENDING_LIMIT = 200;
+
 const DEFAULT_FILE_NAME = "state.json";
 const LOCK_FILE_NAME = "lock";
 
@@ -285,6 +288,7 @@ export function createStore({
   now = () => Date.now(),
   log = () => {},
   recentLimit = RECENT_LIMIT,
+  pendingLimit = PENDING_LIMIT,
 } = {}) {
   const paths = file === undefined ? statePaths({ env, home }) : statePaths({ env: { ...env, DSH_REMOTE_STATE: file }, home });
   let lockOwner = null;
@@ -561,6 +565,9 @@ export function createStore({
     get recentLimit() {
       return recentLimit;
     },
+    get pendingLimit() {
+      return pendingLimit;
+    },
     /** Что мы держим сами (для тестов и `status`). */
     get lockOwner() {
       return lockOwner;
@@ -572,7 +579,7 @@ export function createStore({
  * Привести состояние к известной форме: чужие/старые поля не теряем, но
  * обязательные — восстанавливаем. Версия пока одна, миграций нет.
  */
-function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
+function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT, pendingLimit = PENDING_LIMIT) {
   const base = defaultState();
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     log("состояние: ожидался объект — работаю с дефолтом");
@@ -600,7 +607,9 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
         : DEFAULT_HYBRID_WAIT_MS,
     },
     recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
-    pending: Array.isArray(value.pending) ? value.pending : [],
+    pending: Array.isArray(value.pending)
+      ? value.pending.slice(-Math.max(0, pendingLimit))
+      : [],
     notify: {
       seen: Array.isArray(value.notify?.seen) ? value.notify.seen.filter((key) => typeof key === "string").slice(-500) : [],
       lastTodo: value.notify?.lastTodo !== null && typeof value.notify?.lastTodo === "object"
