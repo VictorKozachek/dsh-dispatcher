@@ -164,3 +164,114 @@ test("--profile вне web|desktop отвергается с кодом 2", (t) 
   assert.equal(result.status, 2);
   assert.match(result.stderr, /неизвестный профиль/);
 });
+
+// --- 035: обновление, версии, откат -----------------------------------------
+
+const pluginVersion = JSON.parse(fs.readFileSync(path.join(pluginDir, "package.json"), "utf8")).version;
+
+/** Профиль с link-зависимостью на «старую» копию плагина. */
+function seedProfile(t, { installedVersion = null } = {}) {
+  const home = tempHome(t);
+  const profileDir = path.join(home, "profiles", "web");
+  fs.mkdirSync(profileDir, { recursive: true });
+  const manifest = path.join(profileDir, "package.json");
+  const dependencies = {};
+  let oldDir = null;
+  if (installedVersion !== null) {
+    oldDir = path.join(home, "old-plugin");
+    fs.mkdirSync(path.join(oldDir, "lib"), { recursive: true });
+    fs.writeFileSync(path.join(oldDir, "package.json"), JSON.stringify({ name: "dsh-remote", version: installedVersion, type: "module" }));
+    fs.writeFileSync(path.join(oldDir, "lib", "index.js"), "export const installed = true;\n");
+    fs.writeFileSync(path.join(oldDir, "lib", "store.js"), "export const STATE_VERSION = 2;\n");
+    dependencies["dsh-remote"] = `link:${oldDir}`;
+    fs.mkdirSync(path.join(profileDir, "node_modules"), { recursive: true });
+    fs.symlinkSync(oldDir, path.join(profileDir, "node_modules", "dsh-remote"));
+  }
+  fs.writeFileSync(manifest, JSON.stringify({
+    name: "web-profile",
+    dependencies,
+    dsh: { profile: { bundles: dependencies["dsh-remote"] === undefined ? [] : ["dsh-remote"] } },
+  }, null, 2));
+  return { home, profileDir, manifest, oldDir };
+}
+
+function runWithEnv(t, args, env) {
+  const result = spawnSync("bash", [script, ...args], {
+    encoding: "utf8",
+    env: { ...process.env, DSH_INSTALL_NO_DSH: "1", ...env },
+  });
+  return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+}
+
+test("035: --update --dry-run печатает версии и ничего не меняет", (t) => {
+  const { home, manifest } = seedProfile(t, { installedVersion: "0.1.0" });
+  const before = fs.readFileSync(manifest, "utf8");
+
+  const result = runWithEnv(t, ["--update", "--dry-run"], { DSH_HOME: home });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /обновление 0\.1\.0 →/);
+  assert.match(result.stdout, new RegExp(pluginVersion.replace(/\./g, "\\.")));
+  assert.match(result.stdout, /dry-run: ничего не изменено/);
+  assert.equal(fs.readFileSync(manifest, "utf8"), before, "манифест не изменён");
+  assert.equal(fs.existsSync(path.join(home, "plugin-cache")), false, "кэш не создан");
+});
+
+test("035: --update обновляет ссылку и кэширует старую версию; откат возвращает её", (t) => {
+  const { home, manifest } = seedProfile(t, { installedVersion: "0.1.0" });
+
+  const update = runWithEnv(t, ["--update"], { DSH_HOME: home });
+  assert.equal(update.status, 0, update.stderr);
+  assert.match(update.stdout, /старая версия 0\.1\.0 сохранена в кэш/);
+
+  const cache = path.join(home, "plugin-cache", "dsh-remote", "0.1.0");
+  assert.ok(fs.existsSync(path.join(cache, "package.json")), "кэш старой версии есть");
+  const updated = JSON.parse(fs.readFileSync(manifest, "utf8"));
+  assert.equal(updated.dependencies["dsh-remote"], `link:${path.join(pluginDir)}`, "ссылка на текущий пакет");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(pluginDir, "package.json"), "utf8")).version, pluginVersion);
+
+  const rollback = runWithEnv(t, ["--rollback", "0.1.0"], { DSH_HOME: home });
+  assert.equal(rollback.status, 0, rollback.stderr);
+  assert.match(rollback.stdout, /откат выполнен/);
+  const rolled = JSON.parse(fs.readFileSync(manifest, "utf8"));
+  assert.equal(rolled.dependencies["dsh-remote"], `link:${cache}`, "ссылка на кэш 0.1.0");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(cache, "package.json"), "utf8")).version, "0.1.0");
+});
+
+test("035: --update на той же версии идемпотентен, кэш не плодится", (t) => {
+  const { home, manifest } = seedProfile(t, { installedVersion: pluginVersion });
+  const before = fs.readFileSync(manifest, "utf8");
+
+  const result = runWithEnv(t, ["--update"], { DSH_HOME: home });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /обновление не требуется \(идемпотентно\)|обновление не требуется\./);
+  assert.equal(fs.readFileSync(manifest, "utf8"), before);
+  assert.equal(fs.existsSync(path.join(home, "plugin-cache")), false);
+});
+
+test("035: --rollback без кэша честно отказывает", (t) => {
+  const { home } = seedProfile(t, { installedVersion: "0.1.0" });
+
+  const result = runWithEnv(t, ["--rollback", "0.0.9"], { DSH_HOME: home });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /версия 0\.0\.9 не найдена в кэше/);
+  assert.match(result.stderr, /установка не выполнена/);
+  assert.match(result.stdout, /кэш пополняется при обновлении/);
+});
+
+test("035: несовместимый schemaVersion блокирует установку с инструкцией", (t) => {
+  const { home, manifest } = seedProfile(t, { installedVersion: "0.1.0" });
+  fs.mkdirSync(path.join(home, "remote-control"), { recursive: true });
+  fs.writeFileSync(path.join(home, "remote-control", "state.json"), JSON.stringify({ schemaVersion: 99 }));
+  const before = fs.readFileSync(manifest, "utf8");
+
+  const result = runWithEnv(t, ["--update"], { DSH_HOME: home });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /schemaVersion 99/);
+  assert.match(result.stdout, /состояние из будущего/);
+  assert.equal(fs.readFileSync(manifest, "utf8"), before, "установка не тронула профиль");
+  assert.equal(fs.existsSync(path.join(home, "plugin-cache")), false);
+});
