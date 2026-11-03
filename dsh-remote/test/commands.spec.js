@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { createStore } from "../lib/store.js";
+import { commandsFeature } from "../lib/features/commands.js";
 import {
   PAIRING_TTL_MS,
   TELEGRAM_TOKEN_REF,
@@ -494,4 +495,147 @@ test("ошибка хранилища превращается в текст, а
   assert.equal(status.kind, "error");
   assert.match(status.text, /диск кончился/);
   assert.equal(status.text.includes("    at "), false);
+});
+
+// --- фича commands: канал из сохранённой привязки ---------------------------
+
+/** `deps` каркаса (задача 001) в объёме, который нужен фиче. */
+function fakeDeps() {
+  const logs = [];
+  const disposers = [];
+  return {
+    logs,
+    disposers,
+    deps: {
+      logger: {
+        debug: (message) => logs.push(`debug: ${message}`),
+        info: (message) => logs.push(`info: ${message}`),
+        warn: (message) => logs.push(`warn: ${message}`),
+        error: (message) => logs.push(`error: ${message}`),
+      },
+      get: (name) => (name === "credentials" ? { resolve: async () => ({ value: TOKEN, source: "file" }) } : null),
+      onDispose: (disposer) => disposers.push(disposer),
+    },
+  };
+}
+
+/** Фейковый cordis-контекст: provide делает сервис видимым для get. */
+function pluginContext() {
+  const provided = [];
+  const services = new Map();
+  const effects = [];
+  const ctx = {
+    provide: (name, service) => {
+      services.set(name, service);
+      provided.push({ name, service });
+    },
+    get: (name) => {
+      if (name === "credentials") return { resolve: async () => ({ value: TOKEN, source: "file" }) };
+      return services.get(name) ?? null;
+    },
+    commands: { register: () => () => {} },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      effects.push(disposable);
+      return () => disposable?.();
+    },
+    logger: () => ({ debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }),
+  };
+  return { ctx, provided, effects };
+}
+
+/** Транспорт висит на getUpdates, пока не отменят: удобно для проверки start/stop. */
+async function hangingTelegramFetch(url, init = {}) {
+  if (url.endsWith("/getUpdates")) {
+    return new Promise((_, reject) => {
+      init.signal?.addEventListener?.("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    });
+  }
+  return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1, username: "test_bot" } }; } };
+}
+
+test("фича commands: сохранённая привязка поднимает транспорт и сервис remoteTransport", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-feature-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "state.json");
+  createStore({ file }).setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+
+  const previousState = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = file;
+  t.after(() => {
+    if (previousState === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previousState;
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = hangingTelegramFetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { ctx, provided } = pluginContext();
+  const { deps, logs } = fakeDeps();
+
+  await commandsFeature.apply(ctx, {}, deps);
+
+  assert.equal(provided.length, 1, "сервис зарегистрирован");
+  assert.equal(provided[0].name, "remoteTransport");
+  assert.equal(provided[0].service.polling, true, "поллинг запущен");
+  assert.match(logs.join("\n"), /канал поднят из сохранённой привязки/);
+
+  await provided[0].service.stop();
+});
+
+test("фича commands: без привязки транспорт не поднимается", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-feature-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "state.json");
+  createStore({ file }).write(createStore({ file }).read());
+
+  const previousState = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = file;
+  t.after(() => {
+    if (previousState === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previousState;
+  });
+
+  const { ctx, provided } = pluginContext();
+  const { deps } = fakeDeps();
+
+  await commandsFeature.apply(ctx, {}, deps);
+
+  assert.deepEqual(provided, [], "нечего поднимать — вопрос уходит в GUI");
+});
+
+test("connect: ensureTransport поднимает канал в той же сессии", async (t) => {
+  const telegram = telegramFetch();
+  const stand = harness(t, { answers: CONNECT_ANSWERS, fetchImpl: telegram.fetch });
+  let ensured = 0;
+  const started = [];
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    sleep: async () => {},
+    random: () => CODE_RANDOM,
+    fetch: telegram.fetch,
+    ensureTransport: async () => {
+      ensured += 1;
+      return { id: "telegram", start: async () => started.push("start"), stop: async () => {} };
+    },
+  });
+
+  const result = await remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "success", result.text);
+  assert.equal(ensured, 1, "фичу попросили поднять канал");
+  assert.deepEqual(started, ["start"], "транспорт запущен");
+  assert.match(result.text, /канал поднят/);
 });

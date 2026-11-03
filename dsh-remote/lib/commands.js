@@ -100,6 +100,9 @@ export function parseRemoteArgs(rawInput) {
  * @param {string} [options.baseUrl]
  * @param {(ms: number) => Promise<void>} [options.sleep]
  * @param {number} [options.pairingTtlMs]
+ * @param {() => Promise<object|null>} [options.ensureTransport] — поднять канал
+ *   после привязки (фича `commands` создаёт транспорт из состояния); без него
+ *   транспорт стартует только при следующей загрузке профиля.
  */
 export function createRemoteCommands({
   ctx,
@@ -111,6 +114,7 @@ export function createRemoteCommands({
   baseUrl = TELEGRAM_API_BASE,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   pairingTtlMs = PAIRING_TTL_MS,
+  ensureTransport = null,
 } = {}) {
   const registry = createRegistry({ readState: () => store.read().enabled, log });
   const credentials = createCredentialAccess(ctx, { log });
@@ -300,14 +304,26 @@ export function createRemoteCommands({
         : `токен не сохранён: источник ${TELEGRAM_TOKEN_REF} только для чтения (переменная окружения)`;
       const scopeNote = applyConnectScope(scopeAnswer, invocation);
 
-      // Транспорт мог подняться ещё до привязки (фича telegram спит без неё) —
-      // теперь у него есть куда доставлять, поэтому просим начать поллинг.
-      const transport = ctx?.get?.("remoteTransport") ?? null;
+      // Транспорт мог подняться ещё до привязки (фича telegram спит без неё), а
+      // мог и не подняться вовсе (привязки не было при старте профиля). Просим
+      // фичу поднять канал из состояния и, если сервис уже есть, — стартовать.
+      let channelNote = "канал поднимется при следующей загрузке профиля";
+      let transport = null;
+      if (typeof ensureTransport === "function") {
+        try {
+          transport = await ensureTransport();
+        } catch (error) {
+          log(`ensureTransport после привязки: ${humanError(error, token)}`);
+        }
+      }
+      if (transport === null) transport = ctx?.get?.("remoteTransport") ?? null;
       if (typeof transport?.start === "function") {
         try {
           await transport.start();
+          channelNote = "канал поднят: вопросы уходят в мессенджер";
         } catch (error) {
           log(`transport.start после привязки: ${humanError(error, token)}`);
+          channelNote = "канал не поднялся — проверьте /remote status";
         }
       }
 
@@ -315,6 +331,7 @@ export function createRemoteCommands({
         `бот @${botUsername} привязан (чат ${match.chatId}, человек ${match.userId})`,
         tokenNote,
         scopeNote,
+        channelNote,
       ].join("\n"));
     } catch (error) {
       return failure(`подключение не удалось: ${humanError(error, token)}`);
