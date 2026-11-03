@@ -41,10 +41,18 @@ export const reliabilityFeature = {
     try {
       ctx.provide?.(RELIABILITY_SERVICE, reliability);
       // 012: доставка в конкретный канал с повторами/таймаутом/сигналом 008.
-      ctx.provide?.("remoteReliabilityDeliver", (targetTransport) => (argument) => reliability.deliver({
-        ...argument,
-        transport: targetTransport,
-      }));
+      ctx.provide?.("remoteReliabilityDeliver", (targetTransport) => async (argument) => {
+        const outcome = await reliability.deliver({ ...argument, transport: targetTransport });
+        if (outcome !== "delivered") return outcome;
+        // Брокеру 012 нужен messageId, чтобы recover после рестарта мог править
+        // сообщения: `deliver` отдаёт строку, поэтому достаём id из состояния.
+        const info = reliability.deliveryInfo?.(argument?.question?.shortId, targetTransport?.id) ?? null;
+        return {
+          delivered: true,
+          messageId: info?.messageId ?? null,
+          chatId: info?.chatId ?? targetTransport?.chatId ?? null,
+        };
+      });
     } catch (error) {
       deps.logger.warn(`фича reliability: сервис ${RELIABILITY_SERVICE} не зарегистрирован (${error?.message ?? error})`);
     }

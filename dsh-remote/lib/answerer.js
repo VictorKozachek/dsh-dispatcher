@@ -219,7 +219,13 @@ export function createAnswerer({
       if (!question.cancel(reason, now())) continue;
       if (attempted !== null && !attempted.has(question)) continue;
       try {
-        await transport?.closeQuestion?.(question, reason);
+        if (useBroker && (question.deliveries?.length ?? 0) > 0) {
+          // 012: в мультиканале одиночный `transport` — пустой фасад, поэтому
+          // закрываем через брокер, иначе сообщения остаются с кнопками.
+          await broker.closeAll(question, { winner: null, summary: reason });
+        } else {
+          await primary?.closeQuestion?.(question, reason);
+        }
       } catch (error) {
         log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
       }

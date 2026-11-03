@@ -480,6 +480,11 @@ export function createReliability({
           signal,
           send: (outgoingQuestion, options) => active.sendQuestion(outgoingQuestion, options),
         });
+        // 012: доставка в конкретный канал — модель вопроса помнит messageId
+        // каждого канала (брокеру и recover нужен id, а не строка "delivered").
+        if (typeof active?.id === "string" && typeof question?.addDelivery === "function") {
+          question.addDelivery({ transport: active.id, messageId: sentValue?.messageId ?? null, chatId: resolvedChatId });
+        }
         rememberOpen(question, { messageId: sentValue?.messageId, chatId: resolvedChatId });
         journal.append({ event: "delivered", shortId: question.shortId, attempt });
         return "delivered";
@@ -542,6 +547,27 @@ export function createReliability({
       });
     } catch (error) {
       logger(`состояние: открытый вопрос ${question.shortId} не сохранён (${error?.message ?? error})`);
+    }
+  }
+
+  /**
+   * Где лежит сообщение вопроса (messageId/chatId) — для брокера 012:
+   * `deliver` по контракту возвращает строку, а брокеру нужен id сообщения.
+   */
+  function deliveryInfo(shortId, transportId = null) {
+    if (typeof shortId !== "string" || shortId === "") return null;
+    try {
+      const current = normalizeState(store.read());
+      const entry = current.questions.find((item) => item.shortId === shortId);
+      if (entry === undefined) return null;
+      if (typeof transportId === "string") {
+        const delivery = (entry.deliveries ?? []).find((item) => item.transport === transportId);
+        if (delivery !== undefined) return { messageId: delivery.messageId ?? null, chatId: delivery.chatId ?? null };
+      }
+      return { messageId: entry.messageId ?? null, chatId: entry.chatId ?? null };
+    } catch (error) {
+      logger(`состояние: доставка ${shortId} не прочитана (${error?.message ?? error})`);
+      return null;
     }
   }
 
@@ -946,6 +972,7 @@ export function createReliability({
     watch,
     unwatch,
     noteDeliveries,
+    deliveryInfo,
     tick,
     start,
     stop,

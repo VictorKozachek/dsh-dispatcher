@@ -87,7 +87,7 @@ export function createBroker({
         return { ok: false, reason: String(outcome) };
       }
       token = typeof outcome === "object" && outcome !== null ? outcome : {};
-      return { ok: true, messageId: token.messageId ?? null, chatId: transport.chatId ?? null };
+      return { ok: true, messageId: token.messageId ?? null, chatId: token.chatId ?? transport.chatId ?? null };
     } catch (error) {
       const timeout = controller.signal.aborted && error?.name === "AbortError";
       return { ok: false, error, reason: timeout ? "timeout" : "error" };
