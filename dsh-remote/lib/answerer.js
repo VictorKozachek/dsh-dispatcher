@@ -162,9 +162,20 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
    * закрывать нечего, им достаточно статуса (аборт во время отправки, ошибка
    * доставки). Начатая отправка могла дойти до сервера, поэтому её закрываем.
    */
+  /** Вопросы, снятые недавно: их поздние ответы уходят в сессию как `steer`. */
+  const recentlyClosed = new Map();
+  const rememberClosed = (question) => {
+    recentlyClosed.set(question.shortId, question);
+    if (recentlyClosed.size > 50) {
+      const oldest = recentlyClosed.keys().next().value;
+      recentlyClosed.delete(oldest);
+    }
+  };
+
   async function closeQuestions(questions, reason, attempted = null) {
     for (const question of questions) {
       pending.delete(question.shortId);
+      rememberClosed(question);
       reliability?.unwatch?.(question.shortId);
       // Уже отвеченный или закрытый вопрос второй раз не закрываем: сообщение в
       // мессенджере и так снято, а лишний closeQuestion — ложный сигнал транспорту.
@@ -202,7 +213,19 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
     const entry = pending.get(normalized.shortId);
     if (entry === undefined) {
-      log(`ответ на ${normalized.shortId}: вопроса нет (уже отвечен или закрыт) — игнор`);
+      // Поздний ответ: вопрос уже снят (TTL/аборт/перезапуск). Это не игнор —
+      // карточка требует, чтобы ответ дошёл до сессии через `steer`.
+      const closedQuestion = recentlyClosed.get(normalized.shortId);
+      if (closedQuestion === undefined || typeof reliability?.applyLateAnswer !== "function") {
+        log(`ответ на ${normalized.shortId}: вопроса нет (уже отвечен или закрыт) — игнор`);
+        return;
+      }
+      const labels = new Map((closedQuestion.options ?? []).map((option) => [option.id, option.label]));
+      const selected = normalized.optionIds.map((id) => labels.get(id)).filter((label) => label !== undefined);
+      const answer = { selected, ...(normalized.text === "" ? {} : { custom: normalized.text }) };
+      void Promise.resolve(reliability.applyLateAnswer({ question: closedQuestion, answer, text: normalized.text }))
+        .then((outcome) => log(`поздний ответ ${normalized.shortId}: ${outcome}`))
+        .catch((error) => log(`поздний ответ ${normalized.shortId}: не доставлен (${error?.message ?? error})`));
       return;
     }
     const parsed = choiceFor(entry.question, normalized);
@@ -281,6 +304,7 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
           const entry = pending.get(question.shortId);
           if (entry === undefined) return;
           pending.delete(question.shortId);
+          rememberClosed(question);
           if (info?.kind === "abort") {
             entry.reject(info.error ?? abortError("вопрос истёк по TTL"));
             return;

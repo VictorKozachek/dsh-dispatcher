@@ -26,6 +26,11 @@ import {
 
 const SESSION_ID = "session-s1";
 
+/** Дать отработать микрозадачам (без реальных задержек). */
+const tickMs = async (times = 2) => {
+  for (let index = 0; index < times; index += 1) await new Promise((resolve) => setImmediate(resolve));
+};
+
 function tempDir(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-rel-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -59,6 +64,7 @@ function fakeTransport({ failures = 0, retryAfterMs = 0, edit = true } = {}) {
   const closed = [];
   const edited = [];
   const calls = { send: 0, close: 0, edit: 0 };
+  const answerHandlers = [];
   const transport = {
     id: "fake",
     caps: { inlineButtons: true, editAfterAnswer: true, maxText: 4096, maxOptions: 8 },
@@ -81,6 +87,17 @@ function fakeTransport({ failures = 0, retryAfterMs = 0, edit = true } = {}) {
       calls.close += 1;
       if (question?.failClose === true) throw new Error("правка не удалась");
       closed.push({ question, summary });
+    },
+    /** Эмуляция ответа из мессенджера (то, что транспорт отдаёт в onAnswer). */
+    answer(event) {
+      for (const handler of answerHandlers) handler(event);
+    },
+    onAnswer(handler) {
+      answerHandlers.push(handler);
+      return () => {
+        const index = answerHandlers.indexOf(handler);
+        if (index >= 0) answerHandlers.splice(index, 1);
+      };
     },
     healthCheck() {
       return { ok: true, detail: "fake на связи" };
@@ -754,4 +771,190 @@ test("фича reliability подключена к плагину: сервис,
   for (const effect of effects) effect?.();
   reliability.stop();
   await provided.get("remoteTransport")?.stop?.();
+});
+
+// --- регрессии по второму ревью 008 ----------------------------------------
+
+test("TTL empty: вопрос снимается и из состояния (unwatch списком/tick)", async (t) => {
+  const clock = fakeClock();
+  const transport = fakeTransport();
+  const { reliability } = makeReliability(t, { transport, clock, onExpire: "empty", setTimeout: immediateTimer });
+  const question = openQuestion({ ttlMs: 1000, now: 0 });
+  reliability.watch(question, { onExpire: () => {} });
+  assert.equal(reliability.store.read().questions.length, 1, "вопрос сохранён как открытый");
+
+  clock.advance(1000);
+  await reliability.tick();
+
+  assert.equal(question.status, "expired");
+  assert.deepEqual(reliability.store.read().questions, [], "после истечения состояние очищено");
+});
+
+test("unwatch принимает и массив shortId", (t) => {
+  const clock = fakeClock();
+  const { reliability } = makeReliability(t, { clock });
+  const first = openQuestion({ id: "q1" });
+  const second = openQuestion({ id: "q2" });
+  reliability.watch(first);
+  reliability.watch(second);
+
+  assert.equal(reliability.unwatch([first.shortId, second.shortId]), true);
+  assert.deepEqual(reliability.store.read().questions, [], "оба вопроса сняты из состояния");
+  assert.deepEqual(reliability.pendingList(), []);
+});
+
+test("deliver сохраняет фактический chatId, recover правит по нему", async (t) => {
+  const clock = fakeClock();
+  const transport = fakeTransport();
+  const { reliability } = makeReliability(t, { transport, clock });
+  const question = openQuestion();
+
+  assert.equal(await reliability.deliver({ question, chatId: 42 }), "delivered");
+  const [saved] = reliability.store.read().questions;
+  assert.equal(saved.chatId, 42, "chatId взят из отправки, а не из вопроса (у 002 его нет)");
+  assert.equal(saved.messageId, 101);
+
+  const edited = [];
+  const restarted = {
+    id: "telegram",
+    caps: {},
+    async editMessage(target, text) { edited.push({ target, text }); },
+    async clearButtons() {},
+  };
+  const { reliability: afterRestart } = makeReliability(t, { transport: restarted, clock, state: reliability.store });
+  const result = await afterRestart.recoverOrphans();
+
+  assert.deepEqual(result, { cancelled: 1, failed: 0 });
+  assert.deepEqual(edited[0].target, { chatId: 42, messageId: 101 });
+});
+
+test("состояние 005 remoteStore без questions не ломает watch и recover", async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "state.json");
+  // Форма 005: pending/recent есть, questions нет.
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    enabled: { global: true, workspaces: {}, sessions: {} },
+    bindings: null,
+    pending: [],
+    recent: [],
+  }));
+  const store = createJsonState({ file });
+  const transport = fakeTransport();
+  const { reliability } = makeReliability(t, { transport, state: store });
+
+  const question = openQuestion();
+  reliability.watch(question);
+  assert.equal(reliability.store.read().questions.length, 1, "watch добавил questions в чужое состояние");
+  assert.equal(reliability.store.read().enabled.global, true, "чужие ключи сохранены");
+
+  const result = await reliability.recoverOrphans();
+  assert.equal(result.failed, 0);
+});
+
+test("in-flight аборт отменяет саму отправку, а не только гонку", async (t) => {
+  const controller = new AbortController();
+  const observed = [];
+  const transport = {
+    id: "fake",
+    caps: {},
+    sendQuestion: (question, options) => new Promise((resolve, reject) => {
+      observed.push(options?.signal);
+      options?.signal?.addEventListener?.("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    }),
+    closeQuestion: async () => {},
+  };
+  const { reliability } = makeReliability(t, { transport });
+
+  const pending = reliability.deliver({ question: openQuestion(), signal: controller.signal, chatId: 42 });
+  await tickMs(1);
+  controller.abort();
+  assert.equal(await pending, "aborted");
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0], controller.signal, "сигнал доехал до транспорта");
+});
+
+test("фасад без канала: deliver не врёт, recover не правит", async (t) => {
+  const facade = { __isTransportFacade: true, current: null };
+  const { reliability } = makeReliability(t, { transport: facade });
+
+  assert.equal(await reliability.deliver({ question: openQuestion() }), "give-up");
+  const result = await reliability.recoverOrphans();
+  assert.deepEqual(result, { cancelled: 0, failed: 0 });
+});
+
+test("фасад с каналом: recover правит сообщение через current", async (t) => {
+  const edited = [];
+  const live = {
+    id: "telegram",
+    caps: {},
+    async editMessage(target, text) { edited.push({ target, text }); },
+    async clearButtons() {},
+    async sendQuestion() { return { messageId: 1 }; },
+  };
+  const facade = { __isTransportFacade: true, current: live };
+  const clock = fakeClock();
+  const state = createJsonState({ file: path.join(tempDir(t), "state.json"), now: clock.now });
+  state.write({ version: 1, pending: [], questions: [{ shortId: "a1", chatId: 42, messageId: 7 }] });
+  const { reliability } = makeReliability(t, { transport: facade, clock, state });
+
+  assert.equal(await reliability.recoverOrphans().then((r) => r.cancelled), 1);
+  assert.equal(edited[0].target.messageId, 7, "правка ушла в живой транспорт фасада");
+});
+
+test("поздний ответ после закрытия уходит в applyLateAnswer (не игнор)", async () => {
+  const transport = fakeTransport();
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const calls = [];
+  const reliability = {
+    watch: () => {},
+    unwatch: () => {},
+    applyLateAnswer: async (argument) => {
+      calls.push(argument);
+      return "steered";
+    },
+  };
+  const answerer = createAnswerer({ transport, registry, reliability, log: () => {}, now: () => 0 });
+  const hooks = new Map();
+  answerer.attach({
+    on: (event, handler) => {
+      hooks.set(event, handler);
+      return () => hooks.delete(event);
+    },
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+    get: () => null,
+  });
+
+  const controller = new AbortController();
+  const pending = answerer.handler(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: SESSION_ID }, signal: controller.signal },
+    () => assert.fail("next() звать нельзя"),
+  );
+  await tickMs(2);
+  const shortId = transport.sent[0].question.shortId;
+
+  controller.abort();
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+
+  // Ответ на кнопку приходит уже после снятия вопроса.
+  transport.answer({ shortId, optionIds: [], text: "поздно" });
+  await tickMs(2);
+
+  assert.equal(calls.length, 1, "поздний ответ передан в applyLateAnswer");
+  assert.equal(calls[0].question.shortId, shortId);
+  assert.deepEqual(calls[0].answer, { selected: [], custom: "поздно" });
+});
+
+test("redact: base64 со слэшем маскируется целиком, путь — нет", () => {
+  const secret = "aB3+xY/9Pq7Zm2Kd4Ls6Nv8Rt0Uw1Ee3Ff5Gg7Hh9Ii2Jj4Kk6Ll8Mm0Nn2Oo4Pp6Qq8";
+  assert.match(redact(secret), /^<redacted-base64>$/);
+  assert.equal(redact("/Users/Victor/Projects/DSHDispatcher/Worktree008"), "/Users/Victor/Projects/DSHDispatcher/Worktree008");
+  assert.match(redact("base64: QWxhZGRpbjpvcGVuIHNlc2FtZQ1aGVsbG8gd29ybGQ"), /<redacted-base64>/);
 });

@@ -79,8 +79,9 @@ export function abortError(reason = "вопрос снят") {
 const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
 const BOT_TOKEN = /(?<![0-9])(\d{6,}):([A-Za-z0-9_-]{30,})\b/g;
 const API_KEY = /\bsk-[A-Za-z0-9_-]{16,}\b/g;
-// Без '/' и '\\': иначе «путь в CamelCase» выглядит как base64 и маскируется.
-const BASE64_RUN = /\b[A-Za-z0-9+]{40,}={0,2}/g;
+// Слэш разрешён (в base64 он значащий), но путь в CamelCase отличается: у него
+// нет '+', он не кончается на '=' и цифр в нём мало — replacer это проверяет.
+const BASE64_RUN = /\b[A-Za-z0-9+/]{40,}={0,2}/g;
 const HEX_RUN = /\b[0-9A-Fa-f]{32,}\b/g;
 
 /**
@@ -109,7 +110,14 @@ export function findSecrets(text) {
   value = value.replace(BOT_TOKEN, (_match, id) => mask(`${id}:<redacted>`));
   value = value.replace(API_KEY, () => mask("sk-<redacted>"));
   value = value.replace(BASE64_RUN, (candidate) => {
-    if (!(/[A-Z]/.test(candidate) && /[a-z]/.test(candidate) && /\d/.test(candidate))) return candidate;
+    const digits = (candidate.match(/\d/g) ?? []).length;
+    // Путь в CamelCase — тоже «венгерская» строка с '/' и цифрами, но у него нет
+    // '+' и '=' и очень мало цифр. Настоящий base64 '/' не исключает.
+    const looksLikePath = candidate.includes("/")
+      && !candidate.includes("+")
+      && !candidate.endsWith("=")
+      && digits / candidate.length < 0.15;
+    if (!(/[A-Z]/.test(candidate) && /[a-z]/.test(candidate) && digits > 0) || looksLikePath) return candidate;
     return mask("<redacted-base64>");
   });
   value = value.replace(HEX_RUN, (candidate) => (/\d/.test(candidate) && /^[0-9A-Fa-f]+$/.test(candidate)
@@ -291,11 +299,23 @@ export function createReliability({
   // --- доставка ------------------------------------------------------------
 
   /** Положить недоставленный вопрос в состояние (для повтора/отчёта). */
+  /** Состояние в нашей форме: у 005 remoteStore нет ключа `questions`. */
+  function normalizeState(current) {
+    const state = current !== null && typeof current === "object" ? current : {};
+    return {
+      ...state,
+      version: state.version ?? 1,
+      pending: Array.isArray(state.pending) ? state.pending : [],
+      questions: Array.isArray(state.questions) ? state.questions : [],
+    };
+  }
+
   function enqueuePending(question, chatId) {
     try {
       // В очередь — уже замаскированная копия: секрет не должен лежать на диске.
       const safe = prepareQuestion(question);
-      store.update((current) => {
+      store.update((raw) => {
+        const current = normalizeState(raw);
         const exists = current.pending.some((item) => item.shortId === question.shortId);
         if (!exists) {
           current.pending.push({
@@ -332,7 +352,8 @@ export function createReliability({
       const timer = setTimeoutImpl(() => finish(reject, Object.assign(new Error("доставка не уложилась в timeout"), { name: "DeliveryTimeout" })), remaining);
       const onAbort = () => finish(reject, abortError("доставка отменена"));
       signal?.addEventListener?.("abort", onAbort, { once: true });
-      Promise.resolve(transport.sendQuestion(question, target)).then(
+      const opts = target === undefined ? { signal } : { ...target, signal };
+      Promise.resolve(channel().sendQuestion(question, opts)).then(
         (value) => finish(resolve, value),
         (error) => finish(reject, error),
       );
@@ -385,9 +406,16 @@ export function createReliability({
    * Это та точка, где ответчик (002) решает отдать вопрос GUI: ему достаточно
    * на `'give-up'` вернуть `next()`.
    */
+  /** Живой транспорт: у фасада (005) внутри, у обычного сервиса — он сам. */
+  function channel() {
+    if (transport === null || transport === undefined) return null;
+    if (transport.__isTransportFacade === true) return transport.current ?? null;
+    return transport;
+  }
+
   async function deliver({ question, chatId, signal } = {}) {
     if (question === null || typeof question !== "object") return "give-up";
-    if (typeof transport?.sendQuestion !== "function") {
+    if (typeof channel()?.sendQuestion !== "function") {
       // Отправлять некуда: не врём «delivered», сразу отдаём вопрос GUI.
       journal.append({ event: "give-up", shortId: question.shortId, reason: "no-transport" });
       return "give-up";
@@ -403,7 +431,7 @@ export function createReliability({
         // Отправка может зависнуть: гоним её с дедлайном и сигналом, иначе
         // handler ждал бы вечно, а вопрос после аборта всё равно уехал бы.
         const sentValue = await raceSend(outgoing, target, { deadline, signal });
-        rememberOpen(question, { messageId: sentValue?.messageId });
+        rememberOpen(question, { messageId: sentValue?.messageId, chatId: target?.chatId });
         journal.append({ event: "delivered", shortId: question.shortId, attempt });
         return "delivered";
       } catch (error) {
@@ -435,16 +463,17 @@ export function createReliability({
   }
 
   /** Запомнить открытый вопрос в состоянии: после рестарта его надо снять. */
-  function rememberOpen(question, { sessionId = null, messageId } = {}) {
+  function rememberOpen(question, { sessionId = null, messageId, chatId } = {}) {
     try {
-      store.update((current) => {
+      store.update((raw) => {
+        const current = normalizeState(raw);
         const exists = current.questions.some((item) => item.shortId === question.shortId);
         if (!exists) {
           current.questions.push({
             shortId: question.shortId,
             questionId: question.questionId ?? null,
             sessionId: sessionId ?? question.sessionId ?? null,
-            chatId: question.chatId ?? null,
+            chatId: chatId ?? question.chatId ?? null,
             messageId: messageId ?? null,
             createdAt: now(),
           });
@@ -462,7 +491,8 @@ export function createReliability({
   /** Убрать вопрос из открытых (ответили/сняли). */
   function forgetOpen(shortId) {
     try {
-      store.update((current) => {
+      store.update((raw) => {
+        const current = normalizeState(raw);
         current.questions = current.questions.filter((item) => item.shortId !== shortId);
         return current;
       });
@@ -503,22 +533,23 @@ export function createReliability({
    * «сессия перезапущена, вопрос снят» (если правка не удалась — просто лог).
    */
   async function recoverOrphans({ reason = "сессия перезапущена, вопрос снят" } = {}) {
-    const current = store.read();
+    const current = normalizeState(store.read());
     const orphans = [...current.pending, ...current.questions];
     let cancelled = 0;
     let failed = 0;
 
     for (const orphan of orphans) {
       try {
+        const live = channel();
         const question = { shortId: orphan.shortId, questionId: orphan.questionId ?? orphan.shortId };
-        if (orphan.messageId !== null && orphan.messageId !== undefined && typeof transport?.editMessage === "function") {
+        if (orphan.messageId !== null && orphan.messageId !== undefined && typeof live?.editMessage === "function") {
           // Реальное сообщение прошлого процесса: правим текст по chatId/messageId.
-          await transport.editMessage({ chatId: orphan.chatId, messageId: orphan.messageId }, reason);
-          if (typeof transport.clearButtons === "function") {
-            await transport.clearButtons({ chatId: orphan.chatId, messageId: orphan.messageId });
+          await live.editMessage({ chatId: orphan.chatId, messageId: orphan.messageId }, reason);
+          if (typeof live.clearButtons === "function") {
+            await live.clearButtons({ chatId: orphan.chatId, messageId: orphan.messageId });
           }
-        } else if (typeof transport?.closeQuestion === "function") {
-          await transport.closeQuestion(question, "restarted");
+        } else if (typeof live?.closeQuestion === "function") {
+          await live.closeQuestion(question, "restarted");
         }
         cancelled += 1;
         journal.append({ event: "orphan-cancelled", shortId: orphan.shortId });
@@ -530,7 +561,8 @@ export function createReliability({
     }
 
     try {
-      store.update((next) => {
+      store.update((raw) => {
+        const next = normalizeState(raw);
         next.pending = [];
         next.questions = [];
         return next;
@@ -593,9 +625,16 @@ export function createReliability({
   }
 
   /** Убрать вопрос из-под сторожа (ответили, сняли вручную). */
-  function unwatch(shortId) {
-    forgetOpen(shortId);
-    return watched.delete(shortId);
+  function unwatch(shortIdOrList) {
+    const ids = Array.isArray(shortIdOrList)
+      ? shortIdOrList.map((item) => (typeof item === "string" ? item : item?.shortId)).filter((id) => typeof id === "string")
+      : [shortIdOrList];
+    let removed = false;
+    for (const id of ids) {
+      forgetOpen(id);
+      removed = watched.delete(id) || removed;
+    }
+    return removed;
   }
 
   /** Один проход сторожа: напоминания и истечения. Возвращает счётчики. */
@@ -610,6 +649,7 @@ export function createReliability({
 
       if (now() >= item.expiresAt) {
         watched.delete(shortId);
+        forgetOpen(shortId);
         question.expire?.(now());
         try {
           // Зависшая правка не должна блокировать сторож: ограничиваем время.

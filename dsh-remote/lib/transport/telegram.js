@@ -566,6 +566,8 @@ export function createTelegramTransport(options = {}) {
         throw new TypeError("telegram: у вопроса нет shortId — кнопки не соберутся");
       }
       const target = sendOptions?.chatId ?? chatId;
+      // Сигнал запроса: отменённая отправка не должна доехать после give-up.
+      const signal = sendOptions?.signal;
       const chunks = renderMessages(question, caps.maxText);
       const options = Array.isArray(question.options) ? question.options : [];
       const keyboard = caps.inlineButtons && options.length > 0
@@ -589,7 +591,7 @@ export function createTelegramTransport(options = {}) {
             parse_mode: "HTML",
             text: chunk,
             ...(last && keyboard !== undefined ? { reply_markup: keyboard } : {}),
-          });
+          }, { signal });
           if (result?.message_id !== undefined) record.messageIds.push(result.message_id);
         }
       } catch (error) {
