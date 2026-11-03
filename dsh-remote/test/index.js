@@ -9,3 +9,4 @@
  */
 
 import "./plugin.spec.js";
+import "./transport.spec.js";
