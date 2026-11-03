@@ -38,7 +38,21 @@ struct Server {
 }
 
 async fn spawn() -> Server {
-    let state = AppState::for_test(AGENT_TOKEN).await.expect("состояние");
+    spawn_with(|_| {}).await
+}
+
+async fn spawn_with(tune: impl FnOnce(&mut Config)) -> Server {
+    let mut config = Config {
+        bind: "127.0.0.1:0".into(),
+        database_url: "sqlite::memory:".into(),
+        agent_token: AGENT_TOKEN.into(),
+        allowed_devices: None,
+        question_ttl: std::time::Duration::from_secs(1800),
+        pairing_ttl: std::time::Duration::from_secs(600),
+        long_poll_max: std::time::Duration::from_secs(5),
+    };
+    tune(&mut config);
+    let state = AppState::new(config).await.expect("состояние");
     let ttl_state = state.clone();
     tokio::spawn(ttl::run(ttl_state));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -571,6 +585,7 @@ async fn pagination_uses_real_cursor_and_does_not_lose_rest() {
         .iter()
         .map(|item| item["id"].as_str().unwrap_or("").to_string())
         .collect();
+
     assert_eq!(second_ids.len(), 10, "остаток не потерян");
     for id in &second_ids {
         assert!(!first_ids.contains(id), "страницы не пересекаются: {id}");
@@ -767,4 +782,244 @@ async fn healthz_alias_and_metrics_are_available() {
         healthz.get("questions").is_some(),
         "счётчик открытых вопросов"
     );
+}
+
+// --- регрессии по второму ревью 017 ----------------------------------------
+
+#[tokio::test]
+async fn ws_respects_device_allowlist() {
+    let stack = spawn_with(|config| {
+        config.allowed_devices = Some(std::collections::HashSet::new());
+    })
+    .await;
+    // Устройство и токен создаём в обход HTTP (pair сам проверяет allowlist),
+    // чтобы проверить именно WS-авторизацию.
+    let (device, _) = dsh_relay::db::create_device(&stack.state.db, "ios", "pub-ws-allow", None, None)
+        .await
+        .expect("устройство");
+    let (code, _) = dsh_relay::db::create_pairing_code(&stack.state.db, 600)
+        .await
+        .expect("код");
+    let (token, _) = dsh_relay::db::confirm_pairing(&stack.state.db, &code, &device.id)
+        .await
+        .expect("привязка")
+        .expect("токен");
+
+    let result = tokio_tungstenite::connect_async(ws_request(&stack, &token)).await;
+    match result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 403, "устройство вне allowlist не пускается в WS");
+        }
+        other => panic!("ожидался 403, получено {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn concurrent_device_registration_and_answers_do_not_500() {
+    let stack = spawn().await;
+    let client = client();
+    let public_key = format!("pub-race-{}", dsh_relay::db::random_token());
+
+    let register = |client: reqwest::Client| {
+        let url = format!("{}/v1/devices", stack.base);
+        let body = json!({ "platform": "ios", "publicKey": public_key.clone() });
+        async move { client.post(url).json(&body).send().await.expect("регистрация").status() }
+    };
+    let (first, second) = tokio::join!(register(client.clone()), register(client.clone()));
+    assert!(first.is_success() && second.is_success(), "гонка регистрации: {first:?} {second:?}");
+    assert!(
+        first == StatusCode::CREATED || second == StatusCode::CREATED,
+        "одна регистрация создаёт устройство"
+    );
+
+    let (_device_id, token) = device(&stack).await;
+    assert_eq!(publish(&stack, &client, question("q-race0001", "aabbccdd")).await.status(), StatusCode::CREATED);
+
+    let answer = json!({
+        "questionId": "q-race0001",
+        "selected": ["o1"],
+        "answeredAt": now(),
+        "idempotencyKey": "55555555-5555-4555-8555-555555555555",
+    });
+    let send = |client: reqwest::Client| {
+        let url = format!("{}/v1/answers", stack.base);
+        let token = token.clone();
+        let body = answer.clone();
+        async move {
+            client
+                .post(url)
+                .header("authorization", format!("Bearer {token}"))
+                .json(&body)
+                .send()
+                .await
+                .expect("ответ")
+                .status()
+        }
+    };
+    let (first, second) = tokio::join!(send(client.clone()), send(client.clone()));
+    assert!(
+        [StatusCode::CREATED, StatusCode::OK].contains(&first),
+        "конкурентный повтор: {first:?}"
+    );
+    assert!(
+        [StatusCode::CREATED, StatusCode::OK].contains(&second),
+        "конкурентный повтор: {second:?}"
+    );
+
+    // Разные ключи на один вопрос: второй — 409, не 500.
+    let other = json!({
+        "questionId": "q-race0001",
+        "selected": ["o2"],
+        "answeredAt": now(),
+        "idempotencyKey": "66666666-6666-4666-8666-666666666666",
+    });
+    let status = client
+        .post(format!("{}/v1/answers", stack.base))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&other)
+        .send()
+        .await
+        .expect("второй ответ")
+        .status();
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn body_version_must_be_one() {
+    let stack = spawn().await;
+    let client = client();
+
+    let device_bad = client
+        .post(format!("{}/v1/devices", stack.base))
+        .json(&json!({ "platform": "ios", "publicKey": "pub-key-with-enough-length-123456", "version": 2 }))
+        .send()
+        .await
+        .expect("версия в теле");
+    assert_eq!(device_bad.status(), StatusCode::BAD_REQUEST);
+
+    let mut with_version = question("q-ver00001", "a1b2c3d4");
+    with_version["version"] = json!(2);
+    let nested_bad = publish(&stack, &client, with_version).await;
+    assert_eq!(nested_bad.status(), StatusCode::BAD_REQUEST, "version:2 в вопросе отвергается");
+}
+
+#[tokio::test]
+async fn nested_option_and_enc_fields_are_strict() {
+    let stack = spawn().await;
+    let client = client();
+
+    let mut bad_option = question("q-opt00001", "a1b2c3d4");
+    bad_option["options"][0]["extra"] = json!(true);
+    assert_eq!(publish(&stack, &client, bad_option).await.status(), StatusCode::BAD_REQUEST, "лишнее поле в options[]");
+
+    let bad_enc = json!({
+        "id": "q-enc00001",
+        "shortId": "cafebabe",
+        "enc": { "enc": "0123456789abcdef", "nonce": "MDEyMzQ1Njc4OWFi", "keyId": "key-1", "alg": "aes256gcm", "plainSize": 10, "extra": 1 },
+        "createdAt": now(),
+        "expiresAt": after(60),
+    });
+    assert_eq!(publish(&stack, &client, bad_enc).await.status(), StatusCode::BAD_REQUEST, "лишнее поле в enc");
+}
+
+#[tokio::test]
+async fn pagination_handles_equal_timestamps_without_duplicates() {
+    let stack = spawn().await;
+    let client = client();
+    let (_device_id, token) = device(&stack).await;
+    let same_time = after(600);
+
+    for index in 0..60 {
+        let mut item = question(&format!("q-same{index:04}"), &format!("{index:08x}"));
+        item["createdAt"] = json!(same_time);
+        item["expiresAt"] = json!(same_time);
+        assert_eq!(publish(&stack, &client, item).await.status(), StatusCode::CREATED);
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut since = String::new();
+    let mut since_id = String::new();
+    for page in 0..2 {
+        let url = if page == 0 {
+            format!("{}/v1/questions?limit=50", stack.base)
+        } else {
+            format!("{}/v1/questions?limit=50&since={since}&sinceId={since_id}", stack.base)
+        };
+        let response: Value = client
+            .get(url)
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .expect("страница")
+            .json()
+            .await
+            .expect("json");
+        let ids: Vec<String> = response["questions"]
+            .as_array()
+            .expect("массив")
+            .iter()
+            .map(|item| item["id"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(ids.len(), 50 - page * 40, "страница {}", page + 1);
+        for id in ids {
+            assert!(!seen.contains(&id), "дубликат {id}");
+            seen.push(id);
+        }
+        since = response["nextSince"].as_str().expect("nextSince").to_string();
+        since_id = response["nextId"].as_str().unwrap_or("").to_string();
+    }
+    assert_eq!(seen.len(), 60, "все вопросы отданы ровно один раз");
+}
+
+#[tokio::test]
+async fn pair_code_is_not_burned_by_invalid_device() {
+    let stack = spawn().await;
+    let client = client();
+    let code: Value = client
+        .post(format!("{}/v1/pairing-codes", stack.base))
+        .header("authorization", format!("Bearer {AGENT_TOKEN}"))
+        .send()
+        .await
+        .expect("код")
+        .json()
+        .await
+        .expect("json");
+    let pair_code = code["pairCode"].as_str().expect("pairCode").to_string();
+
+    let missing = client
+        .post(format!("{}/v1/pair", stack.base))
+        .json(&json!({ "pairCode": pair_code, "deviceId": "no-such-device" }))
+        .send()
+        .await
+        .expect("pair с неизвестным устройством");
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    // Код должен остаться живым для настоящего устройства.
+    let (_device_id, token) = device_with_code(&stack, &pair_code).await;
+    assert!(!token.is_empty(), "код не сожжён неудачной попыткой");
+}
+
+async fn device_with_code(stack: &Server, pair_code: &str) -> (String, String) {
+    let client = client();
+    let register: Value = client
+        .post(format!("{}/v1/devices", stack.base))
+        .json(&json!({ "platform": "ios", "publicKey": format!("pub-{}", dsh_relay::db::random_token()) }))
+        .send()
+        .await
+        .expect("регистрация")
+        .json()
+        .await
+        .expect("json");
+    let device_id = register["deviceId"].as_str().expect("deviceId").to_string();
+    let paired: Value = client
+        .post(format!("{}/v1/pair", stack.base))
+        .json(&json!({ "pairCode": pair_code, "deviceId": device_id }))
+        .send()
+        .await
+        .expect("pair")
+        .json()
+        .await
+        .expect("json");
+    let token = paired["deviceToken"].as_str().expect("deviceToken").to_string();
+    (device_id, token)
 }

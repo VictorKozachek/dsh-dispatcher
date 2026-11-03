@@ -85,6 +85,16 @@ fn reject_unknown(body: &Value, allowed: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// `version` в теле (если есть) обязан быть 1: иначе клиент и сервер
+/// разойдутся молча.
+fn validate_body_version(body: &Value) -> Result<(), String> {
+    match body.get("version") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Number(value)) if value.as_u64() == Some(1) => Ok(()),
+        Some(_) => Err("version: поддерживается только 1".into()),
+    }
+}
+
 /// Кто вызывает: агент (плагин) или устройство.
 enum Auth {
     Agent,
@@ -146,6 +156,9 @@ pub async fn create_device(State(state): State<AppState>, body: Option<Json<Valu
         &body,
         &["platform", "publicKey", "pushToken", "label", "version"],
     ) {
+        return bad_request(&reason);
+    }
+    if let Err(reason) = validate_body_version(&body) {
         return bad_request(&reason);
     }
     let platform = body.get("platform").and_then(Value::as_str).unwrap_or("");
@@ -253,6 +266,12 @@ pub async fn pair(State(state): State<AppState>, Json(body): Json<Value>) -> Res
     if let Err(reason) = reject_unknown(&body, &["pairCode", "deviceId", "version"]) {
         return bad_request(&reason);
     }
+    if let Err(reason) = validate_body_version(&body) {
+        return bad_request(&reason);
+    }
+    if let Err(reason) = validate_body_version(&body) {
+        return bad_request(&reason);
+    }
     let code = body.get("pairCode").and_then(Value::as_str).unwrap_or("");
     let device_id = body.get("deviceId").and_then(Value::as_str).unwrap_or("");
     if code.len() != 6 || !code.chars().all(|ch| ch.is_ascii_digit()) {
@@ -313,6 +332,9 @@ fn validate_enc(enc: &Value) -> Result<(), String> {
     if !matches!(alg, "xchacha20poly1305" | "aes256gcm") {
         return Err("alg: поддерживаются xchacha20poly1305 и aes256gcm".into());
     }
+    if let Err(reason) = reject_unknown(enc, &["enc", "nonce", "keyId", "alg", "plainSize"]) {
+        return Err(reason);
+    }
     let size = enc.get("plainSize").and_then(Value::as_i64).unwrap_or(-1);
     if !(0..=49152).contains(&size) {
         return Err("plainSize: ожидалось 0..49152".into());
@@ -372,6 +394,9 @@ fn validate_question(question: &Value) -> Result<(), String> {
         return Err("options: максимум 10 вариантов".into());
     }
     for option in options {
+        if let Err(reason) = reject_unknown(option, &["id", "label"]) {
+            return Err(format!("options[]: {reason}"));
+        }
         let id = option.get("id").and_then(Value::as_str).unwrap_or("");
         let label = option.get("label").and_then(Value::as_str).unwrap_or("");
         if id.is_empty() || id.len() > 8 {
@@ -413,6 +438,9 @@ pub async fn publish_question(
     else {
         return bad_request("нужен wrapper {\"question\": {...}} (QuestionPublishRequest)");
     };
+    if let Err(reason) = validate_body_version(&body) {
+        return bad_request(&reason);
+    }
     if let Err(reason) = reject_unknown(
         &question,
         &[
@@ -434,6 +462,9 @@ pub async fn publish_question(
             "version",
         ],
     ) {
+        return bad_request(&reason);
+    }
+    if let Err(reason) = validate_body_version(&question) {
         return bad_request(&reason);
     }
     if let Err(reason) = validate_question(&question) {
@@ -506,6 +537,7 @@ pub async fn list_questions(
         Err(response) => return response,
     }
     let since = query.get("since").cloned();
+    let since_id = query.get("sinceId").cloned();
     let limit = query
         .get("limit")
         .and_then(|value| value.parse::<i64>().ok())
@@ -519,18 +551,27 @@ pub async fn list_questions(
     let mut events = state.events.subscribe();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait);
     loop {
-        match db::list_questions(&state.db, since.as_deref(), limit).await {
+        let cursor = since.as_deref().map(|value| (value, since_id.as_deref()));
+        match db::list_questions(&state.db, cursor, limit).await {
             Ok(rows) if !rows.is_empty() || wait == 0 => {
                 // Курсор — created_at последнего элемента: страница не теряет
                 // остаток и не повторяет уже отданное.
-                let next_since = rows
-                    .last()
+                let last = rows.last().map(|(created_at, value)| {
+                    (created_at.clone(), value.get("id").and_then(Value::as_str).unwrap_or("").to_string())
+                });
+                let next_since = last
+                    .as_ref()
                     .map(|(created_at, _)| created_at.clone())
                     .or_else(|| since.clone())
                     .unwrap_or_else(db::now_iso);
+                let next_id = last.map(|(_, id)| id).unwrap_or_default();
                 let questions: Vec<Value> = rows.into_iter().map(|(_, value)| value).collect();
-                return Json(json!({ "questions": questions, "nextSince": next_since }))
-                    .into_response();
+                return Json(json!({
+                    "questions": questions,
+                    "nextSince": next_since,
+                    "nextId": next_id,
+                }))
+                .into_response();
             }
             Ok(_) => {}
             Err(error) => {

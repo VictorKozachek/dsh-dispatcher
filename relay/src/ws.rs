@@ -52,7 +52,24 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Option<St
         return Ok(None);
     }
     match db::device_by_token(&state.db, &token).await {
-        Ok(Some(device)) => Ok(Some(device.id)),
+        Ok(Some(device)) => {
+            // Same allowlist as HTTP-эндпоинты: устройство вне списка не должно
+            // получать поток событий.
+            let allowed = match &state.config.allowed_devices {
+                Some(list) => list.contains(&device.id),
+                None => true,
+            };
+            if !allowed {
+                return Err(routes::error_response(
+                    axum::http::StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "устройство не в allowlist",
+                    false,
+                    None,
+                ));
+            }
+            Ok(Some(device.id))
+        }
         Ok(None) => Err(routes::error_response(
             axum::http::StatusCode::UNAUTHORIZED,
             "unauthorized",

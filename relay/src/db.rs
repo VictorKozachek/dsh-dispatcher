@@ -113,20 +113,15 @@ pub async fn create_device(
     push_token: Option<&str>,
     label: Option<&str>,
 ) -> anyhow::Result<(DeviceRow, bool)> {
-    if let Some(row) = sqlx::query("SELECT * FROM devices WHERE platform = ?1 AND public_key = ?2")
-        .bind(platform)
-        .bind(public_key)
-        .fetch_optional(pool)
-        .await?
-    {
-        return Ok((device_from_row(&row), false));
-    }
+    // Гонка двух регистраций: конкурентный INSERT не должен ронять запрос —
+    // конфликт по (platform, public_key) отдаёт существующую запись.
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
     let created_at = now_iso();
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO devices (id, platform, public_key, push_token, label, token_hash, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(platform, public_key) DO NOTHING",
     )
     .bind(&id)
     .bind(platform)
@@ -137,19 +132,22 @@ pub async fn create_device(
     .bind(&created_at)
     .execute(pool)
     .await?;
-    let token_row = sqlx::query("SELECT * FROM devices WHERE id = ?1")
-        .bind(&id)
+    let created = inserted.rows_affected() == 1;
+    let row = sqlx::query("SELECT * FROM devices WHERE platform = ?1 AND public_key = ?2")
+        .bind(platform)
+        .bind(public_key)
         .fetch_one(pool)
         .await?;
-    let mut device = device_from_row(&token_row);
-    device.push_token = push_token.map(|value| value.to_string());
-    // Токен нужен только при подтверждении привязки; в `Device` его нет.
-    sqlx::query("UPDATE devices SET push_token = ?1 WHERE id = ?2")
-        .bind(push_token)
-        .bind(&id)
-        .execute(pool)
-        .await?;
-    Ok((device, true))
+    let device = device_from_row(&row);
+    if created {
+        sqlx::query("UPDATE devices SET push_token = ?1, label = ?2 WHERE id = ?3")
+            .bind(push_token)
+            .bind(label)
+            .bind(&device.id)
+            .execute(pool)
+            .await?;
+    }
+    Ok((device, created))
 }
 
 /// Найти устройство по токену (Bearer).
@@ -207,6 +205,13 @@ pub async fn confirm_pairing(
     code: &str,
     device_id: &str,
 ) -> anyhow::Result<Option<(String, DeviceRow)>> {
+    // Сначала устройство: неизвестный/отозванный device не должен сжигать код.
+    let Some(device) = device_by_id(pool, device_id).await? else {
+        return Ok(None);
+    };
+    if device.revoked {
+        return Ok(None);
+    }
     // Гонка двух /pair: код подтверждается атомарно (confirmed = 0 и TTL — в
     // том же UPDATE), поэтому ровно один запрос получит строку.
     let claimed = sqlx::query(
@@ -218,12 +223,6 @@ pub async fn confirm_pairing(
     .execute(pool)
     .await?;
     if claimed.rows_affected() != 1 {
-        return Ok(None);
-    }
-    let Some(device) = device_by_id(pool, device_id).await? else {
-        return Ok(None);
-    };
-    if device.revoked {
         return Ok(None);
     }
     let token = random_token();
@@ -249,51 +248,62 @@ pub async fn insert_answer(
     idempotency_key: &str,
     payload: &Value,
 ) -> anyhow::Result<AnswerOutcome> {
-    if let Some(row) = sqlx::query("SELECT payload FROM answers WHERE idempotency_key = ?1")
-        .bind(idempotency_key)
-        .fetch_optional(pool)
-        .await?
-    {
-        let existing: String = row.get("payload");
-        let value: Value = serde_json::from_str(&existing).unwrap_or(Value::Null);
-        let same_question = value.get("questionId").and_then(Value::as_str) == Some(question_id);
-        // 016: тот же ключ и то же тело — 200; тот же ключ, другое тело — 409.
-        let same_body = same_question && value == *payload;
-        return Ok(if same_body {
-            AnswerOutcome::Duplicate(value)
-        } else {
-            AnswerOutcome::Conflict
-        });
-    }
-    if let Some(row) = sqlx::query("SELECT idempotency_key FROM answers WHERE question_id = ?1")
-        .bind(question_id)
-        .fetch_optional(pool)
-        .await?
-    {
-        let existing: String = row.get("idempotency_key");
-        return Ok(if existing == idempotency_key {
-            AnswerOutcome::Duplicate(payload.clone())
-        } else {
-            AnswerOutcome::Conflict
-        });
-    }
     let answered_at = payload
         .get("answeredAt")
         .and_then(Value::as_str)
         .map(|value| value.to_string())
         .unwrap_or_else(now_iso);
-    sqlx::query("INSERT INTO answers (question_id, idempotency_key, payload, answered_at) VALUES (?1, ?2, ?3, ?4)")
-        .bind(question_id)
+    // Конкурентные вставки: конфликт по любому уникальному ключу не роняет
+    // запрос — дальше решаем по уже сохранённому ответу.
+    let inserted = sqlx::query(
+        "INSERT INTO answers (question_id, idempotency_key, payload, answered_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(question_id)
+    .bind(idempotency_key)
+    .bind(payload.to_string())
+    .bind(&answered_at)
+    .execute(pool)
+    .await?;
+    if inserted.rows_affected() == 1 {
+        sqlx::query("UPDATE questions SET answered = 1 WHERE id = ?1")
+            .bind(question_id)
+            .execute(pool)
+            .await?;
+        return Ok(AnswerOutcome::Created(payload.clone()));
+    }
+
+    // Кто-то уже ответил: повтор того же тела — 200, другое тело — 409.
+    let row = sqlx::query("SELECT question_id, idempotency_key, payload FROM answers WHERE idempotency_key = ?1")
         .bind(idempotency_key)
-        .bind(payload.to_string())
-        .bind(&answered_at)
-        .execute(pool)
+        .fetch_optional(pool)
         .await?;
-    sqlx::query("UPDATE questions SET answered = 1 WHERE id = ?1")
-        .bind(question_id)
-        .execute(pool)
-        .await?;
-    Ok(AnswerOutcome::Created(payload.clone()))
+    let Some(row) = row else {
+        // Конфликт по question_id (ответ уже есть под другим ключом).
+        let existing = sqlx::query("SELECT idempotency_key, payload FROM answers WHERE question_id = ?1")
+            .bind(question_id)
+            .fetch_optional(pool)
+            .await?;
+        let Some(existing) = existing else { return Ok(AnswerOutcome::Conflict) };
+        let existing_key: String = existing.get("idempotency_key");
+        let existing_payload: String = existing.get("payload");
+        let value: Value = serde_json::from_str(&existing_payload).unwrap_or(Value::Null);
+        return Ok(if existing_key == idempotency_key && value == *payload {
+            AnswerOutcome::Duplicate(value)
+        } else {
+            AnswerOutcome::Conflict
+        });
+    };
+    let same_question: String = row.get("question_id");
+    let existing_payload: String = row.get("payload");
+    let value: Value = serde_json::from_str(&existing_payload).unwrap_or(Value::Null);
+    let same_body = same_question == question_id && value == *payload;
+    Ok(if same_body {
+        AnswerOutcome::Duplicate(value)
+    } else {
+        AnswerOutcome::Conflict
+    })
 }
 
 pub async fn answer_for(pool: &SqlitePool, question_id: &str) -> anyhow::Result<Option<Value>> {
@@ -361,16 +371,18 @@ pub async fn question_expired(pool: &SqlitePool, id: &str) -> anyhow::Result<boo
 /// Вопросы после `since` (только живые, не отвеченные и не истёкшие).
 pub async fn list_questions(
     pool: &SqlitePool,
-    since: Option<&str>,
+    since: Option<(&str, Option<&str>)>,
     limit: i64,
 ) -> anyhow::Result<Vec<(String, Value)>> {
-    let rows = if let Some(since) = since {
+    let rows = if let Some((created_at, since_id)) = since {
         sqlx::query(
             "SELECT created_at, payload FROM questions
-             WHERE created_at > ?1 AND answered = 0 AND expired = 0 AND expires_at > ?2
-             ORDER BY created_at ASC LIMIT ?3",
+             WHERE (created_at > ?1 OR (created_at = ?1 AND ?2 <> '' AND id > ?2))
+               AND answered = 0 AND expired = 0 AND expires_at > ?3
+             ORDER BY created_at ASC, id ASC LIMIT ?4",
         )
-        .bind(since)
+        .bind(created_at)
+        .bind(since_id.unwrap_or(""))
         .bind(now_iso())
         .bind(limit)
         .fetch_all(pool)
@@ -379,7 +391,7 @@ pub async fn list_questions(
         sqlx::query(
             "SELECT created_at, payload FROM questions
              WHERE answered = 0 AND expired = 0 AND expires_at > ?1
-             ORDER BY created_at ASC LIMIT ?2",
+             ORDER BY created_at ASC, id ASC LIMIT ?2",
         )
         .bind(now_iso())
         .bind(limit)
