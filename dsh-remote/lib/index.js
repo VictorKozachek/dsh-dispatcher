@@ -102,10 +102,22 @@ export function apply(ctx, config = {}) {
     }
   };
 
+  // Снятие ресурсов — через `ctx.effect`: cordis вызывает возвращённый disposer
+  // при выгрузке файбера плагина, и это единственный настоящий путь shutdown.
+  // Событие `dispose` cordis НЕ эмитит (тот же вывод в образце
+  // ~/projects/dsh-kanban/dsh-kanban/lib/index.js:541-549), поэтому `ctx.on` ниже
+  // — лишь хук для хостов и тестов, которые эмитят событие сами; `dispose`
+  // идемпотентен, двойной вызов безопасен.
+  try {
+    ctx?.effect?.(() => dispose, "dsh-remote: dispose");
+  } catch (error) {
+    logger.warn(`не зарегистрировал снятие ресурсов через ctx.effect: ${describeError(error)}`);
+  }
+
   try {
     ctx?.on?.("dispose", dispose);
   } catch (error) {
-    logger.warn(`не подписался на dispose: ${describeError(error)}`);
+    logger.warn(`не подписался на событие dispose: ${describeError(error)}`);
   }
 
   const deps = {

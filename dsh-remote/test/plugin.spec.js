@@ -24,16 +24,28 @@ const packageDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const LEVELS = ["debug", "info", "warn", "error"];
 
 /**
- * Фейковый `ctx` в объёме, который нужен каркасу: `get`, `on`, `logger`.
+ * Фейковый `ctx` в объёме, который нужен каркасу: `get`, `on`, `effect`, `logger`.
  *
  * `services` — что отдаёт `get`; `loggerShape` — каким бывает логгер у cordis
  * (функция `ctx.logger(name)`, готовый объект, отсутствие, сломанный);
- * `getThrows`/`onThrows` — проверка того, что каркас не падает на чужой поломке.
+ * `getThrows`/`onThrows`/`effectThrows` — проверка того, что каркас не падает на
+ * чужой поломке.
+ *
+ * `effect(execute, label)` ведёт себя как cordis: выполняет `execute` сразу и
+ * отдаёт disposer, который снимет то, что `execute` вернул, — именно так cordis
+ * и выгружает файбер плагина (событие `dispose` он не эмитит).
  */
-function fakeCtx({ services = {}, loggerShape = "function", getThrows = false, onThrows = false } = {}) {
+function fakeCtx({
+  services = {},
+  loggerShape = "function",
+  getThrows = false,
+  onThrows = false,
+  effectThrows = false,
+} = {}) {
   const calls = [];
   const scopes = [];
   const handlers = [];
+  const effects = [];
   const record = (level) => (message) => calls.push({ level, message: String(message) });
   const build = () => Object.fromEntries(LEVELS.map((level) => [level, record(level)]));
 
@@ -60,9 +72,17 @@ function fakeCtx({ services = {}, loggerShape = "function", getThrows = false, o
       if (onThrows) throw new Error("on сломан");
       handlers.push({ event, handler });
     },
+    effect(execute, label) {
+      if (effectThrows) throw new Error("effect сломан");
+      const disposable = execute();
+      effects.push({ label, disposable });
+      return () => {
+        if (typeof disposable === "function") disposable();
+      };
+    },
     logger,
   };
-  return { ctx, calls, scopes, handlers };
+  return { ctx, calls, scopes, handlers, effects };
 }
 
 /** Сообщения заданного уровня из записанных вызовов логгера. */
@@ -96,12 +116,13 @@ test("каркас: имя плагина, пустой inject и пустой �
 });
 
 test("apply поднимается на пустом ctx без сервисов и не бросает", () => {
-  const { ctx, calls, scopes, handlers } = fakeCtx();
+  const { ctx, calls, scopes, handlers, effects } = fakeCtx();
   assert.doesNotThrow(() => apply(ctx, {}));
   assert.equal(scopes[0], "dsh-remote", "логгер создаётся со scope [dsh-remote]");
   assert.deepEqual(messages(calls, "error"), []);
   assert.match(messages(calls, "info").join("\n"), /каркас поднят/);
-  assert.deepEqual(handlers.map((item) => item.event), ["dispose"]);
+  assert.deepEqual(effects.map((item) => item.label), ["dsh-remote: dispose"], "cleanup — через ctx.effect");
+  assert.deepEqual(handlers.map((item) => item.event), ["dispose"], "событие dispose — хук для хостов");
 });
 
 test("apply не падает на ctx без logger, get и on", () => {
@@ -109,11 +130,12 @@ test("apply не падает на ctx без logger, get и on", () => {
   assert.doesNotThrow(() => apply(undefined, undefined));
 });
 
-test("apply не падает, когда ctx.get, ctx.on и ctx.logger сами бросают", () => {
+test("apply не падает, когда ctx.get, ctx.on, ctx.effect и ctx.logger сами бросают", () => {
   const { ctx } = fakeCtx({ loggerShape: "throwing" });
   assert.doesNotThrow(() => apply(ctx, {}));
   assert.doesNotThrow(() => apply(fakeCtx({ getThrows: true }).ctx, {}));
   assert.doesNotThrow(() => apply(fakeCtx({ onThrows: true }).ctx, {}));
+  assert.doesNotThrow(() => apply(fakeCtx({ effectThrows: true }).ctx, {}));
   assert.doesNotThrow(() => apply(fakeCtx({ loggerShape: "object" }).ctx, {}));
 });
 
@@ -185,8 +207,8 @@ test("отказ асинхронной фичи уходит в warn, а не �
   assert.match(messages(calls, "warn").join("\n"), /async boom/);
 });
 
-test("onDispose снимает ресурсы фичи при выгрузке плагина", () => {
-  const { ctx, handlers } = fakeCtx();
+test("выгрузка плагина через ctx.effect снимает ресурсы фичи", () => {
+  const fake = fakeCtx();
   let released = 0;
   const feature = {
     name: "с-ресурсом",
@@ -195,12 +217,18 @@ test("onDispose снимает ресурсы фичи при выгрузке �
     }),
   };
 
-  withFeatures([feature], () => apply(ctx, {}));
+  withFeatures([feature], () => apply(fake.ctx, {}));
   assert.equal(released, 0, "до выгрузки ресурс жив");
-  for (const { event, handler } of handlers) {
-    if (event === "dispose") handler();
-  }
-  assert.equal(released, 1, "dispose снимает ресурс");
+
+  // cordis при выгрузке файбера вызывает disposer, который вернул effect().
+  assert.equal(fake.effects.length, 1, "cleanup зарегистрирован одним эффектом");
+  assert.equal(fake.effects[0].label, "dsh-remote: dispose");
+  fake.effects[0].disposable();
+  assert.equal(released, 1, "выгрузка плагина снимает ресурс");
+
+  // Идемпотентность: событие dispose от хоста после выгрузки ничего не ломает.
+  for (const { handler } of fake.handlers) handler();
+  assert.equal(released, 1, "повторное снятие — no-op");
 });
 
 test("cordis.patch.yml: один insert-ряд ui-remote с name dsh-remote", () => {
