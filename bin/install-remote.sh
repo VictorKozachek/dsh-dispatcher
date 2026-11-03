@@ -60,6 +60,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "$PROFILE" in
+  web|desktop) ;;
+  *)
+    echo "неизвестный профиль: '$PROFILE' (ожидается web или desktop)" >&2
+    exit 2
+    ;;
+esac
+
 HOME_DIR="${DSH_HOME:-$HOME/.dsh}"
 PROFILE_DIR="$HOME_DIR/profiles/$PROFILE"
 MANIFEST="$PROFILE_DIR/package.json"
@@ -68,7 +76,11 @@ PATCH_FILE="$PROFILE_DIR/cordis.patch.yml"
 say() { printf '%s\n' "$*"; }
 plan() { printf '  • %s\n' "$*"; }
 
-say "dsh-remote → профиль '$PROFILE'${DRY_RUN:+ (dry-run)}"
+if (( DRY_RUN == 1 )); then
+  say "dsh-remote → профиль '$PROFILE' (dry-run)"
+else
+  say "dsh-remote → профиль '$PROFILE'"
+fi
 say "пакет:  $PLUGIN_DIR"
 say "профиль: $PROFILE_DIR"
 say ""

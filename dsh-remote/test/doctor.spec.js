@@ -159,3 +159,13 @@ test("runDoctorChecks: файла состояния ещё нет — warn, а 
 test("readPluginVersion: версия читается из package.json плагина", () => {
   assert.match(readPluginVersion(), /^\d+\.\d+\.\d+/);
 });
+
+test("runDoctorChecks: битый JSON и права 644 — обе проблемы видны", async (t) => {
+  const file = writeState(t, { raw: "{не json", perms: 0o644 });
+  const checks = await runDoctorChecks(fakeServices(t, { stateFile: file }));
+
+  assert.equal(checks.find((check) => check.title === "состояние").level, "fail");
+  const rights = checks.find((check) => check.title === "права");
+  assert.equal(rights.level, "warn", "права проверяются независимо от парсинга");
+  assert.match(rights.detail, /644/);
+});

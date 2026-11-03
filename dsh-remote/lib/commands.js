@@ -207,6 +207,16 @@ export async function runDoctorChecks({
       add(missing ? "warn" : "fail", "состояние", missing ? "файла ещё нет" : `не прочитан: ${humanError(error)}`, "оно появится после /remote connect");
     }
     if (text !== null) {
+      // Права проверяем независимо от содержимого: битый JSON — отдельная
+      // проблема, но файл с 644 не должен проходить незамеченным.
+      if (mode !== null) {
+        add(
+          mode === 0o600 ? "ok" : "warn",
+          "права",
+          `state.json: ${mode.toString(8)}`,
+          mode === 0o600 ? undefined : `должно быть 600: chmod 600 ${statePath}`,
+        );
+      }
       let parsed = null;
       try {
         parsed = JSON.parse(text);
@@ -221,14 +231,6 @@ export async function runDoctorChecks({
           binding === null ? "привязки нет" : `привязка: ${binding.transport ?? "telegram"} @${binding.botUsername ?? "?"}`,
           binding === null ? "выполните /remote connect" : undefined,
         );
-        if (mode !== null) {
-          add(
-            mode === 0o600 ? "ok" : "warn",
-            "права",
-            `state.json: ${mode.toString(8)}`,
-            mode === 0o600 ? undefined : `должно быть 600: chmod 600 ${statePath}`,
-          );
-        }
       }
     }
   }

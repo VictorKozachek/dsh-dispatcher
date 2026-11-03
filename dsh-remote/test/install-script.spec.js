@@ -124,3 +124,21 @@ test("неизвестная опция: код 2 и подсказка", (t) =>
   assert.equal(result.status, 2);
   assert.match(result.stderr, /неизвестная опция/);
 });
+
+test("без --dry-run в заголовке нет пометки «(dry-run)»", (t) => {
+  const home = tempHome(t);
+  // Пустой DSH_HOME: профиля нет, установка не начнётся — проверяем только вывод.
+  const result = run(t, ["--profile", "web"], home);
+
+  assert.equal(result.status, 1, "без профиля установка невозможна");
+  assert.match(result.stdout, /dsh-remote → профиль 'web'\n/);
+  assert.equal(result.stdout.includes("(dry-run)"), false, "пометка только с флагом");
+});
+
+test("--profile вне web|desktop отвергается с кодом 2", (t) => {
+  const home = tempHome(t);
+  const result = run(t, ["--profile", "staging", "--dry-run"], home);
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /неизвестный профиль/);
+});
