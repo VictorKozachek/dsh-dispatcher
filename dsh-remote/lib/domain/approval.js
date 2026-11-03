@@ -200,14 +200,16 @@ export class RemoteApproval {
    * человека не должен подменять `allowed-once` на `cancelled` (иначе решение
    * человека теряется, а действие не выполнится).
    */
-  cancel(reason = "cancelled", at = Date.now()) {
+  cancel(reason = "cancelled", at = Date.now(), outcome = APPROVAL_OUTCOME.cancelled) {
     if (this.status === APPROVAL_STATUS.cancelled) return false;
     if (this.status === APPROVAL_STATUS.decided) {
       this._log(`подтверждение ${this.shortId}: уже решено (${this.outcome}) — снятие игнорирую`);
       return false;
     }
     this.status = APPROVAL_STATUS.cancelled;
-    this.outcome = APPROVAL_OUTCOME.cancelled;
+    // Таймаут может быть `unavailable` (025): это тоже отказ, но вызывающий
+    // должен увидеть именно тот исход, который настроен политикой.
+    this.outcome = outcome === APPROVAL_OUTCOME.unavailable ? APPROVAL_OUTCOME.unavailable : APPROVAL_OUTCOME.cancelled;
     this.decidedAt = at;
     this._log(`подтверждение ${this.shortId}: снято (${reason})`);
     return true;

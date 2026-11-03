@@ -27,8 +27,10 @@
  */
 
 import { createBroker } from "./broker.js";
+import { createApprovalPolicy } from "./approvals/policy.js";
 import {
   APPROVAL_OUTCOME,
+  APPROVAL_TITLE,
   RemoteApproval,
   outcomeOfOption,
   outcomeSummary,
@@ -79,11 +81,54 @@ export function createApprovals({
   deliver = null,
   deliverFor = null,
   channelOf = null,
-  audit = null,
-  hybrid = null,
+  /** Политика подтверждений (025); без неё действует безопасная по умолчанию. */
+  policy = null,
+  /** Колбэк аудита решений политики (026): {type, toolName, reason, at}. */
+  onDecision = null,
+  /** Исход по таймауту: `cancelled` (по умолчанию) или `unavailable`; никогда `allowed-once`. */
+  onTimeout = null,
   setTimeout: setTimeoutImpl = setTimeout,
   clearTimeout: clearTimeoutImpl = clearTimeout,
+  /** Журнал решений 026. */
+  audit = null,
+  /** Гибрид 028: `{enabled, waitMs}` или функция. */
+  hybrid = null,
 } = {}) {
+  // 025: «по умолчанию безопасно» живёт в самом ответчике, а не только в фиче —
+  // иначе прямой вызов createApprovals (тесты, будущие вызывающие) спрашивал бы
+  // удалённо любой инструмент.
+  const activePolicy = policy !== null && typeof policy?.decide === "function"
+    ? policy
+    : createApprovalPolicy(null);
+  /** TTL: явный аргумент, иначе дефолт политики (30 минут) — даже без policy. */
+  const effectiveTtlMs = Number.isFinite(ttlMs) && ttlMs > 0 ? Math.floor(ttlMs) : activePolicy.ttlMs;
+
+  /** Записать решение политики: сначала аудит (026), потом лог. */
+  function recordPolicyDecision(request, toolName, resolution) {
+    const record = {
+      type: "approval-policy",
+      decision: "gui",
+      toolName,
+      reason: resolution.reason,
+      at: now(),
+      sessionId: typeof request?.agent?.id === "string" ? request.agent.id : null,
+    };
+    if (typeof onDecision === "function") {
+      try {
+        onDecision(record);
+      } catch (error) {
+        log(`подтверждение ${toolName}: аудит решения политики упал (${error?.message ?? error})`);
+      }
+    }
+    return record;
+  }
+
+  /** Исход таймаута: только отказ (025). */
+  function timeoutOutcome() {
+    const value = typeof onTimeout === "function" ? onTimeout() : onTimeout;
+    return value === APPROVAL_OUTCOME.unavailable ? APPROVAL_OUTCOME.unavailable : APPROVAL_OUTCOME.cancelled;
+  }
+
   /** Счётчики решений — для `/remote status` (026). */
   const stats = { claimed: 0, allowed: 0, rejected: 0, unavailable: 0, cancelled: 0, hybridHanded: 0, hybridLate: 0 };
 
@@ -224,6 +269,18 @@ export function createApprovals({
       const oldest = recentlyClosed.keys().next().value;
       recentlyClosed.delete(oldest);
     }
+    // 025 + 028: снимаем ОБА таймера — TTL политики и гибридный waitMs.
+    // Сработавший первым решает исход, второй уже не должен ни аудитить, ни
+    // вызывать next(), ни отменять запись.
+    if (entry.timer !== undefined && entry.timer !== null) {
+      try {
+        clearTimeoutImpl(entry.timer);
+      } catch {
+        /* таймер уже сработал */
+      }
+      entry.timer = null;
+    }
+    clearHybridTimer(entry);
     entry.settled = true;
     pending.delete(entry.approval.shortId);
     entry.resolve(outcome);
@@ -474,21 +531,20 @@ export function createApprovals({
       return next();
     }
 
+
     // Модель создаём ДО проверок транспорта: иначе «отдано GUI» и «снято по
     // аборту» не попадали бы в журнал (а карточка 026 требует каждое решение).
     const marks = marksOf(sessionId);
     const channel = channelFor(workspace, primary?.id ?? null);
-    const queueNumber = ++queueCounter;
     const approval = new RemoteApproval(request, {
       sessionId,
       workspace,
       role: marks.role,
       taskId: marks.taskId,
-      queueNumber,
       chatId: channel.chatId,
       threadId: channel.threadId,
       now: now(),
-      ...(Number.isFinite(ttlMs) ? { ttlMs } : {}),
+      ttlMs: effectiveTtlMs,
       log,
     });
 
@@ -497,6 +553,19 @@ export function createApprovals({
       stats.cancelled += 1;
       record(approval, { outcome: APPROVAL_OUTCOME.cancelled, decision: "timeout" });
       return APPROVAL_OUTCOME.cancelled;
+    }
+    // 025: политика решает ДО отправки в канал. Модель уже создана, поэтому
+    // решение «отдано GUI по политике» попадает в аудит 026 полной записью.
+    {
+      const resolution = activePolicy.decide(request);
+      if (resolution.remote !== true) {
+        approval.cancel("policy", now());
+        statsFor(APPROVAL_OUTCOME.unavailable);
+        record(approval, { outcome: APPROVAL_OUTCOME.unavailable, decision: "gui" });
+        const legacy = recordPolicyDecision(request, toolName, resolution);
+        log(`подтверждение ${toolName}: отдано GUI по политике (${resolution.reason}: ${resolution.message}; audit ${legacy.type})`);
+        return next();
+      }
     }
     if (typeof deliver !== "function" && !useBroker && typeof primary?.sendQuestion !== "function") {
       approval.cancel("no-transport", now());
@@ -511,10 +580,35 @@ export function createApprovals({
       return next();
     }
 
+    // 027: номер в очереди получает только то подтверждение, которое реально
+    // уйдёт в канал. Policy-GUI/аборт/сбой транспорта не «съедают» номер и не
+    // сбивают нумерацию соседних запросов.
+    queueCounter += 1;
+    approval.queueNumber = queueCounter;
+    approval.title = `${APPROVAL_TITLE} #${queueCounter}`;
+
     /** Ожидание решения + гонка с абортом запроса. */
     const outcome = await new Promise((resolve) => {
-      const entry = { approval, resolve, settled: false, delivered: false };
+      const entry = { approval, resolve, settled: false, delivered: false, timer: null };
       pending.set(approval.shortId, entry);
+
+      // 025: не ответили за TTL — отказ, а не «тихое разрешение». Таймер
+      // снимается в `settle()` при любом другом исходе.
+      if (Number.isFinite(effectiveTtlMs) && effectiveTtlMs > 0) {
+        const outcomeOnTimeout = timeoutOutcome();
+        entry.timer = setTimeoutImpl(() => {
+          if (entry.settled) return;
+          approval.cancel("timeout", now(), outcomeOnTimeout);
+          statsFor(outcomeOnTimeout);
+          record(approval, { outcome: outcomeOnTimeout, decision: "timeout" });
+          if (entry.delivered) {
+            void closeMessage(approval, outcomeSummary(outcomeOnTimeout));
+          }
+          log(`подтверждение ${approval.shortId}: таймаут — ${outcomeOnTimeout} (отказ)`);
+          settle(entry, outcomeOnTimeout);
+        }, effectiveTtlMs);
+        entry.timer?.unref?.();
+      }
 
       const onAbort = () => {
         if (entry.settled) return;

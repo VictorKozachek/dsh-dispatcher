@@ -19,6 +19,17 @@ import { APPROVAL_OUTCOME, RemoteApproval } from "../lib/domain/approval.js";
 import { features } from "../lib/features.js";
 import { hybridConfigFrom } from "../lib/features/approvals.js";
 
+/**
+ * Тесты 024 проверяют транспорт и исходы кнопок, а не политику: чтобы они не
+ * зависели от безопасных дефолтов 025 (read-only, denyRemote), политика здесь
+ * явно разрешает любой инструмент. Сами дефолты проверяются в
+ * approvals-policy-answerer.spec.js.
+ */
+const testPolicy = {
+  decide: () => ({ remote: true, reason: "allowed", toolName: "test", message: "test" }),
+  timeoutOutcome: () => "cancelled",
+};
+
 const tick = async (times = 6) => {
   for (let index = 0; index < times; index += 1) await new Promise((resolve) => setImmediate(resolve));
 };
@@ -93,7 +104,7 @@ function request(overrides = {}) {
 
 function setup({ enabled = true, transport = fakeTransport(), requestOverride = {}, audit = null, hybrid = null, timers = null } = {}) {
   const registry = { resolve: () => ({ enabled, scope: enabled ? "global" : null }) };
-  const approvals = createApprovals({
+  const approvals = createApprovals({ policy: testPolicy,
     transport,
     registry,
     audit,
@@ -114,7 +125,7 @@ function setup({ enabled = true, transport = fakeTransport(), requestOverride = 
 
 test("режим выключен: next() ровно один раз, сообщений нет", async () => {
   const transport = fakeTransport();
-  const approvals = createApprovals({
+  const approvals = createApprovals({ policy: testPolicy,
     transport,
     registry: { resolve: () => ({ enabled: false, scope: null }) },
     log: () => {},
@@ -250,7 +261,7 @@ test("транспорт без onAnswer: next() (ждать решение не
 test("два канала: первый доставил, второй ответил — решают оба", async () => {
   const first = fakeTransport({ id: "first" });
   const second = fakeTransport({ id: "second" });
-  const approvals = createApprovals({
+  const approvals = createApprovals({ policy: testPolicy,
     transports: [first, second],
     registry: { resolve: () => ({ enabled: true, scope: "global" }) },
     log: () => {},
@@ -274,7 +285,7 @@ test("два канала: первый доставил, второй отве�
 test("каналы проектов (015): у каждого транспорта свой chatId", async () => {
   const telegram = fakeTransport({ id: "telegram" });
   const max = fakeTransport({ id: "max" });
-  const approvals = createApprovals({
+  const approvals = createApprovals({ policy: testPolicy,
     transports: [telegram, max],
     registry: { resolve: () => ({ enabled: true, scope: "global" }) },
     channelOf: (workspace, transportId) => (
@@ -319,7 +330,7 @@ test("подтверждения транзиентны: после снятия
 
   // Новый экземпляр (как после рестарта плагина) не знает про старый shortId:
   // позднее нажатие не решает ничего и не бросает.
-  const restarted = createApprovals({ transport, registry: { resolve: () => ({ enabled: true }) }, log: () => {} });
+  const restarted = createApprovals({ policy: testPolicy, transport, registry: { resolve: () => ({ enabled: true }) }, log: () => {} });
   restarted.attach(fakeContext());
   assert.equal(restarted.pending.size, 0, "после рестарта очередь подтверждений пуста");
   restarted.handler; // экземпляр рабочий
@@ -330,7 +341,7 @@ test("подтверждения транзиентны: после снятия
 test("результат deliver give-up/aborted — «не доставили», next() в GUI", async () => {
   for (const result of ["give-up", "aborted", false]) {
     const transport = fakeTransport();
-    const approvals = createApprovals({
+    const approvals = createApprovals({ policy: testPolicy,
       transport,
       registry: { resolve: () => ({ enabled: true }) },
       deliver: async () => result,

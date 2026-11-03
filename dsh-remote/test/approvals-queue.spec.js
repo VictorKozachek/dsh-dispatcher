@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 
 import { APPROVAL_REQUEST_EVENT, createApprovals } from "../lib/approvals.js";
 import { APPROVAL_OUTCOME } from "../lib/domain/approval.js";
+import { createApprovalPolicy } from "../lib/approvals/policy.js";
 
 const tick = async (times = 8) => {
   for (let index = 0; index < times; index += 1) await new Promise((resolve) => setImmediate(resolve));
@@ -58,6 +59,9 @@ function setup({ transports = [fakeTransport()] } = {}) {
     transport: transports.length === 1 ? transports[0] : null,
     transports: transports.length > 1 ? transports : null,
     registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    // Тесты 027 проверяют очередь/маршрутизацию, а не политику 025: разрешаем
+    // используемые инструменты явно, безопасные дефолты проверяются отдельно.
+    policy: createApprovalPolicy({ tools: ["Bash", "Write", "Edit", "read_file"], denyRemote: [] }),
     now: () => 1_700_000_000_000,
     log: () => {},
   });
@@ -253,6 +257,7 @@ function setupHybrid({ waitMs = 20_000, audit = { entries: [], append(entry) { t
     transport: null,
     transports: [telegram, max],
     registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    policy: createApprovalPolicy({ tools: ["Bash", "Write", "Edit", "read_file"], denyRemote: [] }),
     hybrid: { enabled: true, waitMs },
     audit,
     now: () => 1_700_000_000_000,
@@ -337,4 +342,130 @@ test("обычный аборт: late-клик только логируется
   await tick();
   assert.equal(audit.entries.length, afterAbort, "обычный поздний ответ не пишет audit-late");
   assert.equal(telegram.closed.length, 1, "повторно сообщение не закрывается");
+});
+
+// --- очередь + policy-TTL (025) + hybrid (028) -------------------------------
+
+function setupTimed({ ttlMs, waitMs, allowed = ["read_file", "Bash", "Write"] }) {
+  const timers = fakeTimers();
+  const telegram = fakeTransport("telegram");
+  const audit = { entries: [], append(entry) { this.entries.push(entry); } };
+  const approvals = createApprovals({
+    transport: telegram,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    policy: createApprovalPolicy({ tools: allowed, denyRemote: [] }),
+    ttlMs,
+    hybrid: { enabled: true, waitMs },
+    audit,
+    now: () => 1_700_000_000_000,
+    log: () => {},
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const nextCalls = [];
+  const next = async () => {
+    nextCalls.push(true);
+    return "gui";
+  };
+  return { timers, telegram, approvals, ctx, handler: ctx.subscriptions[0].handler, next, nextCalls, audit };
+}
+
+test("TTL раньше hybrid в очереди: отказ, одна запись, гибрид снят, поздний клик не аудитится", async () => {
+  const { timers, telegram, handler, next, nextCalls, audit } = setupTimed({ ttlMs: 60_000, waitMs: 120_000 });
+  const pending = handler(request({ toolName: "read_file" }), next);
+  await tick();
+  const approval = telegram.sent[0].question;
+  assert.match(approval.title, /#1/);
+
+  const ttl = timers.byDelay(60_000)[0];
+  const hybrid = timers.byDelay(120_000)[0];
+  ttl.callback();
+
+  assert.equal(await pending, APPROVAL_OUTCOME.cancelled);
+  assert.equal(nextCalls.length, 0);
+  assert.equal(audit.entries.length, 1);
+  assert.equal(audit.entries[0].decision, "timeout");
+  assert.equal(hybrid.cleared, true, "гибридный таймер снят");
+
+  // Поздний клик после TTL: исход не переигрывается, late-аудита нет.
+  telegram.answer({ shortId: approval.shortId, optionIds: ["o1"] });
+  await tick();
+  assert.equal(audit.entries.length, 1, "поздний клик после TTL не пишет новый аудит");
+  assert.equal(await (async () => approval.outcome)(), APPROVAL_OUTCOME.cancelled);
+});
+
+test("hybrid раньше TTL: next один раз, затем очередь #2 и late-клик в аудит", async () => {
+  const { timers, telegram, handler, next, nextCalls, audit } = setupTimed({ ttlMs: 120_000, waitMs: 20_000 });
+  const first = handler(request({ toolName: "read_file", callId: "call-1" }), next);
+  await tick();
+  assert.match(telegram.sent[0].question.title, /#1/);
+  const shortId = telegram.sent[0].question.shortId;
+
+  timers.byDelay(20_000)[0].callback();
+  assert.equal(await first, "gui");
+  assert.equal(nextCalls.length, 1);
+  assert.equal(audit.entries[0].decision, "gui");
+
+  const second = handler(request({ toolName: "Write", callId: "call-2", agent: { id: "session-2" } }), next);
+  await tick();
+  const secondApproval = telegram.sent[1].question;
+  assert.match(secondApproval.title, /#2/, "нумерация не сбилась после гибрида");
+  telegram.answer({ shortId: secondApproval.shortId, optionIds: ["o1"] });
+  assert.equal(await second, APPROVAL_OUTCOME.allowedOnce);
+  assert.equal(audit.entries[1].decision, "remote");
+
+  telegram.answer({ shortId, optionIds: ["o2"], answeredBy: "user-7" });
+  await tick();
+  assert.equal(audit.entries.length, 3);
+  assert.equal(audit.entries[2].decision, "late");
+  assert.equal(audit.entries[2].outcome, APPROVAL_OUTCOME.rejected);
+  assert.equal(audit.entries[2].answeredBy, "user-7");
+  assert.equal(nextCalls.length, 1, "next() не повторяется");
+});
+
+test("policy-GUI рядом с pending-соседом не съедает номер очереди", async () => {
+  const timers = fakeTimers();
+  const telegram = fakeTransport("telegram");
+  const audit = { entries: [], append(entry) { this.entries.push(entry); } };
+  const approvals = createApprovals({
+    transport: telegram,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    // безопасная политика: read_file можно, Bash — всегда GUI
+    policy: createApprovalPolicy(null),
+    audit,
+    now: () => 1_700_000_000_000,
+    log: () => {},
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const nextCalls = [];
+  const next = async () => {
+    nextCalls.push(true);
+    return "gui";
+  };
+
+  const first = ctx.subscriptions[0].handler(request({ toolName: "read_file", callId: "call-1" }), next);
+  await tick();
+  assert.match(telegram.sent[0].question.title, /#1/);
+
+  // Сосед по очереди — опасный инструмент: уходит в GUI по политике, номер не тратит.
+  assert.equal(await ctx.subscriptions[0].handler(request({ toolName: "bash", callId: "call-2" }), next), "gui");
+  assert.equal(audit.entries[0].decision, "gui");
+  assert.equal(nextCalls.length, 1);
+
+  const third = ctx.subscriptions[0].handler(request({ toolName: "read_file", callId: "call-3", agent: { id: "session-3" } }), next);
+  await tick();
+  const thirdApproval = telegram.sent[1].question;
+  assert.match(thirdApproval.title, /#2/, "policy-GUI не занял номер: следующий снова #2");
+
+  telegram.answer({ shortId: thirdApproval.shortId, optionIds: ["o1"] });
+  assert.equal(await third, APPROVAL_OUTCOME.allowedOnce);
+
+  telegram.answer({ shortId: telegram.sent[0].question.shortId, optionIds: ["o2"] });
+  assert.equal(await first, APPROVAL_OUTCOME.rejected);
+  assert.equal(audit.entries.length, 3, "policy gui + два remote, без дублей");
 });
