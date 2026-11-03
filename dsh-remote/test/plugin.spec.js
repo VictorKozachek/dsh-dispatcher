@@ -125,8 +125,12 @@ test("каркас: имя плагина, пустой inject и фичи с к
   // Порядок не косметика: транспорт поднимается первым, иначе ответчик с
   // `needs: [remoteTransport]` пропускается, не дождавшись сервиса.
   // Порядок: commands регистрирует фасад и состояние, telegram кладёт транспорт в
-  // фасад, answerer подписывается последним.
-  assert.deepEqual(features.map((feature) => feature.name), ["commands", "telegram", "answerer"]);
+  // фасад, reliability даёт ответчику deliver/TTL, answerer подписывается последним,
+  // panel (009) — рядом с ним.
+  assert.deepEqual(
+    features.map((feature) => feature.name),
+    ["commands", "max", "telegram", "reliability", "answerer", "notify", "panel"],
+  );
 });
 
 test("apply поднимается на пустом ctx без сервисов и не бросает", async () => {
@@ -261,10 +265,12 @@ test("package.json: поля, которые читает загрузчик п�
   assert.equal(pkg.exports["."], "./lib/index.js");
   assert.equal(pkg.exports["./cordis.patch.yml"], "./cordis.patch.yml");
   assert.equal(pkg.exports["./package.json"], "./package.json");
-  assert.equal(pkg.exports["./client"], undefined, "клиентская половина — задача 009, не сейчас");
+  assert.equal(pkg.exports["./client"], "./lib/client.js", "клиентская половина — задача 009");
+  assert.equal(pkg.dsh?.client?.platform, "web", "клиентский бандл для Web");
+  assert.ok(Array.isArray(pkg.dsh?.client?.inject) && pkg.dsh.client.inject.length > 0);
 
   assert.equal(pkg.dsh?.bundle?.patch, "./cordis.patch.yml");
-  assert.deepEqual(pkg.files, ["lib", "cordis.patch.yml"]);
+  assert.deepEqual(pkg.files, ["lib", "cordis.patch.yml", "README.md"]);
   assert.deepEqual(pkg.peerDependencies, { "@deepseek-ai/cordis": "^4.0.2" });
   assert.equal(pkg.dependencies, undefined, "зависимостей у каркаса нет: только peer cordis");
 });

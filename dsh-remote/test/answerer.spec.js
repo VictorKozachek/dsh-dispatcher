@@ -319,7 +319,8 @@ test("второй ответ на тот же вопрос ничего не п
 
   const result = await pending;
   assert.deepEqual(result.answers, [{ id: "q1", selected: ["Да"] }], "первый ответ остался");
-  assert.match(logs.join("\n"), /уже отвечен или закрыт/);
+  // 012: повторный ответ — уже «поздний», в логе видно, из какого канала он пришёл.
+  assert.match(logs.join("\n"), /вопрос уже отвечен/);
 });
 
 test("ответ на неизвестный shortId игнорируется", async () => {
