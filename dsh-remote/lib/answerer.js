@@ -169,15 +169,23 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
   }
 
+  /** Правка сообщения после ответа: в фоне, ошибка не мешает ответу. */
+  async function closeMessage(question) {
+    try {
+      await transport?.closeQuestion?.(question, answerSummary(question));
+    } catch (error) {
+      log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
+    }
+  }
+
   /**
-   * Ответ транспорта: разнести по ожидающим вопросам, закрыть сообщение и
-   * разбудить слушатель.
+   * Ответ транспорта: разнести по ожидающим вопросам, разбудить слушатель и
+   * поправить сообщение в мессенджере.
    *
-   * Сообщение правится на «✅ Отвечено: …» именно здесь: ответ уже принят доменом,
-   * и человеку в мессенджере незачем видеть кнопки вопроса, на который он ответил.
-   * Ошибка правки не мешает ответу — ответ всё равно уходит в сессию.
+   * Слушатель будим **до** правки: медленный (или зависший) editMessageText не
+   * должен задерживать ответ сессии. Правка — украшение, ответ — смысл.
    */
-  async function onTransportAnswer(event) {
+  function onTransportAnswer(event) {
     const normalized = normalizeAnswerEvent(event);
     if (normalized === null) {
       log("ответ транспорта: событие без shortId — игнор");
@@ -195,12 +203,8 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
     if (!entry.question.accept(parsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
     pending.delete(normalized.shortId);
-    try {
-      await transport?.closeQuestion?.(entry.question, answerSummary(entry.question));
-    } catch (error) {
-      log(`вопрос ${normalized.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
-    }
     entry.resolve(entry.question);
+    void closeMessage(entry.question);
   }
 
   /**

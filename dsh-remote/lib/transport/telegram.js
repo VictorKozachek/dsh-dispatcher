@@ -214,7 +214,9 @@ function renderMessages(question, limit) {
   });
 
   if (buffer !== "") messages.push(buffer);
-  return messages;
+  // Текст из одних пробелов не даёт ни одного куска: без сообщения ответчик
+  // ждал бы ответа вечно, поэтому отправляем заглушку.
+  return messages.length > 0 ? messages : ["(пустой вопрос)"];
 }
 
 /**
@@ -534,17 +536,22 @@ export function createTelegramTransport(options = {}) {
 
     /** Остановить поллинг: сигнал, ожидание цикла, без текущих таймеров. */
     async stop() {
-      if (!running) return transport;
-      running = false;
-      controller?.abort();
-      const loop = loopPromise;
-      loopPromise = null;
-      try {
-        await loop;
-      } catch {
-        /* цикл завершился отменой — это нормальный путь остановки */
+      if (running) {
+        running = false;
+        controller?.abort();
+        const loop = loopPromise;
+        loopPromise = null;
+        try {
+          await loop;
+        } catch {
+          /* цикл завершился отменой — это нормальный путь остановки */
+        }
       }
-      // Открытые записи без поллинга бесполезны: следующий старт начнёт с чистого листа.
+      // Открытые вопросы закрываем молча: кнопки вопроса, на который уже никто не
+      // ответит (плагин остановлен), не должны остаться в чате.
+      for (const [shortId, record] of [...sent.entries()]) {
+        if (record.messageIds.length > 0) await closeRecord(shortId, record, "");
+      }
       sent.clear();
       log("telegram: поллинг остановлен");
       return transport;

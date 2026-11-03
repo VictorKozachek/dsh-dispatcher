@@ -43,6 +43,12 @@ export const telegramFeature = {
   name: "telegram",
   needs: [],
   async apply(ctx, config, deps) {
+    /** Выгрузили ли плагин, пока мы ждали токен: тогда поллинг не поднимаем. */
+    let disposed = false;
+    deps.onDispose(() => {
+      disposed = true;
+    });
+
     const settings = config?.telegram;
     if (settings === null || typeof settings !== "object") {
       deps.logger.debug("фича telegram: привязки нет — спит (включение в задаче 005)");
@@ -50,6 +56,10 @@ export const telegramFeature = {
     }
 
     const token = await resolveToken(settings, deps);
+    if (disposed) {
+      deps.logger.debug("фича telegram: плагин выгружен во время чтения токена — не запускаю");
+      return;
+    }
     if (token === null) {
       deps.logger.warn("фича telegram: токена нет в ctx.credentials — спит");
       return;
