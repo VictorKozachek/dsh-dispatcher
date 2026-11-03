@@ -289,6 +289,8 @@ export function createReliability({
   tickIntervalMs = 15_000,
   notifyTimeoutMs = 2_000,
   setTimeout: setTimeoutImpl = setTimeout,
+  /** 012: (transportId) => transport, чтобы TTL/напоминания шли во все каналы. */
+  transportFor = null,
 } = {}) {
   if (!ON_EXPIRE_VALUES.includes(onExpire)) {
     throw new TypeError(`reliability: onExpire должен быть одним из ${ON_EXPIRE_VALUES.join(", ")}`);
@@ -426,6 +428,24 @@ export function createReliability({
    * Это та точка, где ответчик (002) решает отдать вопрос GUI: ему достаточно
    * на `'give-up'` вернуть `next()`.
    */
+  /**
+   * Транспорты, куда доставлен вопрос (012): все `deliveries`, иначе базовый.
+   * Через `transportFor` они находятся по id после рестарта.
+   */
+  function targetsFor(question) {
+    const found = [];
+    const deliveries = Array.isArray(question?.deliveries) ? question.deliveries : [];
+    for (const delivery of deliveries) {
+      const target = typeof transportFor === "function" ? transportFor(delivery?.transport) : null;
+      if (target !== null && target !== undefined && typeof target.sendQuestion === "function") {
+        if (!found.includes(target)) found.push(target);
+      }
+    }
+    const base = channel();
+    if (found.length === 0 && base !== null) found.push(base);
+    return found;
+  }
+
   /** Живой транспорт: у фасада (005) внутри, у обычного сервиса — он сам. */
   function channel() {
     if (transport === null || transport === undefined) return null;
@@ -582,6 +602,38 @@ export function createReliability({
     let failed = 0;
 
     for (const orphan of orphans) {
+      // 012: закрываем каждую доставку (после рестарта каналов может быть два).
+      const deliveries = Array.isArray(orphan.deliveries) && orphan.deliveries.length > 0
+        ? orphan.deliveries
+        : [orphan];
+      if (deliveries.length > 1) {
+        let ok = true;
+        for (const delivery of deliveries) {
+          const target = typeof transportFor === "function" ? transportFor(delivery.transport) : null;
+          const question = { shortId: orphan.shortId, questionId: orphan.questionId ?? orphan.shortId };
+          try {
+            if (delivery.messageId !== null && delivery.messageId !== undefined && typeof target?.editMessage === "function") {
+              await target.editMessage({ chatId: delivery.chatId, messageId: delivery.messageId }, reason);
+              if (typeof target.clearButtons === "function") {
+                await target.clearButtons({ chatId: delivery.chatId, messageId: delivery.messageId });
+              }
+            } else if (typeof target?.closeQuestion === "function") {
+              await target.closeQuestion(question, "restarted");
+            }
+          } catch (error) {
+            ok = false;
+            logger(`рестарт: канал ${delivery.transport ?? "?"} вопроса ${orphan.shortId} не снят (${error?.message ?? error})`);
+          }
+        }
+        if (ok) {
+          cancelled += 1;
+          journal.append({ event: "orphan-cancelled", shortId: orphan.shortId });
+        } else {
+          failed += 1;
+          journal.append({ event: "orphan-failed", shortId: orphan.shortId });
+        }
+        continue;
+      }
       try {
         const live = channel();
         const question = { shortId: orphan.shortId, questionId: orphan.questionId ?? orphan.shortId };
@@ -626,17 +678,18 @@ export function createReliability({
   async function notify(question, text) {
     // Правку проверяем по результату, а не по наличию метода: фасад 005 есть
     // всегда, но если за ним нет живого канала, правка «успешно» ничего не делает.
-    if (typeof transport?.editQuestion === "function") {
+    let editedAny = false;
+    for (const target of targetsFor(question)) {
+      if (typeof target.editQuestion !== "function") continue;
       try {
-        const edited = await transport.editQuestion(question, text);
-        // Только явный `true`: фасад без живого канала возвращает undefined,
-        // и это не повод считать напоминание доставленным.
-        if (edited === true) return "edited";
-        logger(`уведомление ${question.shortId}: транспорт не смог править сообщение`);
+        const edited = await target.editQuestion(question, text);
+        if (edited === true) editedAny = true;
+        else logger(`уведомление ${question.shortId}: канал ${target.id ?? "?"} не смог править сообщение`);
       } catch (error) {
         logger(`уведомление ${question.shortId}: правка не удалась (${error?.message ?? error})`);
       }
     }
+    if (editedAny) return "edited";
     // Если правка не удалась (нет метода, вернул не `true`, фасад без канала) —
     // карточка требует короткое новое сообщение. Не теряем напоминание молча.
     if (typeof transport?.sendQuestion === "function") {
@@ -705,13 +758,16 @@ export function createReliability({
         // §7.3: по TTL сообщение помечается «⌛ ждёт ответа», и только потом
         // снимаются кнопки. Silent-close сам текст не меняет.
         let marked = false;
-        try {
-          marked = (await withTimeout(
-            Promise.resolve(transport?.editQuestion?.(question, "⌛ ждёт ответа")),
-            notifyTimeoutMs,
-          )) === true;
-        } catch (error) {
-          logger(`TTL: пометка вопроса ${shortId} не удалась (${error?.message ?? error})`);
+        for (const target of targetsFor(question)) {
+          try {
+            const markedOne = (await withTimeout(
+              Promise.resolve(target?.editQuestion?.(question, "⌛ ждёт ответа")),
+              notifyTimeoutMs,
+            )) === true;
+            marked = marked || markedOne;
+          } catch (error) {
+            logger(`TTL: пометка вопроса ${shortId} в канале ${target.id ?? "?"} не удалась (${error?.message ?? error})`);
+          }
         }
         if (!marked) {
           // Пометка невозможна (нет editQuestion / фасад без канала): сообщение
@@ -719,11 +775,13 @@ export function createReliability({
           journal.append({ event: "expire-unmarked", shortId });
           logger(`TTL: транспорт не умеет править сообщение ${shortId} — пометка «⌛» не поставлена`);
         }
-        try {
-          // Зависшая правка не должна блокировать сторож: ограничиваем время.
-          await withTimeout(Promise.resolve(transport?.closeQuestion?.(question, "expired")), notifyTimeoutMs);
-        } catch (error) {
-          logger(`TTL: кнопки вопроса ${shortId} не снялись (${error?.message ?? error})`);
+        for (const target of targetsFor(question)) {
+          try {
+            // Зависшая правка не должна блокировать сторож: ограничиваем время.
+            await withTimeout(Promise.resolve(target?.closeQuestion?.(question, "expired")), notifyTimeoutMs);
+          } catch (error) {
+            logger(`TTL: кнопки вопроса ${shortId} в канале ${target.id ?? "?"} не снялись (${error?.message ?? error})`);
+          }
         }
         const resolved = resolveExpiry(question);
         journal.append({ event: "expired", shortId, outcome: onExpire });

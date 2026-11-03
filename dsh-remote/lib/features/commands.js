@@ -270,7 +270,9 @@ export const commandsFeature = {
       return transport;
     };
 
-    const currentChannel = () => facade.current;
+    // 012: в мультиканальном режиме фасад пуст, каналы живут в реестре —
+    // status/on должны видеть хотя бы один живой канал.
+    const currentChannel = () => facade.current ?? [...transportRegistry.values()][0] ?? null;
     const remote = createRemoteCommands({ ctx, store, log, ensureTransport: ensure, currentChannel });
     deps.onDispose(remote.register());
 

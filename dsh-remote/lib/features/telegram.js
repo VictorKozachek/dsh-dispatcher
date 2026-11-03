@@ -78,9 +78,16 @@ export const telegramFeature = {
       return;
     }
 
+    // 012: при нескольких каналах фасад (005) держит один «current» и гасит
+    // previous — второй канал перестал бы принимать ответы. Поэтому в
+    // мультиканальном режиме каналы живут сами и регистрируются только в реестре.
+    const multiChannel = Array.isArray(config?.transports) && config.transports.length > 1;
     try {
       const facade = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
-      if (facade !== null && facade.__isTransportFacade === true) {
+      if (multiChannel) {
+        ctx?.get?.("remoteTransports")?.set?.("telegram", transport);
+        deps.logger.info("фича telegram: мультиканальный режим — транспорт только в реестре");
+      } else if (facade !== null && facade.__isTransportFacade === true) {
         // Фича commands (005) уже держит фасад: кладём транспорт внутрь, чтобы
         // connect/disconnect могли его заменить и остановить.
         facade.set(transport);
