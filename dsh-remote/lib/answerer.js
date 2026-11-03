@@ -128,7 +128,15 @@ function answerSummary(question) {
  * @param {() => number} [options.now] — часы (мс epoch), в тестах подменяются.
  * @returns {{attach: (ctx: object) => () => void, handler: Function, dispose: (reason?: string) => void}}
  */
-export function createAnswerer({ transport, registry, log = noopLog, now = Date.now } = {}) {
+export function createAnswerer({ transport, registry, log = noopLog, now = Date.now, deliver = null, reliability = null } = {}) {
+  /**
+   * Доставка вопроса: по умолчанию — транспорт, но 008 подставляет сюда
+   * `reliability.deliver` с повторами. Сигнал `'give-up'` означает «за
+   * `connectTimeoutMs` не доставили» — тогда вопрос достаётся GUI через `next()`.
+   */
+  const sendOne = typeof deliver === "function"
+    ? async (question, signal) => deliver({ question, signal })
+    : async (question, signal) => transport.sendQuestion(question, signal);
   /** Открытые вопросы по короткому id: ждём ответа транспорта. */
   const pending = new Map();
   /** Контекст плагина: из него берём cwd сессии для scope воркспейса. */
@@ -161,9 +169,21 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
    * закрывать нечего, им достаточно статуса (аборт во время отправки, ошибка
    * доставки). Начатая отправка могла дойти до сервера, поэтому её закрываем.
    */
+  /** Вопросы, снятые недавно: их поздние ответы уходят в сессию как `steer`. */
+  const recentlyClosed = new Map();
+  const rememberClosed = (question) => {
+    recentlyClosed.set(question.shortId, question);
+    if (recentlyClosed.size > 50) {
+      const oldest = recentlyClosed.keys().next().value;
+      recentlyClosed.delete(oldest);
+    }
+  };
+
   async function closeQuestions(questions, reason, attempted = null) {
     for (const question of questions) {
       pending.delete(question.shortId);
+      rememberClosed(question);
+      reliability?.unwatch?.(question.shortId);
       // Уже отвеченный или закрытый вопрос второй раз не закрываем: сообщение в
       // мессенджере и так снято, а лишний closeQuestion — ложный сигнал транспорту.
       if (!question.cancel(reason, now())) continue;
@@ -200,7 +220,19 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
     const entry = pending.get(normalized.shortId);
     if (entry === undefined) {
-      log(`ответ на ${normalized.shortId}: вопроса нет (уже отвечен или закрыт) — игнор`);
+      // Поздний ответ: вопрос уже снят (TTL/аборт/перезапуск). Это не игнор —
+      // карточка требует, чтобы ответ дошёл до сессии через `steer`.
+      const closedQuestion = recentlyClosed.get(normalized.shortId);
+      if (closedQuestion === undefined || typeof reliability?.applyLateAnswer !== "function") {
+        log(`ответ на ${normalized.shortId}: вопроса нет (уже отвечен или закрыт) — игнор`);
+        return;
+      }
+      const labels = new Map((closedQuestion.options ?? []).map((option) => [option.id, option.label]));
+      const selected = normalized.optionIds.map((id) => labels.get(id)).filter((label) => label !== undefined);
+      const answer = { selected, ...(normalized.text === "" ? {} : { custom: normalized.text }) };
+      void Promise.resolve(reliability.applyLateAnswer({ question: closedQuestion, answer, text: normalized.text }))
+        .then((outcome) => log(`поздний ответ ${normalized.shortId}: ${outcome}`))
+        .catch((error) => log(`поздний ответ ${normalized.shortId}: не доставлен (${error?.message ?? error})`));
       return;
     }
     const parsed = choiceFor(entry.question, normalized);
@@ -218,6 +250,7 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
     if (!entry.question.accept(parsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
     pending.delete(normalized.shortId);
+    reliability?.unwatch?.(normalized.shortId);
     entry.resolve(entry.question);
     void closeMessage(entry.question);
   }
@@ -255,7 +288,7 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       log(`вопрос ${sessionId ?? "(без агента)"}: режим выключен — отдаю GUI (next)`);
       return next();
     }
-    if (typeof transport?.sendQuestion !== "function") {
+    if (typeof deliver !== "function" && typeof transport?.sendQuestion !== "function") {
       log("вопрос: транспорт не умеет sendQuestion — отдаю GUI (next)");
       return next();
     }
@@ -277,6 +310,9 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       return next();
     }
 
+    /** Ответы, которыми TTL закрыл вопрос (empty/default-first). */
+    const expiredAnswers = new Map();
+
     // Ожидание ответа: по промису на вопрос, ключ — короткий id для кнопок.
     // `catch`-заглушка вешается сразу: если вопрос снимают (аборт, ошибка
     // отправки), промис остаётся неразрешённым, но не должен шуметь как
@@ -289,6 +325,25 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       });
       waited.catch(() => {});
       waiting.push(waited);
+
+      // TTL-сторож (008): по истечении вопрос получает исход из конфига. Abort
+      // отклоняет ожидание (DSH получит ASK_ABORTED), empty/default-first
+      // отдают ответ — иначе сессия ждала бы вечно: таймаута в DSH нет.
+      reliability?.watch?.(question, {
+        sessionId: question.sessionId,
+        onExpire: (info) => {
+          const entry = pending.get(question.shortId);
+          if (entry === undefined) return;
+          pending.delete(question.shortId);
+          rememberClosed(question);
+          if (info?.kind === "abort") {
+            entry.reject(info.error ?? abortError("вопрос истёк по TTL"));
+            return;
+          }
+          expiredAnswers.set(question.shortId, info.answer);
+          entry.resolve(question);
+        },
+      });
     }
 
     // Аборт слушаем ДО отправки: иначе аборт во время sendQuestion оставил бы
@@ -316,7 +371,13 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       try {
         for (const question of questions) {
           attempted.add(question);
-          await Promise.race([transport.sendQuestion(question), aborted]);
+          const outcome = await Promise.race([sendOne(question, request?.signal), aborted]);
+          if (outcome === "give-up") {
+            // Недоставка за отведённое время: вопрос достаётся GUI, сессия не висит.
+            log(`вопрос ${question.shortId}: не доставлен — отдаю GUI (next)`);
+            await closeQuestions(questions, "undelivered", attempted);
+            return next();
+          }
         }
       } catch (error) {
         if (error?.name === "AbortError") {
@@ -350,8 +411,11 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
 
     for (const question of questions) pending.delete(question.shortId);
+    reliability?.unwatch?.(questions.map((question) => question.shortId));
     log(`вопросов ${questions.length}: ответ получен (${decision.scope})`);
-    return { answers: questions.map((question) => question.toAnswer()) };
+    return {
+      answers: questions.map((question) => expiredAnswers.get(question.shortId) ?? question.toAnswer()),
+    };
   }
 
   /**

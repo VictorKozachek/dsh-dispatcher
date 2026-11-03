@@ -593,14 +593,25 @@ test("плагин: async apply -> remoteTransport -> answerer подписан 
     logger: () => ({ debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }),
   };
 
+  // Состояние и журнал — во временном каталоге: тест не должен трогать ~/.dsh.
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-plugin-"));
+  const previousState = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = path.join(stateDir, "state.json");
+  t.after(() => {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    if (previousState === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previousState;
+  });
+
   await apply(ctx, {
     telegram: { tokenRef: "tg", chatId: 42, allowedUserIds: [7], pollTimeoutSec: 25 },
   });
 
-  // Команды (005) дополнительно регистрируют сервис состояния, панель (009) — свой.
+  // Команды (005) регистрируют фасад и состояние, reliability (008) и панель (009) — свои сервисы.
   const transportEntries = provided.filter((entry) => entry.name === "remoteTransport");
   assert.equal(transportEntries.length, 1, "транспорт зарегистрирован ровно один раз");
   assert.ok(provided.some((entry) => entry.name === "remoteStore"), "состояние зарегистрировано как сервис");
+  assert.ok(provided.some((entry) => entry.name === "remoteReliability"), "устойчивость зарегистрирована");
   assert.ok(provided.some((entry) => entry.name === "remotePanel"), "панель зарегистрирована рядом");
   const facade = transportEntries[0].service;
   assert.equal(facade.current?.polling, true, "поллинг запущен после async-привязки");
