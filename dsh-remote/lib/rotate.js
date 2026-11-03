@@ -92,7 +92,11 @@ export function rotateIfNeeded(fsImpl, file, incoming = 0, { maxBytes = DEFAULT_
 export function vacuum(fsImpl, { dir, bases = ["audit.jsonl", "log.jsonl"], keep = DEFAULT_KEEP, dryRun = false, log = noop } = {}) {
   const removed = [];
   const kept = [];
-  for (const base of bases) {
+  // Мусор в аргументах не должен удалять лишнего: keep — только целое ≥ 0,
+  // bases — только массив имён.
+  const effectiveKeep = Number.isFinite(keep) && keep >= 0 ? Math.floor(keep) : DEFAULT_KEEP;
+  const list = Array.isArray(bases) ? bases.filter((base) => typeof base === "string" && base !== "") : ["audit.jsonl", "log.jsonl"];
+  for (const base of list) {
     const file = path.join(dir, base);
     const candidates = [];
     const prefix = `${base}.`;
@@ -117,7 +121,7 @@ export function vacuum(fsImpl, { dir, bases = ["audit.jsonl", "log.jsonl"], keep
     }
     candidates.sort((a, b) => a.index - b.index);
     // Оставляем файлы с наибольшими индексами (самые свежие ротации).
-    const drop = candidates.slice(0, Math.max(0, candidates.length - Math.max(0, Math.floor(keep))));
+    const drop = candidates.slice(0, Math.max(0, candidates.length - effectiveKeep));
     for (const item of candidates) {
       if (drop.includes(item)) {
         if (!dryRun) {

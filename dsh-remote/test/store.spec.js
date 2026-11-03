@@ -62,7 +62,7 @@ test("нет файла — состояние по умолчанию", (t) => 
   const state = store.read();
 
   assert.deepEqual(state, defaultState());
-  assert.equal(state.version, STATE_VERSION);
+  assert.equal(state.schemaVersion, STATE_VERSION);
   assert.equal(state.bindings, null);
   assert.deepEqual(state.enabled, { global: false, workspaces: {}, sessions: {} });
   assert.deepEqual(state.recent, []);
@@ -150,7 +150,7 @@ test("мусор в состоянии не ломает чтение и не т
   const dir = tempDir(t);
   const file = path.join(dir, "state.json");
   fs.writeFileSync(file, JSON.stringify({
-    version: 99,
+    schemaVersion: 1,
     bindings: "строка вместо объекта",
     enabled: { global: "yes", workspaces: { "/p": true, "/q": "нет" }, sessions: [] },
     recent: "не массив",
@@ -160,7 +160,7 @@ test("мусор в состоянии не ломает чтение и не т
 
   const state = makeStore(dir).store.read();
 
-  assert.equal(state.version, STATE_VERSION);
+  assert.equal(state.schemaVersion, STATE_VERSION);
   assert.equal(state.bindings, null);
   assert.deepEqual(state.enabled, { global: false, workspaces: { "/p": true }, sessions: {} });
   assert.deepEqual(state.recent, []);
@@ -226,7 +226,7 @@ for (let i = 0; i < 40; i += 1) store.setEnabled({ kind: "global" }, ${flag});
 
   const raw = fs.readFileSync(file, "utf8");
   const state = JSON.parse(raw);
-  assert.equal(state.version, STATE_VERSION, "JSON целый");
+  assert.equal(state.schemaVersion, STATE_VERSION, "JSON целый");
   assert.equal(typeof state.enabled.global, "boolean");
   assert.deepEqual(fs.readdirSync(dir), ["state.json"], "временных файлов не осталось");
 });

@@ -200,28 +200,48 @@ export async function runHealthChecks({
   }
 
   // --- schema state.json (032) -------------------------------------------------
+  // Отказ схемы (файл из будущего, битая версия, миграция не удалась) — это fail:
+  // плагин работает без удалённого режима и НЕ перезаписывает state.json.
+  let schemaStatus = null;
+  try {
+    schemaStatus = typeof store?.schemaStatus === "function" ? store.schemaStatus() : null;
+  } catch {
+    schemaStatus = null;
+  }
   let stateVersion = null;
+  let stateReadError = null;
   try {
     const state = typeof store?.read === "function" ? store.read() : null;
-    stateVersion = Number.isFinite(state?.version) ? state.version : null;
-  } catch {
-    stateVersion = null;
+    stateVersion = Number.isFinite(state?.schemaVersion)
+      ? state.schemaVersion
+      : Number.isFinite(state?.version)
+        ? state.version
+        : null;
+  } catch (error) {
+    stateReadError = error?.message ?? String(error);
   }
-  if (supportedSchemaVersion === null) {
+  if (schemaStatus?.error !== null && schemaStatus?.error !== undefined) {
+    checks.push(createCheck({
+      id: "schema",
+      status: "fail",
+      detail: schemaStatus.error.message,
+      action: schemaStatus.error.instruction ?? "восстановите state.json из state.json.bak-* или обновите плагин",
+    }));
+  } else if (supportedSchemaVersion === null) {
     checks.push(createCheck({ id: "schema", status: "ok", detail: `версия схемы не проверяется (state: ${stateVersion ?? "?"})` }));
   } else if (stateVersion === null) {
     checks.push(createCheck({
       id: "schema",
       status: "warn",
-      detail: "версия схемы state.json не прочитана",
+      detail: stateReadError === null ? "версия схемы state.json не прочитана" : `state.json не прочитан: ${stateReadError}`,
       action: "проверьте state.json: /remote connect",
     }));
   } else if (stateVersion > supportedSchemaVersion) {
     checks.push(createCheck({
       id: "schema",
-      status: "warn",
+      status: "fail",
       detail: `state.json версии ${stateVersion} новее плагина (${supportedSchemaVersion})`,
-      action: "обновите плагин или восстановите state.json",
+      action: "обновите плагин dsh-remote или восстановите state.json из state.json.bak-*",
     }));
   } else {
     checks.push(createCheck({ id: "schema", status: "ok", detail: `state.json версии ${stateVersion} (поддерживается ${supportedSchemaVersion})` }));

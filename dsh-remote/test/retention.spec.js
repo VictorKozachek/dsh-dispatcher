@@ -11,7 +11,7 @@ import path from "node:path";
 import { DEFAULT_KEEP, DEFAULT_MAX_BYTES, rotateIfNeeded, vacuum } from "../lib/rotate.js";
 import { createAudit, DEFAULT_KEEP_ROTATED, DEFAULT_MAX_BYTES as AUDIT_MAX_BYTES } from "../lib/audit.js";
 import { createJournalLog } from "../lib/reliability.js";
-import { createStore, PENDING_LIMIT, RECENT_LIMIT } from "../lib/store.js";
+import { LEGACY_STATE_VERSION, PENDING_LIMIT, RECENT_LIMIT, StateSchemaError, createStore } from "../lib/store.js";
 
 function tempDir(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-retention-"));
@@ -234,4 +234,58 @@ test("/remote vacuum: команда работает, --dry-run безопас�
 
   const again = await remote.handler(invoke("vacuum"));
   assert.match(again.text, /очистка не требуется/);
+});
+
+// --- 033 × 032: лимиты вместе с миграцией схемы ------------------------------
+
+test("миграция v1 → v2 применяет pendingLimit/recentLimit после бэкапа", (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "state.json");
+  const pending = Array.from({ length: 250 }, (_, index) => ({ shortId: `p-${index}` }));
+  const recent = Array.from({ length: 60 }, (_, index) => ({ id: `r-${index}` }));
+  fs.writeFileSync(file, JSON.stringify({ version: LEGACY_STATE_VERSION, pending, recent }));
+
+  const store = createStore({ file, pendingLimit: 3, recentLimit: 5 });
+  const state = store.read();
+  assert.equal(state.schemaVersion, 2, "миграция выполнена");
+  assert.equal(state.pending.length, 3, "pendingLimit соблюдён на мигрированном файле");
+  assert.deepEqual(state.pending.map((item) => item.shortId), ["p-247", "p-248", "p-249"]);
+  assert.equal(state.recent.length, 5, "recentLimit соблюдён");
+  assert.equal(store.schemaStatus().ok, true);
+  assert.ok(store.schemaStatus().backup, "бэкап до миграции есть");
+  assert.equal(fs.readFileSync(file, "utf8").includes('"p-249"'), true, "на диск ушли лимитированные данные");
+
+  // Идемпотентность: повторное чтение не плодит бэкапы и не ломает лимиты.
+  const backup = store.schemaStatus().backup;
+  const again = store.read();
+  assert.equal(again.pending.length, 3);
+  assert.equal(again.recent.length, 5);
+  assert.equal(store.schemaStatus().backup, backup, "второй миграции нет");
+
+  // Отказ схемы не обходится лимитами.
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 99, pending: [1, 2, 3] }));
+  const future = createStore({ file, pendingLimit: 1 });
+  const safe = future.read();
+  assert.equal(future.schemaStatus().ok, false);
+  assert.equal(safe.pending.length, 0, "будущий файл не читается как свой");
+  assert.throws(() => future.update((value) => value), StateSchemaError);
+  assert.equal(fs.readFileSync(file, "utf8"), JSON.stringify({ schemaVersion: 99, pending: [1, 2, 3] }), "файл не перезаписан");
+});
+
+test("vacuum: keep=NaN/отрицательный безопасен, bases не-массив не ломает", (t) => {
+  const dir = tempDir(t);
+  for (let index = 1; index <= 7; index += 1) fs.writeFileSync(path.join(dir, `audit.jsonl.${index}`), "x");
+  for (let index = 1; index <= 2; index += 1) fs.writeFileSync(path.join(dir, `log.jsonl.${index}`), "y");
+
+  const nan = vacuum(fs, { dir, keep: Number.NaN, dryRun: true });
+  assert.equal(nan.removed.length, 2, "NaN -> дефолт keep=5");
+
+  const negative = vacuum(fs, { dir, keep: -3, dryRun: true });
+  assert.equal(negative.removed.length, 2, "отрицательный -> дефолт keep=5");
+
+  const badBases = vacuum(fs, { dir, bases: "audit.jsonl", keep: 5, dryRun: true });
+  assert.equal(badBases.removed.length, 2, "не-массив bases -> дефолтные оба журнала");
+  assert.equal(badBases.kept.length, 7, "log в пределах keep");
+
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.1")), true, "dry-run ничего не тронул");
 });

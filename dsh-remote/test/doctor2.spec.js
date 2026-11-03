@@ -144,21 +144,42 @@ test("relay: ok (healthz), fail (нет связи), не настроен — �
   assert.equal(absent.find((check) => check.id === "relay").status, "ok");
 });
 
-test("schema: ok, warn (новее плагина), warn (не прочитана)", async (t) => {
+test("schema: ok, fail (новее плагина или отказ схемы), warn (не прочитана)", async (t) => {
   const fresh = tempStore(t);
-  const ok = await runHealthChecks({ store: fresh, supportedSchemaVersion: 1 });
+  const ok = await runHealthChecks({ store: fresh, supportedSchemaVersion: 2 });
   assert.equal(ok.find((check) => check.id === "schema").status, "ok");
 
+  // 032: файл из будущего — не warn, а fail: плагин не перезаписывает состояние.
   const newer = {
-    read: () => ({ version: 99 }),
+    read: () => ({ schemaVersion: 99 }),
   };
-  const warn = await runHealthChecks({ store: newer, supportedSchemaVersion: 1 });
-  const schemaWarn = warn.find((check) => check.id === "schema");
-  assert.equal(schemaWarn.status, "warn");
-  assert.match(schemaWarn.action, /обновите плагин/);
+  const future = await runHealthChecks({ store: newer, supportedSchemaVersion: 2 });
+  const schemaFail = future.find((check) => check.id === "schema");
+  assert.equal(schemaFail.status, "fail");
+  assert.match(schemaFail.action, /обновите плагин/);
+
+  // Отказ миграции/бэкапа приходит из schemaStatus и тоже обязан быть fail.
+  const refused = {
+    read: () => ({ schemaVersion: 2 }),
+    schemaStatus: () => ({
+      ok: false,
+      version: null,
+      supported: 2,
+      error: {
+        code: "future-version",
+        message: "state.json версии 9 новее плагина (поддерживается 2)",
+        instruction: "обновите плагин или восстановите state.json из state.json.bak-*",
+      },
+    }),
+  };
+  const refusedReport = await runHealthChecks({ store: refused, supportedSchemaVersion: 2 });
+  const refusedCheck = refusedReport.find((check) => check.id === "schema");
+  assert.equal(refusedCheck.status, "fail");
+  assert.match(refusedCheck.detail, /версии 9 новее/);
+  assert.match(refusedCheck.action, /bak-/);
 
   const broken = { read: () => { throw new Error("битый state"); } };
-  const unreadable = await runHealthChecks({ store: broken, supportedSchemaVersion: 1 });
+  const unreadable = await runHealthChecks({ store: broken, supportedSchemaVersion: 2 });
   assert.equal(unreadable.find((check) => check.id === "schema").status, "warn");
 });
 
