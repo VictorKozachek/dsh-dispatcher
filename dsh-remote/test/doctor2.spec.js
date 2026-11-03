@@ -286,3 +286,58 @@ test("/remote doctor: код возврата 2 при fail (нет секрет
   assert.ok(failed.length > 0);
   for (const check of failed) assert.ok(check.action);
 });
+
+// --- ревью 030: код в результате, relay-токен только при реле, legacy fail ---
+
+test("fromLegacyChecks: legacy fail без hint получает защитный action", () => {
+  const checks = fromLegacyChecks([{ level: "fail", title: "канал", detail: "нет" }]);
+  assert.equal(checks[0].status, "fail");
+  assert.equal(typeof checks[0].action, "string");
+  assert.match(checks[0].action, /\/remote doctor/);
+});
+
+test("Telegram-only установка: relay-токен не проверяется, exitCode 0", async (t) => {
+  const stand = harness(t);
+  const result = await stand.remote.handler(stand.invoke("doctor --json"));
+
+  const report = JSON.parse(result.text);
+  assert.equal(result.exitCode, 0, "здоровый Telegram-only не должен быть fail из-за relay-токена");
+  assert.equal(report.exitCode, 0);
+  assert.equal(report.checks.some((check) => check.id.includes("RELAY_TOKEN_REF")), false);
+  assert.equal(report.checks.some((check) => check.id.includes("DSH_REMOTE_RELAY_TOKEN")), false);
+});
+
+test("релей настроен без токена: credentials relay — fail с action, exitCode 2", async (t) => {
+  const { RELAY_TOKEN_REF } = await import("../lib/transport/relay.js");
+  const telegramOk = fakeCredentials();
+  const relayMissing = {
+    ...telegramOk,
+    describe: async (ref) => (ref === RELAY_TOKEN_REF
+      ? { present: false, configured: false, writable: false, source: null }
+      : { present: true, configured: true, writable: true, source: "file" }),
+  };
+  const stand = harness(t, { credentials: relayMissing });
+  stand.store.update((state) => {
+    state.bindings = { transport: "relay", url: "https://relay.test", createdAt: 1 };
+    return state;
+  });
+
+  const result = await stand.remote.handler(stand.invoke("doctor --json"));
+
+  const report = JSON.parse(result.text);
+  assert.equal(result.exitCode, 2);
+  const relayCredential = report.checks.find((check) => check.id === `credentials:${RELAY_TOKEN_REF}`);
+  assert.ok(relayCredential, "проверка relay-токена появилась");
+  assert.equal(relayCredential.status, "fail");
+  assert.ok(relayCredential.action);
+});
+
+test("человеческий вывод тоже несёт exitCode в результате", async (t) => {
+  const stand = harness(t);
+  const result = await stand.remote.handler(stand.invoke("doctor"));
+
+  assert.equal(result.kind, "success");
+  assert.equal(typeof result.exitCode, "number");
+  assert.ok([0, 1, 2].includes(result.exitCode));
+  assert.match(result.text, new RegExp(`код ${result.exitCode}`));
+});

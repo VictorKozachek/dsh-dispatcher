@@ -1042,21 +1042,27 @@ export function createRemoteCommands({
       ? { url: relayService.url, transport: relayService.transport }
       : live !== null && live.id === "relay"
         ? { url: store.read().bindings?.url, transport: live }
-        : null;
+        : store.read().bindings?.transport === "relay"
+          ? { url: store.read().bindings?.url, transport: null }
+          : null;
 
+    // Ссылку relay-токена проверяем только когда релей действительно настроен:
+    // на Telegram-only установке её отсутствие — норма, а не fail.
+    const tokenRefs = relay === null ? [TELEGRAM_TOKEN_REF] : [TELEGRAM_TOKEN_REF, RELAY_TOKEN_REF];
     const checks = await runHealthChecks({
       legacyChecks,
       credentials,
-      tokenRefs: [TELEGRAM_TOKEN_REF, RELAY_TOKEN_REF],
+      tokenRefs,
       relay,
       store,
       reliability: ctx?.get?.("remoteReliability") ?? null,
       supportedSchemaVersion: STATE_VERSION,
-      now,
     });
     const report = buildReport(checks);
-    if (flags?.has?.("json") === true) return success(serializeReport(report));
-    return success(formatHealthReport(report));
+    if (flags?.has?.("json") === true) {
+      return { ...success(serializeReport(report)), exitCode: report.exitCode };
+    }
+    return { ...success(formatHealthReport(report)), exitCode: report.exitCode };
   }
 
   async function disconnect(invocation) {

@@ -104,7 +104,8 @@ export function fromLegacyChecks(checks) {
     id: ids[check.title] ?? String(check.title ?? "legacy"),
     status: check.level,
     detail: `${check.title}: ${check.detail ?? ""}`,
-    ...(check.hint === undefined ? {} : { action: check.hint }),
+    // Legacy fail без hint не должен ломать модель: даём защитный action.
+    action: check.hint ?? (check.level === "fail" ? "проверьте пункт вручную: /remote doctor" : undefined),
   }));
 }
 
@@ -122,7 +123,6 @@ export async function runHealthChecks({
   store = null,
   reliability = null,
   supportedSchemaVersion = null,
-  now = () => Date.now(),
 } = {}) {
   const checks = [...fromLegacyChecks(legacyChecks)];
 
@@ -259,6 +259,5 @@ export async function runHealthChecks({
     }
   }
 
-  void now;
   return checks;
 }
