@@ -56,6 +56,7 @@ function createTransportFacade() {
     /** Маркер для фичи telegram (004): «я — фасад, положи транспорт внутрь». */
     __isTransportFacade: true,
     set(transport) {
+      const previous = current;
       // Сначала снимаем подписки со старого транспорта, потом подписываем на новый.
       for (const off of offs.values()) {
         try {
@@ -66,6 +67,15 @@ function createTransportFacade() {
       }
       offs.clear();
       current = transport ?? null;
+      // Прежний канал (state или config) останавливаем: два поллера одного бота
+      // получают 409 и мешают друг другу.
+      if (previous !== null && previous !== current) {
+        try {
+          void previous.stop?.();
+        } catch {
+          /* остановка не должна мешать подмене */
+        }
+      }
       for (const handler of subscribers) {
         offs.set(handler, current?.onAnswer?.(handler) ?? null);
       }
@@ -93,6 +103,14 @@ function createTransportFacade() {
     async stop() {
       const transport = current;
       current = null;
+      for (const off of offs.values()) {
+        try {
+          off?.();
+        } catch {
+          /* уже отписан */
+        }
+      }
+      offs.clear();
       await transport?.stop?.();
     },
     healthCheck: () => current?.healthCheck?.() ?? { ok: false, detail: "транспорт не поднят" },
@@ -136,6 +154,10 @@ async function ensureTransport(ctx, store, deps, facade, isDisposed = () => fals
 
   const credentials = createCredentialAccess(ctx, { log });
   const token = await credentials.resolve(TELEGRAM_TOKEN_REF);
+  if (token === null) {
+    // Секрет пропал/ротировался: старый канал с прежним токеном поллить не должен.
+    await facade.stop();
+  }
   if (isDisposed()) {
     // Плагин выгрузили, пока ждали секрет: поллинг после dispose не поднимаем.
     await facade.stop();

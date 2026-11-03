@@ -982,7 +982,7 @@ function makePluginCtx({ token = "111:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ser
     get: (name) => {
       if (name === "credentials") return { resolve: async () => ({ value: token, source: "file" }) };
       if (name === "sessionController") return null;
-      return services.get(name) ?? provided.get(name) ?? null;
+      return provided.get(name) ?? services.get(name) ?? null;
     },
     on: (event, handler, options) => {
       hooks.set(event, (hooks.get(event) ?? []).concat([{ handler, options }]));
@@ -1027,13 +1027,16 @@ test("фасад: dispose гасит запущенный канал и сним
   const live = facade.current;
   assert.equal(live?.polling, true, "канал запущен");
 
-  const seen = [];
-  facade.onAnswer((answer) => seen.push(answer));
-  assert.equal(typeof facade.onAnswer, "function");
-  await live.stop(); // снимаем поллинг, чтобы тест не ждал сеть
-  // Выгрузка плагина: наш dispose + фасадный.
+  let offCalls = 0;
+  const off = live.onAnswer(() => {});
+  assert.equal(typeof off, "function");
+  facade.onAnswer((answer) => void answer);
+  // Выгрузка плагина: фасадный dispose должен погасить поллинг и снять подписки.
   for (const dispose of [...disposers].reverse()) await dispose?.();
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(facade.current, null, "живого канала после dispose нет");
+  assert.equal(live.polling, false, "старый поллер остановлен");
+  off();
   void api;
 });
 
@@ -1156,4 +1159,151 @@ test("/remote test: подписка снимается по таймауту, �
 
   assert.equal(result.kind, "success", result.text);
   assert.equal(offCalls, 1, "подписка снята таймаутом, listener не утёк");
+});
+
+test("state+config на старте: один канал, старый поллер остановлен", async (t) => {
+  const { store } = withTempState(t);
+  store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = hangingTelegramFetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const configTransport = {
+    id: "telegram",
+    polling: false,
+    async start() { this.polling = true; },
+    async stop() { this.polling = false; },
+    async sendQuestion() { return { messageId: 1 }; },
+    onAnswer: () => () => {},
+    caps: {},
+  };
+  const services = new Map([["remoteTransport", configTransport]]);
+  const { ctx, provided } = makePluginCtx({ services });
+  const { deps } = fakeDeps();
+
+  await commandsFeature.apply(ctx, {}, deps);
+  const facade = provided.get("remoteTransport");
+  const stateTransport = facade.current;
+  assert.notEqual(stateTransport, configTransport, "сначала поднят канал из состояния");
+  assert.equal(stateTransport.polling, true);
+
+  await telegramFeature.apply(ctx, { telegram: { tokenRef: TELEGRAM_TOKEN_REF, chatId: 42, allowedUserIds: [7] } }, deps);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.notEqual(facade.current, stateTransport, "config-канал стал текущим");
+  assert.equal(facade.current.polling, true, "config-канал запущен");
+  assert.equal(stateTransport.polling, false, "старый state-поллер остановлен");
+  await facade.stop();
+});
+
+test("config-only: статус, on и test работают без привязки в состоянии", async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = hangingTelegramFetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  const sent = [];
+  const configTransport = {
+    id: "telegram",
+    polling: true,
+    async start() { this.polling = true; },
+    async stop() { this.polling = false; },
+    async sendQuestion(question) { sent.push(question); return { messageId: 1 }; },
+    async closeQuestion() {},
+    onAnswer: () => () => {},
+    caps: {},
+  };
+  const services = new Map([["remoteTransport", configTransport]]);
+  const { ctx, provided } = makePluginCtx({ services });
+  const { deps, disposers } = fakeDeps();
+
+  await commandsFeature.apply(ctx, {}, deps);
+  await telegramFeature.apply(ctx, { telegram: { tokenRef: TELEGRAM_TOKEN_REF, chatId: 42, allowedUserIds: [7] } }, deps);
+  const facade = provided.get("remoteTransport");
+  assert.notEqual(facade.current, null, "config-канал внутри фасада");
+  const stand = harness(t);
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    currentChannel: () => facade.current,
+  });
+
+  const status = await remote.handler(invoke("status"));
+  assert.equal(status.kind, "success");
+  assert.match(status.text, /канал/);
+
+  const on = await remote.handler(invoke("on --all"));
+  assert.equal(on.kind, "success", on.text);
+
+  const test = await remote.handler(invoke("test"));
+  assert.equal(test.kind, "success", test.text);
+
+  for (const dispose of [...disposers].reverse()) await dispose?.();
+  void provided;
+});
+
+test("токен пропал: живой канал останавливается", async (t) => {
+  const { store } = withTempState(t);
+  store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = hangingTelegramFetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let token = "111:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const provided = new Map();
+  const services = new Map();
+  const ctx = {
+    provide: (name, service) => provided.set(name, service),
+    get: (name) => (name === "credentials"
+      ? { resolve: async () => (token === null ? undefined : { value: token, source: "file" }) }
+      : services.get(name) ?? provided.get(name) ?? null),
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+    logger: () => ({ debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }),
+  };
+  const { deps } = fakeDeps();
+  const api = await commandsFeature.apply(ctx, {}, deps);
+  const facade = provided.get("remoteTransport");
+  const live = facade.current;
+  assert.equal(live.polling, true);
+
+  token = null;
+  const second = await api.ensureTransport();
+
+  assert.equal(second, null, "без секрета канал не поднимается");
+  assert.equal(facade.current, null, "и старый канал остановлен");
+  assert.equal(live.polling, false);
+});
+
+test("connect: start() -> false не выдаётся за поднятый канал", async (t) => {
+  const telegram = telegramFetch();
+  const stand = harness(t, { answers: CONNECT_ANSWERS, fetchImpl: telegram.fetch });
+  const started = [];
+  const transport = { id: "telegram", start: async () => { started.push("start"); return false; }, stop: async () => {} };
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    fetch: telegram.fetch,
+    random: () => CODE_RANDOM,
+    sleep: async () => {},
+    ensureTransport: async () => transport,
+    currentChannel: () => (started.length > 0 ? transport : null),
+  });
+
+  const result = await remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "success", result.text);
+  assert.match(result.text, /канал не поднят/);
+  assert.doesNotMatch(result.text, /канал поднят:/);
 });

@@ -362,8 +362,13 @@ export function createRemoteCommands({
       if (transport === null) transport = liveTransport();
       if (typeof transport?.start === "function") {
         try {
-          await transport.start();
-          channelNote = "канал поднят: вопросы уходят в мессенджер";
+          const started = await transport.start();
+          const live = liveTransport() ?? transport;
+          if (started === false || live === null) {
+            channelNote = "привязка сохранена, но канал не поднят: проверьте /remote status";
+          } else {
+            channelNote = "канал поднят: вопросы уходят в мессенджер";
+          }
         } catch (error) {
           log(`transport.start после привязки: ${humanError(error, token)}`);
           channelNote = "канал не поднялся — проверьте /remote status";
@@ -390,7 +395,7 @@ export function createRemoteCommands({
       // Включённый режим без канала = вопрос уходит в ответчик, который не может
       // его доставить, и сессия висит. Требуем привязку и живой канал.
       const state = store.read();
-      if (state.bindings === null) {
+      if (state.bindings === null && liveTransport() === null) {
         return failure("сначала привяжите бота: /remote connect");
       }
       if (typeof ensureTransport === "function") {
@@ -436,8 +441,11 @@ export function createRemoteCommands({
     const { sessionId, cwd } = sessionInfo(invocation);
     const lines = [];
 
-    if (state.bindings === null) {
+    if (state.bindings === null && liveTransport() === null) {
       lines.push("бот не привязан: /remote connect");
+    } else if (state.bindings === null) {
+      // Канал живёт из config профиля (004): привязки через /remote connect нет.
+      lines.push("бот не привязан через /remote connect; канал поднят из config профиля");
     } else {
       const created = Number.isFinite(state.bindings.createdAt)
         ? new Date(state.bindings.createdAt).toISOString()
@@ -464,7 +472,7 @@ export function createRemoteCommands({
   /** `/remote test` — отправить тестовый вопрос через живой транспорт. */
   async function testChannel(invocation) {
     const state = store.read();
-    if (state.bindings === null) return failure("бот не привязан: /remote connect");
+    if (state.bindings === null && liveTransport() === null) return failure("бот не привязан: /remote connect");
     const transport = liveTransport();
     if (transport === null || typeof transport.sendQuestion !== "function") {
       return failure("канал не поднят: /remote connect");
