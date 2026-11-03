@@ -124,7 +124,7 @@ test("каркас: имя плагина, пустой inject и фичи с к
   }
   // Порядок не косметика: транспорт поднимается первым, иначе ответчик с
   // `needs: [remoteTransport]` пропускается, не дождавшись сервиса.
-  assert.deepEqual(features.map((feature) => feature.name), ["telegram", "answerer"]);
+  assert.deepEqual(features.map((feature) => feature.name), ["telegram", "commands", "answerer"]);
 });
 
 test("apply поднимается на пустом ctx без сервисов и не бросает", async () => {
