@@ -182,9 +182,26 @@ export class RemoteApproval {
     return true;
   }
 
-  /** Снять подтверждение без решения (аборт запроса, выгрузка плагина). */
+  /** Сообщение доставлено: подтверждение открыто и ждёт кнопку. */
+  markOpen() {
+    if (this.status !== APPROVAL_STATUS.pending) return false;
+    this.status = APPROVAL_STATUS.open;
+    return true;
+  }
+
+  /**
+   * Снять подтверждение без решения (аборт запроса, выгрузка плагина).
+   *
+   * Решённое подтверждение не переигрывается: поздний аборт после ответа
+   * человека не должен подменять `allowed-once` на `cancelled` (иначе решение
+   * человека теряется, а действие не выполнится).
+   */
   cancel(reason = "cancelled", at = Date.now()) {
     if (this.status === APPROVAL_STATUS.cancelled) return false;
+    if (this.status === APPROVAL_STATUS.decided) {
+      this._log(`подтверждение ${this.shortId}: уже решено (${this.outcome}) — снятие игнорирую`);
+      return false;
+    }
     this.status = APPROVAL_STATUS.cancelled;
     this.outcome = APPROVAL_OUTCOME.cancelled;
     this.decidedAt = at;

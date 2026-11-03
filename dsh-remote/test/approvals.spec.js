@@ -20,15 +20,18 @@ const tick = async (times = 6) => {
 /** Транспорт-двойник: запоминает сообщения и умеет «нажать кнопку». */
 function fakeTransport({ failSend = false, id = "fake" } = {}) {
   const sent = [];
+  const sentOptions = [];
   const closed = [];
   const handlers = new Set();
   return {
     id,
     sent,
+    sentOptions,
     closed,
-    async sendQuestion(question) {
+    async sendQuestion(question, options) {
       if (failSend) throw new Error("транспорт недоступен");
       sent.push(question);
+      sentOptions.push(options ?? null);
       return { messageId: `m-${sent.length}` };
     },
     async closeQuestion(question, summary) {
@@ -259,6 +262,82 @@ test("два канала: первый доставил, второй отве�
   assert.equal(first.closed.length, 1, "проигравший канал тоже закрыт — кнопки не остаются");
 });
 
+test("каналы проектов (015): у каждого транспорта свой chatId", async () => {
+  const telegram = fakeTransport({ id: "telegram" });
+  const max = fakeTransport({ id: "max" });
+  const approvals = createApprovals({
+    transports: [telegram, max],
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    channelOf: (workspace, transportId) => (
+      transportId === "telegram" ? { chatId: "-100-telegram", threadId: 7 } : { chatId: "-200-max", threadId: null }
+    ),
+    log: () => {},
+  });
+  approvals.attach(fakeContext());
+  const next = async () => "gui";
+
+  const pendingOutcome = approvals.handler(request(), next);
+  await tick();
+  assert.equal(telegram.sentOptions[0].chatId, "-100-telegram");
+  assert.equal(telegram.sentOptions[0].threadId, 7);
+  assert.equal(max.sentOptions[0].chatId, "-200-max");
+  assert.notEqual(max.sentOptions[0].chatId, "-100-telegram", "телеграм-чат не должен уехать в MAX");
+
+  max.answer({ shortId: max.sent[0].shortId, optionIds: ["o2"] });
+  assert.equal(await pendingOutcome, "rejected");
+});
+
+test("после доставки подтверждение открыто (status=open)", async () => {
+  const { approvals, transport, next } = setup();
+
+  const pendingOutcome = approvals.handler(request(), next);
+  await tick();
+  assert.equal(transport.sent[0].status, "open", "доставленное подтверждение ждёт кнопку");
+  transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
+  await pendingOutcome;
+});
+
+test("подтверждения транзиентны: после снятия плагина не восстанавливаются", async () => {
+  const { approvals, transport, next } = setup();
+  const pendingOutcome = approvals.handler(request(), next);
+  await tick();
+  assert.equal(approvals.pending.size, 1);
+
+  approvals.dispose("detached");
+  assert.equal(await pendingOutcome, "cancelled");
+  assert.equal(approvals.pending.size, 0, "открытых подтверждений не осталось");
+  assert.equal(approvals.stats.cancelled, 1, "снятие по dispose учтено в статистике");
+
+  // Новый экземпляр (как после рестарта плагина) не знает про старый shortId:
+  // позднее нажатие не решает ничего и не бросает.
+  const restarted = createApprovals({ transport, registry: { resolve: () => ({ enabled: true }) }, log: () => {} });
+  restarted.attach(fakeContext());
+  assert.equal(restarted.pending.size, 0, "после рестарта очередь подтверждений пуста");
+  restarted.handler; // экземпляр рабочий
+  transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
+  await tick();
+});
+
+test("результат deliver give-up/aborted — «не доставили», next() в GUI", async () => {
+  for (const result of ["give-up", "aborted", false]) {
+    const transport = fakeTransport();
+    const approvals = createApprovals({
+      transport,
+      registry: { resolve: () => ({ enabled: true }) },
+      deliver: async () => result,
+      log: () => {},
+    });
+    approvals.attach(fakeContext());
+    const nextCalls = [];
+    const outcome = await approvals.handler(request(), async () => {
+      nextCalls.push(true);
+      return "gui";
+    });
+    assert.equal(outcome, "gui", `deliver=${result} должен отдать GUI`);
+    assert.equal(nextCalls.length, 1);
+  }
+});
+
 test("неизвестная кнопка не решает подтверждение", async () => {
   const { approvals, transport, next } = setup();
 
@@ -308,6 +387,8 @@ test("модель подтверждения: kind=approval и исходы и�
   assert.equal(approval.decide("allowed-always"), false, "исход вне словаря отвергается");
   assert.equal(approval.decide(APPROVAL_OUTCOME.allowedOnce), true);
   assert.equal(approval.decide(APPROVAL_OUTCOME.rejected), false, "повтор не переигрывает решение");
+  assert.equal(approval.cancel("поздний аборт"), false, "решение человека не отменяется абортом");
+  assert.equal(approval.outcome, APPROVAL_OUTCOME.allowedOnce);
 });
 
 test("фича approvals подключена в реестр фич", () => {

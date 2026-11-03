@@ -120,20 +120,33 @@ export function createApprovals({
     ...(approval.threadId === null || approval.threadId === undefined ? {} : { threadId: approval.threadId }),
   });
 
-  /** Доставить подтверждение: один канал — прежний путь, несколько — брокер (012). */
+  /**
+   * Доставить подтверждение: один канал — прямой путь, несколько — брокер (012).
+   *
+   * Каналы проекта (015) считаются **на каждый транспорт**: `channelFor`
+   * пересчитывается по id транспорта в брокере, иначе телеграм-чата уехал бы в
+   * MAX. `deliver` (008) получает те же адреса, что и прямой `sendQuestion`.
+   *
+   * Reliability (008) в подтверждения намеренно не подключаем: решение
+   * одноразовое и срочное, повторная отправка спутала бы человека вторым
+   * сообщением. Поэтому `deliver` — только если его передал вызывающий, а
+   * результат (`give-up`/`aborted`/`false`) трактуется как «не доставили».
+   */
   async function publish(approval, signal) {
     if (useBroker) {
       const publication = await broker.publish(approval, {
         signal,
         chatId: approval.chatId ?? undefined,
         threadId: approval.threadId ?? undefined,
+        channelFor: (transportId) => channelFor(approval.workspace, transportId),
       });
       return { anyDelivered: publication.anyDelivered, winner: publication.delivered[0] ?? null };
     }
-    if (typeof deliver === "function") {
-      await deliver({ question: approval, signal, ...sendOptionsFor(approval) });
-    } else {
-      await primary.sendQuestion(approval, sendOptionsFor(approval));
+    const outcome = typeof deliver === "function"
+      ? await deliver({ question: approval, signal, ...sendOptionsFor(approval) })
+      : await primary.sendQuestion(approval, sendOptionsFor(approval));
+    if (outcome === "give-up" || outcome === "aborted" || outcome === false) {
+      return { anyDelivered: false, reason: String(outcome) };
     }
     return { anyDelivered: true, winner: primary };
   }
@@ -303,6 +316,7 @@ export function createApprovals({
           return;
         }
         entry.delivered = true;
+        approval.markOpen();
         stats.claimed += 1;
         // Аборт мог выиграть гонку, пока сообщение доставлялось: снимаем его сразу,
         // чтобы у человека не осталась живая кнопка на уже снятый запрос.
@@ -371,7 +385,8 @@ export function createApprovals({
   function dispose(reason = "disposed") {
     disposed = true;
     for (const entry of [...pending.values()]) {
-      entry.approval.cancel(reason, now());
+      if (!entry.approval.cancel(reason, now())) continue;
+      stats.cancelled += 1;
       void closeMessage(entry.approval, outcomeSummary(APPROVAL_OUTCOME.cancelled));
       settle(entry, APPROVAL_OUTCOME.cancelled);
     }
