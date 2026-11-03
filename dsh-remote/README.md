@@ -20,5 +20,14 @@ waterfall `user-questions/request`.
 `~/.dsh/remote-control/state.json` (атомарно, chmod 600) и `log.jsonl` без
 секретов; токены мессенджеров — только через `ctx.credentials`, в git их нет.
 
+Поставить в профиль: `bin/install-remote.sh --dry-run` (план), затем
+`bin/install-remote.sh` (профиль `web` или `--profile desktop`). Скрипт
+идемпотентен и отказывается ставить пакет, если в профиле остался ручной ряд
+`ui-remote` — иначе плагин смонтируется дважды.
+
+Диагностика: `/remote doctor` — список пунктов `ok/warn/fail` с подсказками
+(токен и его источник, `getMe`, конфликт поллеров по lock, последняя ошибка
+канала, состояние и права `state.json`, версия плагина).
+
 Тесты: `node --test dsh-remote/test`; на Node ≥ 22 надёжнее
 `node --test dsh-remote/test/*.spec.js`.
