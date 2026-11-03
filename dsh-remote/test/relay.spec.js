@@ -39,6 +39,8 @@ const VALID = {
   "health.response.json": "Health",
   "error.response.json": "Error",
   "pairing.response.json": "PairingCodeResponse",
+  "question.query.json": "QuestionQuery",
+  "answer.query.json": "AnswerQuery",
 };
 
 test("схема релея: загружается, версия 1, все $ref разрешаются", () => {
@@ -243,8 +245,9 @@ test("каждая схема из paths покрыта хотя бы одним
   const covered = new Set(Object.values(VALID));
   for (const [endpoint, methods] of Object.entries(schema.paths)) {
     for (const [method, contract] of Object.entries(methods)) {
-      for (const ref of [contract.request, contract.response]) {
-        if (ref === null) continue;
+      // Покрываем и query-схемы long-poll/курсоров: у них тоже должен быть пример.
+      for (const ref of [contract.request, contract.response, contract.query]) {
+        if (ref === null || ref === undefined) continue;
         const name = ref.split("/").pop();
         assert.ok(covered.has(name), `${method.toUpperCase()} ${endpoint}: для ${name} нет примера`);
       }
@@ -319,4 +322,25 @@ test("long-poll и курсоры описаны схемой и докумен�
 
   const pairing = validate(schema.components.schemas.PairingCodeResponse, readJson("pairing.response.json"), { root: schema });
   assert.equal(pairing.ok, true, pairing.errors.join("; "));
+
+  // Примеры query-схем и аддитивных полей ответов (023).
+  for (const [file, schemaName] of [
+    ["question.query.json", "QuestionQuery"],
+    ["answer.query.json", "AnswerQuery"],
+  ]) {
+    const result = validate(schema.components.schemas[schemaName], readJson(file), { root: schema });
+    assert.equal(result.ok, true, `${file}: ${result.errors.join("; ")}`);
+  }
+  assert.equal(query.required, undefined, "QuestionQuery: все параметры необязательны");
+  assert.deepEqual(schema.components.schemas.AnswerQuery.required, ["questionId"], "без questionId — 400");
+
+  const missingQuestion = validate(schema.components.schemas.AnswerQuery, { wait: 5 }, { root: schema });
+  assert.equal(missingQuestion.ok, false, "AnswerQuery без questionId невалиден");
+
+  const listed = readJson("questions.list.response.json");
+  assert.ok("nextId" in listed, "в примере списка есть nextId");
+  const health = readJson("health.response.json");
+  for (const counter of ["devices", "questions", "answers"]) {
+    assert.equal(typeof health[counter], "number", `в примере health есть ${counter}`);
+  }
 });

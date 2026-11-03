@@ -1,5 +1,8 @@
 {
   "ok": true,
   "version": "1.0.0",
-  "at": "2026-11-03T18:00:00Z"
+  "at": "2026-11-03T18:00:00Z",
+  "devices": 1,
+  "questions": 2,
+  "answers": 3
 }

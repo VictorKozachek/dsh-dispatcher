@@ -823,7 +823,7 @@
         }
       },
       "AnswerQuery": {
-        "description": "Query-параметры GET /v1/answers (все необязательные).",
+        "description": "Query-параметры GET /v1/answers: questionId обязателен, wait необязателен.",
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -837,7 +837,10 @@
             "minimum": 0,
             "maximum": 25
           }
-        }
+        },
+        "required": [
+          "questionId"
+        ]
       }
     }
   }
