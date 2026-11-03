@@ -353,3 +353,103 @@ test("onAnswer: подписка и отписка, повтор ответа н
   off();
   assert.throws(() => transport.onAnswer("не функция"), TypeError);
 });
+
+test("после переподключения WS long-poll останавливается и снова включается на close", async () => {
+  const sockets = [];
+  class FakeSocket {
+    constructor(url, headers) {
+      this.url = url;
+      this.headers = headers;
+      this.listeners = new Map();
+      sockets.push(this);
+    }
+
+    addEventListener(name, handler) {
+      const list = this.listeners.get(name) ?? [];
+      list.push(handler);
+      this.listeners.set(name, list);
+    }
+
+    emit(name, event) {
+      for (const handler of this.listeners.get(name) ?? []) handler(event);
+    }
+
+    close() {
+      this.emit("close", {});
+    }
+  }
+
+  const timers = [];
+  let answersCalls = 0;
+  const fetchImpl = async (url, init = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/v1/answers") {
+      answersCalls += 1;
+      return new Promise((resolve, reject) => {
+        const signal = init.signal;
+        const fail = () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        if (signal?.aborted) return fail();
+        signal?.addEventListener?.("abort", fail, { once: true });
+        setTimeout(() => {
+          resolve({
+            ok: false,
+            status: 404,
+            async text() {
+              return JSON.stringify({ error: { code: "not-found", message: "нет ответа" } });
+            },
+          });
+        }, 0);
+      });
+    }
+    if (parsed.pathname === "/healthz") {
+      return { ok: true, status: 200, async text() { return JSON.stringify({ ok: true, version: "0.1.0" }); } };
+    }
+    return { ok: true, status: 201, async text() { return JSON.stringify({ id: QUESTION_ID }); } };
+  };
+
+  const transport = createRelayTransport({
+    url: URL_BASE,
+    agentToken: TOKEN,
+    fetch: fetchImpl,
+    wsFactory: (url, headers) => new FakeSocket(url, headers),
+    setTimeout: (callback) => {
+      timers.push(callback);
+      return timers.length;
+    },
+    clearTimeout: () => {},
+    sleep: async () => {
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+    jitter: () => 0,
+    log: () => {},
+  });
+
+  await transport.start();
+  await transport.sendQuestion(question());
+  sockets[0].emit("open", {});
+  await tick(4);
+  const baseline = answersCalls;
+
+  // Разрыв: включается long-poll.
+  sockets[0].emit("close", {});
+  await tick(6);
+  assert.ok(answersCalls > baseline, `long-poll пошёл после close (${baseline} -> ${answersCalls})`);
+
+  // Переподключение и open: long-poll обязан остановиться.
+  timers.at(-1)();
+  assert.equal(sockets.length, 2, "новый WS после backoff");
+  const afterClose = answersCalls;
+  sockets[1].emit("open", {});
+  await tick(8);
+  assert.equal(answersCalls, afterClose, "после open новых GET /v1/answers нет");
+
+  // Следующий разрыв снова включает long-poll.
+  sockets[1].emit("close", {});
+  await tick(6);
+  assert.ok(answersCalls > afterClose, "после нового close long-poll снова идёт");
+  await transport.stop();
+});

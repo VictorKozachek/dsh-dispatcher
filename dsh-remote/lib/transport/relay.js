@@ -303,6 +303,8 @@ export function createRelayTransport({
     wsAbort = new AbortController();
     socket.addEventListener("open", () => {
       attempts = 0;
+      // WS снова живой: long-poll больше не нужен, иначе запросы дублируются.
+      stopPolling();
       safeLog("relay: WS подключён");
     });
     socket.addEventListener("message", (event) => {
@@ -371,6 +373,15 @@ export function createRelayTransport({
     });
   }
 
+  /** Остановить long-poll: он нужен только пока WebSocket не подключён. */
+  function stopPolling() {
+    if (pollAbort !== null) {
+      pollAbort.abort();
+      pollAbort = null;
+    }
+    pollLoop = null;
+  }
+
   const transport = {
     id: "relay",
     caps,
@@ -393,9 +404,7 @@ export function createRelayTransport({
         clearTimeoutImpl(reconnectTimer);
         reconnectTimer = null;
       }
-      pollAbort?.abort();
-      pollAbort = null;
-      pollLoop = null;
+      stopPolling();
       try {
         ws?.close?.();
       } catch {
