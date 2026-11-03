@@ -1,0 +1,49 @@
+/**
+ * Фича «ответчик»: вопрос человека уходит в транспорт мессенджера.
+ *
+ * Подключается к каркасу одной строкой в `lib/features.js`. Транспорта пока нет
+ * (его объявит задача 003), поэтому фича заявляет его в `needs`: каркас пропустит
+ * её с предупреждением, и вопрос спокойно уйдёт в GUI — поведение DSH не меняется.
+ *
+ * Состояние режима (`~/.dsh/remote-control/state.json`) появится в задаче 005;
+ * пока источник пустой, значит режим выключен, и это тот же безопасный путь.
+ */
+
+import { createAnswerer } from "../answerer.js";
+import { createRegistry } from "../domain/registry.js";
+
+/** Имя сервиса транспорта: его объявит задача 003 (`dsh-remote/lib/transport`). */
+export const TRANSPORT_SERVICE = "remoteTransport";
+
+/** Имя сервиса состояния: его объявляет фича commands (005). */
+export const STATE_SERVICE = "remoteStore";
+
+export const answererFeature = {
+  name: "answerer",
+  needs: [TRANSPORT_SERVICE],
+  apply(ctx, config, deps) {
+    // Состояние — сервис `remoteStore` (005). Без него режим считаем выключенным:
+    // лучше отдать вопрос в GUI, чем увести его в мессенджер «на всякий случай».
+    const store = deps.get(STATE_SERVICE);
+    const registry = createRegistry({
+      readState: () => {
+        try {
+          const state = typeof store?.read === "function" ? store.read() : null;
+          return state?.enabled ?? {};
+        } catch (error) {
+          deps.logger.warn(`answerer: состояние не прочитано (${error?.message ?? error})`);
+          return {};
+        }
+      },
+      log: (message) => deps.logger.debug(message),
+    });
+
+    const answerer = createAnswerer({
+      transport: deps.get(TRANSPORT_SERVICE),
+      registry,
+      log: (message) => deps.logger.debug(message),
+    });
+
+    deps.onDispose(answerer.attach(ctx));
+  },
+};

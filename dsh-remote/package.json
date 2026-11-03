@@ -1,0 +1,29 @@
+{
+  "name": "dsh-remote",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Удалённое управление вопросами агента DSH: вопрос уходит в мессенджер, ответ возвращается в ту же сессию",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.spec.js"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "license": "MIT"
+}
