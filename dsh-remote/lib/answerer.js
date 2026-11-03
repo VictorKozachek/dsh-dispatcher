@@ -31,6 +31,8 @@
  * прислать один `optionId` или `custom` вместо `text`, не ломая ответчик.
  */
 
+import { randomUUID } from "node:crypto";
+
 import { ANSWERED_ELSEWHERE, createBroker } from "./broker.js";
 import { createQuestion } from "./domain/question.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, resolveContext } from "./present.js";
@@ -181,14 +183,15 @@ export function createAnswerer({
     if (controller === null || controller === undefined || typeof controller.prompt !== "function") {
       throw new Error("sessionController недоступен");
     }
-    // Контракт DSH: prompt(request, signal); requestId обязателен, иначе ответ
-    // не привяжется к запросу (см. 008 applyLateAnswer).
+    // Контракт DSH: prompt(request, signal); requestId — новый uuid, signal —
+    // свежий контроллер (сигнал исходного запроса после next() уже может быть
+    // aborted, как в 008 applyLateAnswer).
     await controller.prompt({
-      requestId: question.questionId ?? question.shortId,
+      requestId: randomUUID(),
       sessionId: question.sessionId,
       mode: "steer",
       content: [{ type: "text", text: body }],
-    }, signal);
+    }, new AbortController().signal);
   }
   /**
    * Каналы (012): один транспорт — прежний путь, несколько — брокер с гонкой.
@@ -563,7 +566,8 @@ export function createAnswerer({
           }
           if (guiRequested) return; // next() уже звали
           waitingEntry.hybridGui = true;
-          stats.hybridHanded += 1;
+          // Метрика — по числу вопросов, отданных в GUI, а не по числу таймеров.
+          stats.hybridHanded += stillOpen.length;
           for (const item of stillOpen) {
             const itemEntry = pending.get(item.shortId);
             if (itemEntry !== undefined) itemEntry.hybridGui = true;

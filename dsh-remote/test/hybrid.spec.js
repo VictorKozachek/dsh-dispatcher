@@ -335,9 +335,11 @@ test("late-steer вызывает prompt(request, signal) по контракт�
   assert.equal(prompts.length, 1);
   const { request, signal } = prompts[0];
   assert.equal(request.mode, "steer");
-  assert.ok(typeof request.requestId === "string" && request.requestId !== "", "requestId обязателен");
+  assert.match(request.requestId, /^[0-9a-f-]{36}$/, "requestId — новый uuid, как в 008");
   assert.equal(request.sessionId, SESSION_ID);
-  assert.equal(signal, controller.signal, "сигнал запроса прокинут вторым аргументом");
+  // Свежий сигнал: исходный request.signal после next() может быть aborted.
+  assert.ok(signal instanceof AbortSignal, "второй аргумент — AbortSignal");
+  assert.equal(signal.aborted, false, "новый сигнал не отменён");
   assert.match(request.content[0].text, /из мессенджера/);
 });
 
