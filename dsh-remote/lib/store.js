@@ -50,6 +50,8 @@ export function defaultState() {
     enabled: { global: false, workspaces: {}, sessions: {} },
     recent: [],
     pending: [],
+    /** 014: дедуп уведомлений доски: что уже отправлено и сколько было todo. */
+    notify: { seen: [], lastTodo: {}, baseline: false },
   };
 }
 
@@ -411,6 +413,13 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
     },
     recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
     pending: Array.isArray(value.pending) ? value.pending : [],
+    notify: {
+      seen: Array.isArray(value.notify?.seen) ? value.notify.seen.filter((key) => typeof key === "string").slice(-500) : [],
+      lastTodo: value.notify?.lastTodo !== null && typeof value.notify?.lastTodo === "object"
+        ? { ...value.notify.lastTodo }
+        : {},
+      baseline: value.notify?.baseline === true,
+    },
   };
 }
 
