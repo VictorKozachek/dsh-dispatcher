@@ -80,6 +80,20 @@ export const approvalsFeature = {
       policy,
       ttlMs: policy.ttlMs,
       onTimeout: () => policy.timeoutOutcome(),
+      // 026: аудит удалённых решений. Пока сервиса нет — структурированная
+      // строка в лог, чтобы факт «отдано GUI по политике» не терялся.
+      onDecision: (record) => {
+        const audit = deps.get("remoteAudit") ?? ctx?.get?.("remoteAudit") ?? null;
+        if (typeof audit?.record === "function") {
+          try {
+            audit.record(record);
+            return;
+          } catch (error) {
+            deps.logger.warn(`approvals: аудит решения не записан (${error?.message ?? error})`);
+          }
+        }
+        deps.logger.info(`approvals: ${JSON.stringify(record)}`);
+      },
       log: (message) => deps.logger.debug(message),
     });
 

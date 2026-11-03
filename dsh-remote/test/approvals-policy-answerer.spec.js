@@ -295,3 +295,112 @@ test("фича approvals публикует политику для /remote stat
   transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
   assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
 });
+
+// --- дефолты и аудит (ревью 025) -------------------------------------------
+
+test("createApprovals без policy безопасен по умолчанию: Bash -> GUI, read_file -> канал", async () => {
+  const transport = fakeTransport();
+  const approvals = createApprovals({
+    transport,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    log: () => {},
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const handler = ctx.subscriptions[0].handler;
+  const nextCalls = [];
+  const next = async () => {
+    nextCalls.push(true);
+    return "gui";
+  };
+
+  assert.equal(await handler(request({ toolName: "Bash" }), next), "gui");
+  assert.equal(transport.sent.length, 0, "опасный инструмент не ушёл в канал");
+  assert.equal(nextCalls.length, 1);
+
+  const pending = handler(request({ toolName: "read_file" }), next);
+  await tick();
+  assert.equal(transport.sent.length, 1, "чтение разрешено дефолтом");
+  transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+});
+
+test("решение политики отдаётся аудиту (026) через onDecision", async () => {
+  const transport = fakeTransport();
+  const records = [];
+  const approvals = createApprovals({
+    transport,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    policy: createApprovalPolicy(null),
+    onDecision: (record) => records.push(record),
+    now: () => 1_700_000_000_000,
+    log: () => {},
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const handler = ctx.subscriptions[0].handler;
+
+  assert.equal(await handler(request({ toolName: "bash" }), async () => "gui"), "gui");
+
+  assert.equal(records.length, 1);
+  assert.deepEqual(records[0], {
+    type: "approval-policy",
+    decision: "gui",
+    toolName: "bash",
+    reason: "deny-remote",
+    at: 1_700_000_000_000,
+    sessionId: "session-1",
+  });
+  assert.equal(transport.sent.length, 0);
+});
+
+test("фича approvals передаёт решение политики в remoteAudit, если сервис есть", async () => {
+  const transport = fakeTransport();
+  const ctx = fakeContext();
+  const records = [];
+  const provided = new Map();
+  ctx.provide = (name, service) => provided.set(name, service);
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => {
+      if (name === "remoteTransport") return transport;
+      if (name === "remoteStore") {
+        return { read: () => ({ enabled: { global: true, workspaces: {}, sessions: {} }, bindings: null, channels: {} }) };
+      }
+      if (name === "remoteAudit") return { record: (record) => records.push(record) };
+      return null;
+    },
+    onDispose: (fn) => ctx.onDispose(fn),
+  };
+  approvalsFeature.apply(ctx, { approvals: { tools: ["read_file"] } }, deps);
+
+  const handler = ctx.subscriptions.find((item) => item.name === APPROVAL_REQUEST_EVENT)?.handler;
+  assert.equal(await handler(request({ toolName: "bash" }), async () => "gui"), "gui");
+  assert.equal(records.length, 1);
+  assert.equal(records[0].reason, "deny-remote");
+  assert.equal(records[0].toolName, "bash");
+});
+
+test("таймаут unavailable: исход модели — unavailable, не cancelled", async () => {
+  const timers = fakeTimers();
+  const transport = fakeTransport();
+  const approvals = createApprovals({
+    transport,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    policy: createApprovalPolicy({ onTimeout: "unavailable" }),
+    ttlMs: 60_000,
+    onTimeout: () => "unavailable",
+    now: () => 1_700_000_000_000,
+    log: () => {},
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const pending = ctx.subscriptions[0].handler(request(), async () => "gui");
+  await tick();
+  timers.fire();
+
+  assert.equal(await pending, APPROVAL_OUTCOME.unavailable);
+  assert.equal(transport.sent[0].outcome, APPROVAL_OUTCOME.unavailable, "модель не врёт про cancelled");
+});

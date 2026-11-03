@@ -28,9 +28,14 @@ test("по умолчанию безопасные инструменты уда
   assert.equal(policy.onTimeout, "cancelled");
   assert.equal(policy.ttlMs, DEFAULT_TTL_MS);
 
-  for (const toolName of ["read_file", "write_file", "edit_file", "list_files"]) {
+  // По умолчанию — только чтение: политика не видит путь и не может доказать,
+  // что запись идёт «в свой воркспейс».
+  for (const toolName of ["read_file", "list_files", "glob", "grep"]) {
     assert.equal(decide(policy, { toolName }).remote, true, `${toolName} можно`);
     assert.equal(decide(policy, { toolName }).reason, "allowed");
+  }
+  for (const toolName of ["write_file", "edit_file", "apply_patch", "create_file"]) {
+    assert.equal(decide(policy, { toolName }).remote, false, `${toolName} по умолчанию нельзя`);
   }
   for (const toolName of DANGEROUS) {
     const decision = decide(policy, { toolName });
@@ -91,6 +96,7 @@ test("битый конфиг не расширяет права: дефолты
 
   assert.deepEqual(policy.tools, [...DEFAULT_TOOLS], "не-массив → дефолт");
   assert.deepEqual(policy.denyRemote, [...DEFAULT_DENY_REMOTE], "мусор в denyRemote → дефолт");
+  assert.deepEqual(normalizePolicy({ tools: ["read_file", 123] }).tools, [...DEFAULT_TOOLS], "смешанный массив → дефолт, а не усечённый список");
   assert.equal(policy.onTimeout, "cancelled");
   assert.equal(policy.ttlMs, DEFAULT_TTL_MS);
 

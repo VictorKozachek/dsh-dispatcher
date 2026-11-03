@@ -27,6 +27,7 @@
  */
 
 import { createBroker } from "./broker.js";
+import { createApprovalPolicy } from "./approvals/policy.js";
 import {
   APPROVAL_OUTCOME,
   RemoteApproval,
@@ -64,13 +65,42 @@ export function createApprovals({
   deliver = null,
   deliverFor = null,
   channelOf = null,
-  /** Политика подтверждений (025): решает, можно ли спрашивать удалённо. */
+  /** Политика подтверждений (025); без неё действует безопасная по умолчанию. */
   policy = null,
+  /** Колбэк аудита решений политики (026): {type, toolName, reason, at}. */
+  onDecision = null,
   /** Исход по таймауту: `cancelled` (по умолчанию) или `unavailable`; никогда `allowed-once`. */
   onTimeout = null,
   setTimeout: setTimeoutImpl = setTimeout,
   clearTimeout: clearTimeoutImpl = clearTimeout,
 } = {}) {
+  // 025: «по умолчанию безопасно» живёт в самом ответчике, а не только в фиче —
+  // иначе прямой вызов createApprovals (тесты, будущие вызывающие) спрашивал бы
+  // удалённо любой инструмент.
+  const activePolicy = policy !== null && typeof policy?.decide === "function"
+    ? policy
+    : createApprovalPolicy(null);
+
+  /** Записать решение политики: сначала аудит (026), потом лог. */
+  function recordPolicyDecision(request, toolName, resolution) {
+    const record = {
+      type: "approval-policy",
+      decision: "gui",
+      toolName,
+      reason: resolution.reason,
+      at: now(),
+      sessionId: typeof request?.agent?.id === "string" ? request.agent.id : null,
+    };
+    if (typeof onDecision === "function") {
+      try {
+        onDecision(record);
+      } catch (error) {
+        log(`подтверждение ${toolName}: аудит решения политики упал (${error?.message ?? error})`);
+      }
+    }
+    return record;
+  }
+
   /** Исход таймаута: только отказ (025). */
   function timeoutOutcome() {
     const value = typeof onTimeout === "function" ? onTimeout() : onTimeout;
@@ -266,10 +296,11 @@ export function createApprovals({
     }
     // 025: политика решает ДО отправки в канал. Неизвестный инструмент,
     // denyRemote или не-allowlist — сразу GUI, без кнопок в мессенджере.
-    if (policy !== null && typeof policy?.decide === "function") {
-      const resolution = policy.decide(request);
+    {
+      const resolution = activePolicy.decide(request);
       if (resolution.remote !== true) {
-        log(`подтверждение ${toolName}: отдано GUI по политике (${resolution.reason}: ${resolution.message})`);
+        const record = recordPolicyDecision(request, toolName, resolution);
+        log(`подтверждение ${toolName}: отдано GUI по политике (${resolution.reason}: ${resolution.message}; audit ${record.type})`);
         return next();
       }
     }
@@ -307,7 +338,7 @@ export function createApprovals({
         const outcomeOnTimeout = timeoutOutcome();
         entry.timer = setTimeoutImpl(() => {
           if (entry.settled) return;
-          approval.cancel("timeout", now());
+          approval.cancel("timeout", now(), outcomeOnTimeout);
           if (entry.delivered) {
             void closeMessage(approval, outcomeSummary(outcomeOnTimeout));
           }
