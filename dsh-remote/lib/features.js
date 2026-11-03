@@ -28,6 +28,7 @@
  */
 import { telegramFeature } from "./features/telegram.js";
 import { commandsFeature } from "./features/commands.js";
+import { maxFeature } from "./features/max.js";
 import { answererFeature } from "./features/answerer.js";
 import { panelFeature } from "./features/panel.js";
 
@@ -35,6 +36,7 @@ import { panelFeature } from "./features/panel.js";
 // кладёт транспорт в фасад (config-путь), answerer подписывается последним.
 export const features = [
   commandsFeature,
+  maxFeature,
   telegramFeature,
   answererFeature,
   panelFeature,

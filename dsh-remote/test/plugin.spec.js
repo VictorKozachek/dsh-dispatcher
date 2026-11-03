@@ -128,7 +128,7 @@ test("каркас: имя плагина, пустой inject и фичи с к
   // фасад, answerer подписывается на questions последним, panel (009) — рядом с ним.
   assert.deepEqual(
     features.map((feature) => feature.name),
-    ["commands", "telegram", "answerer", "panel"],
+    ["commands", "max", "telegram", "answerer", "panel"],
   );
 });
 
