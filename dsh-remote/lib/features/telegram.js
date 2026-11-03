@@ -14,6 +14,26 @@ import { createTelegramTransport } from "../transport/telegram.js";
 import { createCredentialAccess } from "../store.js";
 
 /** Имя сервиса транспорта в контексте плагина. */
+/** 015: чаты проектов из состояния — их тоже принимаем (allowlist). */
+function projectChatIds(deps) {
+  try {
+    const state = deps.get("remoteStore")?.read?.() ?? null;
+    const channels = state?.channels ?? {};
+    // 015: канал проекта хранится по транспортам: {project: {telegram: {chatId}, ...}}.
+    const ids = [];
+    for (const perTransport of Object.values(channels)) {
+      if (perTransport === null || typeof perTransport !== "object") continue;
+      for (const channel of Object.values(perTransport)) {
+        const chatId = channel?.chatId;
+        if (chatId !== undefined && chatId !== null && chatId !== "") ids.push(chatId);
+      }
+    }
+    return ids;
+  } catch {
+    return [];
+  }
+}
+
 export const TRANSPORT_SERVICE = "remoteTransport";
 
 /**
@@ -70,6 +90,7 @@ export const telegramFeature = {
         token,
         chatId: settings.chatId,
         allowedUserIds: Array.isArray(settings.allowedUserIds) ? settings.allowedUserIds : [],
+        allowedChatIds: () => projectChatIds(deps),
         pollTimeoutSec: settings.pollTimeoutSec,
         log: (message) => deps.logger.debug(message),
       });
@@ -78,9 +99,16 @@ export const telegramFeature = {
       return;
     }
 
+    // 012: при нескольких каналах фасад (005) держит один «current» и гасит
+    // previous — второй канал перестал бы принимать ответы. Поэтому в
+    // мультиканальном режиме каналы живут сами и регистрируются только в реестре.
+    const multiChannel = Array.isArray(config?.transports) && config.transports.length > 1;
     try {
       const facade = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
-      if (facade !== null && facade.__isTransportFacade === true) {
+      if (multiChannel) {
+        ctx?.get?.("remoteTransports")?.set?.("telegram", transport);
+        deps.logger.info("фича telegram: мультиканальный режим — транспорт только в реестре");
+      } else if (facade !== null && facade.__isTransportFacade === true) {
         // Фича commands (005) уже держит фасад: кладём транспорт внутрь, чтобы
         // connect/disconnect могли его заменить и остановить.
         facade.set(transport);
@@ -91,6 +119,13 @@ export const telegramFeature = {
       }
     } catch (error) {
       deps.logger.warn(`фича telegram: сервис ${TRANSPORT_SERVICE} не зарегистрирован (${error?.message ?? error})`);
+    }
+
+    // Реестр каналов (012): ответчик может публиковать вопрос в несколько.
+    try {
+      ctx?.get?.("remoteTransports")?.set?.("telegram", transport);
+    } catch (error) {
+      deps.logger.debug(`фича telegram: реестр каналов недоступен (${error?.message ?? error})`);
     }
 
     deps.onDispose(() => {
