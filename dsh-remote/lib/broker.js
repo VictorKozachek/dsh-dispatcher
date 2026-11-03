@@ -53,7 +53,7 @@ export function createBroker({
   }
 
   /** Доставка в один канал: результат нормализуем к `{ok, messageId, chatId}`. */
-  async function deliverOne(transport, question, { signal } = {}) {
+  async function deliverOne(transport, question, { signal, chatId, threadId } = {}) {
     const deliver = typeof deliverFor === "function" ? deliverFor(transport) : null;
     // Свой контроллер на канал: зависший транспорт не должен держать Promise.all.
     const controller = new AbortController();
@@ -77,9 +77,14 @@ export function createBroker({
     timer?.unref?.();
     let token;
     try {
+      const target = {
+        signal: controller.signal,
+        ...(chatId === undefined || chatId === null ? {} : { chatId }),
+        ...(threadId === undefined || threadId === null ? {} : { threadId }),
+      };
       const send = typeof deliver === "function"
-        ? deliver({ question, signal: controller.signal })
-        : transport.sendQuestion(question, controller.signal === undefined ? undefined : { signal: controller.signal });
+        ? deliver({ question, signal: controller.signal, chatId, threadId })
+        : transport.sendQuestion(question, target);
       const outcome = await Promise.race([send, aborted]);
       // `deliver` из 008 возвращает строку; прямой sendQuestion — `{messageId}`,
       // `undefined` или `"give-up"`.
@@ -108,12 +113,12 @@ export function createBroker({
    * @param {{signal?: AbortSignal}} [options]
    * @returns {{delivered: object[], failed: object[], anyDelivered: boolean, allFailed: boolean}}
    */
-  async function publish(question, { signal } = {}) {
+  async function publish(question, { signal, chatId, threadId } = {}) {
     if (question === null || typeof question !== "object") throw new TypeError("broker: нужен вопрос");
     const results = await Promise.all(
       channels.map(async (transport) => {
         if (signal?.aborted === true) return { transport, ok: false, reason: "aborted" };
-        const result = await deliverOne(transport, question, { signal });
+        const result = await deliverOne(transport, question, { signal, chatId, threadId });
         if (!result.ok) {
           log(`broker: канал ${transport.id} не доставил вопрос ${question.shortId}`
             + `${result.reason === undefined ? "" : ` (${result.reason})`}`);

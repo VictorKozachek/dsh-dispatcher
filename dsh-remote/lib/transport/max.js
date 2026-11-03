@@ -258,6 +258,13 @@ export function createMaxTransport(options = {}) {
    * чата. Пустой allowlist — **fail-closed**: MAX-бот публичен по нику, и без
    * списка любой мог бы ответить за человека (канал удалённого управления).
    */
+  /** Чаты, из которых принимаем ответы: привязка + каналы проектов (015). */
+  const allowedChats = new Set(
+    [chatId, ...(Array.isArray(options.allowedChatIds) ? options.allowedChatIds : [])]
+      .filter((item) => item !== undefined && item !== null && item !== "")
+      .map((item) => String(item)),
+  );
+
   function allowedSender(update) {
     if (allowed.size === 0) return false;
     const sender = senderOf(update);
@@ -266,7 +273,7 @@ export function createMaxTransport(options = {}) {
       ?? update?.callback?.chat?.chat_id
       ?? update?.message?.chat?.chat_id
       ?? null;
-    if (chatId !== null) return updateChat !== null && String(updateChat) === String(chatId);
+    if (chatId !== null) return updateChat !== null && allowedChats.has(String(updateChat));
     if (userId !== null) return String(sender) === String(userId);
     return false;
   }

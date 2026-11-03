@@ -42,6 +42,48 @@ export function statePaths({ env = process.env, home = os.homedir() } = {}) {
   return { file, dir, lock: path.join(dir, LOCK_FILE_NAME) };
 }
 
+/** Каналы проектов: только `{chatId, threadId?}`, ключ — имя проекта. */
+function normalizeChannels(value) {
+  const base = {};
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return base;
+  for (const [name, channel] of Object.entries(value)) {
+    if (typeof name !== "string" || name === "") continue;
+    if (channel === null || typeof channel !== "object") continue;
+    const chatId = channel.chatId;
+    if (chatId === undefined || chatId === null || chatId === "") continue;
+    base[name] = {
+      chatId,
+      ...(channel.threadId === undefined || channel.threadId === null || channel.threadId === "" ? {} : { threadId: channel.threadId }),
+    };
+  }
+  return base;
+}
+
+/**
+ * Канал вопроса по воркспейсу (015).
+ *
+ * Сначала ищем проект по `basename(cwd)` в `state.channels`, затем — общий чат
+ * привязки. `source` говорит, куда попали: `workspace`, `default` или `null`
+ * (канала нет вовсе). Чистая функция: тесты гоняют её на объекте состояния.
+ *
+ * @param {object} state — состояние store.
+ * @param {string|null} workspace — cwd сессии/вопроса.
+ * @returns {{chatId: any, threadId: any, source: "workspace"|"default"|null}}
+ */
+export function resolveChannel(state, workspace) {
+  const channels = normalizeChannels(state?.channels);
+  const name = typeof workspace === "string" && workspace !== "" ? workspace.replace(/[\\/]+$/, "").split(/[\\/]/).pop() : null;
+  const project = name === null ? undefined : channels[name];
+  if (project !== undefined) {
+    return { chatId: project.chatId, threadId: project.threadId ?? null, source: "workspace" };
+  }
+  const fallback = state?.bindings?.chatId;
+  if (fallback !== undefined && fallback !== null && fallback !== "") {
+    return { chatId: fallback, threadId: null, source: "default" };
+  }
+  return { chatId: null, threadId: null, source: null };
+}
+
 /** Состояние по умолчанию: пустая привязка, режим выключен, ничего не ждёт. */
 export function defaultState() {
   return {
@@ -50,6 +92,8 @@ export function defaultState() {
     enabled: { global: false, workspaces: {}, sessions: {} },
     recent: [],
     pending: [],
+    /** 015: каналы проектов: `{ "<basename cwd>": { chatId, threadId? } }`. */
+    channels: {},
   };
 }
 
@@ -226,6 +270,40 @@ export function createStore({
   }
 
   /** Включить/выключить режим для scope: `global`, `workspace` (cwd) или `session`. */
+  /**
+   * Канал проекта (015): `chatId` (+ `threadId` для топика форума).
+   *
+   * «Свой/чужой» здесь не проверяем — это делает `/remote channel`; allowlist
+   * транспорта всё равно отклонит чат, куда бота не добавляли.
+   */
+  function setChannel(name, channel) {
+    const key = typeof name === "string" ? name.trim() : "";
+    if (key === "") throw new TypeError("setChannel: нужно имя проекта");
+    if (channel === null || typeof channel !== "object" || channel.chatId === undefined || channel.chatId === null || channel.chatId === "") {
+      throw new TypeError("setChannel: нужен chatId");
+    }
+    return update((state) => {
+      state.channels = normalizeChannels({
+        ...state.channels,
+        [key]: {
+          chatId: channel.chatId,
+          ...(channel.threadId === undefined || channel.threadId === null || channel.threadId === "" ? {} : { threadId: channel.threadId }),
+        },
+      });
+      return state;
+    });
+  }
+
+  /** Убрать канал проекта: вопросы снова идут в общий чат. */
+  function removeChannel(name) {
+    return update((state) => {
+      const channels = { ...state.channels };
+      delete channels[name];
+      state.channels = normalizeChannels(channels);
+      return state;
+    });
+  }
+
   function setEnabled(scope, value) {
     const enabled = Boolean(value);
     return update((state) => {
@@ -368,6 +446,8 @@ export function createStore({
     write,
     update,
     setEnabled,
+    setChannel,
+    removeChannel,
     setBinding,
     addRecent,
     setPending,

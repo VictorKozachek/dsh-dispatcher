@@ -453,7 +453,7 @@ export function createReliability({
     return transport;
   }
 
-  async function deliver({ question, chatId, signal, transport: overrideTransport = null } = {}) {
+  async function deliver({ question, chatId, threadId, signal, transport: overrideTransport = null } = {}) {
     if (question === null || typeof question !== "object") return "give-up";
     // 012: доставка в конкретный канал (брокер), а не только в «свой» транспорт.
     const source = overrideTransport ?? transport;
@@ -466,7 +466,12 @@ export function createReliability({
     const deadline = now() + connectTimeoutMs;
     // Фактический чат: явный аргумент или свойство транспорта (004 его отдаёт).
     const resolvedChatId = chatId ?? active?.chatId ?? null;
-    const target = resolvedChatId === null ? undefined : { chatId: resolvedChatId };
+    const target = resolvedChatId === null
+      ? undefined
+      : {
+        chatId: resolvedChatId,
+        ...(threadId === undefined || threadId === null || threadId === "" ? {} : { threadId }),
+      };
 
     const outgoing = prepareQuestion(question);
 

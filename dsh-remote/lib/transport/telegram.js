@@ -253,11 +253,18 @@ export function createTelegramTransport(options = {}) {
   }
 
   /** Человек и чат из allowlist? Пустой allowlist — никого (безопасный дефолт). */
+  /** Чаты, из которых принимаем ответы: привязка + каналы проектов (015). */
+  const allowedChats = new Set(
+    [chatId, ...(Array.isArray(options.allowedChatIds) ? options.allowedChatIds : [])]
+      .filter((item) => item !== undefined && item !== null && item !== "")
+      .map((item) => String(item)),
+  );
+
   function allowed(fromId, chatIdOfUpdate) {
     const from = fromId === undefined || fromId === null ? null : String(fromId);
     const chat = chatIdOfUpdate === undefined || chatIdOfUpdate === null ? null : String(chatIdOfUpdate);
     const known = from !== null && allowedUserIds.has(from);
-    const ownChat = chat !== null && chat === String(chatId);
+    const ownChat = chat !== null && allowedChats.has(chat);
     if (!known || !ownChat) {
       log(`telegram: чужой апдейт (from=${from ?? "?"}, chat=${chat ?? "?"}) — игнор`);
       return false;
@@ -499,6 +506,9 @@ export function createTelegramTransport(options = {}) {
           chat_id: target,
           parse_mode: "HTML",
           text,
+          ...(sendOptions?.threadId === undefined || sendOptions?.threadId === null
+            ? {}
+            : { message_thread_id: sendOptions.threadId }),
           ...(keyboard === undefined ? {} : { reply_markup: keyboard }),
         }, { signal });
         if (result?.message_id !== undefined) record.messageIds.push(result.message_id);

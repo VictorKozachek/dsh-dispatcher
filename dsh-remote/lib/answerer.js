@@ -138,6 +138,8 @@ export function createAnswerer({
   deliver = null,
   deliverFor = null,
   reliability = null,
+  /** 015: канал проекта по воркспейсу: `(workspace) => {chatId, threadId, source}`. */
+  channelOf = null,
 } = {}) {
   /**
    * Каналы (012): один транспорт — прежний путь, несколько — брокер с гонкой.
@@ -153,16 +155,29 @@ export function createAnswerer({
    * `reliability.deliver` с повторами. Сигнал `'give-up'` означает «за
    * `connectTimeoutMs` не доставили» — тогда вопрос достаётся GUI через `next()`.
    */
+  /** Параметры отправки с учётом канала проекта (015). */
+  const sendOptionsFor = (question) => ({
+    ...(question.chatId === null || question.chatId === undefined ? {} : { chatId: question.chatId }),
+    ...(question.threadId === null || question.threadId === undefined ? {} : { threadId: question.threadId }),
+  });
+
   const sendOne = typeof deliver === "function"
-    ? async (question, signal) => deliver({ question, signal })
-    : async (question, signal) => primary.sendQuestion(question, signal);
+    // У доставки через reliability сигнал есть (она умеет отменять отправку).
+    ? async (question, signal) => deliver({ question, signal, ...sendOptionsFor(question) })
+    // Прямой транспорт исторически сигнал не отменяет: аборт ждёт завершения
+    // sendMessage и закрывает сообщение по факту (тест 004).
+    : async (question) => primary.sendQuestion(question, sendOptionsFor(question));
 
   /**
    * Доставить вопрос во все каналы (012). Возвращает `true`, если доставили
    * хотя бы в один: ошибка одного канала не должна блокировать второй.
    */
   async function publishAll(question, signal) {
-    const publication = await broker.publish(question, { signal });
+    const publication = await broker.publish(question, {
+      signal,
+      chatId: question.chatId ?? undefined,
+      threadId: question.threadId ?? undefined,
+    });
     return publication;
   }
   /** Открытые вопросы по короткому id: ждём ответа транспорта. */
@@ -349,11 +364,29 @@ export function createAnswerer({
     const questions = [];
     try {
       for (const item of items) {
+        // 015: канал проекта — свой чат/топик; нет канала — общий чат привязки.
+        let questionChannel = { chatId: null, threadId: null };
+        if (typeof channelOf === "function") {
+          try {
+            const resolved = channelOf(workspace) ?? {};
+            questionChannel = {
+              chatId: resolved.chatId ?? null,
+              threadId: resolved.threadId ?? null,
+            };
+            if (resolved.source === "default" && workspace !== null) {
+              log(`вопрос: у проекта ${workspace} нет своего канала — иду в общий чат`);
+            }
+          } catch (error) {
+            log(`вопрос: канал проекта не определён (${error?.message ?? error})`);
+          }
+        }
         const created = createQuestion(item, {
           sessionId,
           workspace,
           role: questionContext.role,
           taskId: questionContext.taskId,
+          chatId: questionChannel.chatId,
+          threadId: questionChannel.threadId,
           now: now(),
           log,
         });

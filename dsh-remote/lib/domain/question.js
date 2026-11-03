@@ -101,6 +101,9 @@ export class RemoteQuestion {
     this.workspace = context.workspace ?? null;
     this.role = context.role ?? null;
     this.taskId = context.taskId ?? null;
+    /** 015: канал проекта (`chatId` + опциональный `threadId` топика). */
+    this.chatId = context.chatId ?? null;
+    this.threadId = context.threadId ?? null;
     this.title = typeof item.header === "string" && item.header !== "" ? item.header : null;
     this.body = typeof item.question === "string" ? item.question : "";
     /** Подробности вопроса: рендерятся рядом с телом (шапка и текст — задача 006). */
@@ -265,6 +268,8 @@ export class RemoteQuestion {
       createdAt: this.createdAt,
       expiresAt: this.expiresAt,
       status: this.status,
+      chatId: this.chatId,
+      threadId: this.threadId,
       deliveries: this.deliveries,
       answer: this.answer,
       answeredBy: this.answeredBy,
