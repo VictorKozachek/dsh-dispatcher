@@ -157,3 +157,81 @@ test("reliability: вытеснение pending пишется в журнал",
   assert.match(journal, /pending-dropped/);
   assert.match(journal, /"shortId":"s-1"/);
 });
+
+// --- ревью 033: дырка в нумерации, кастомный pendingLimit, команда vacuum ---
+
+test("vacuum видит ротированные файлы с дыркой в нумерации", (t) => {
+  const dir = tempDir(t);
+  // .1 отсутствует (удалён вручную), есть .2 и .3
+  fs.writeFileSync(path.join(dir, "audit.jsonl.2"), "a".repeat(10));
+  fs.writeFileSync(path.join(dir, "audit.jsonl.3"), "b".repeat(20));
+
+  const dry = vacuum(fs, { dir, keep: 1, dryRun: true });
+  assert.deepEqual(dry.removed.map((item) => path.basename(item.path)), ["audit.jsonl.2"], "дырка не скрывает .3");
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.2")), true, "dry-run ничего не удалил");
+
+  const real = vacuum(fs, { dir, keep: 1, dryRun: false });
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.2")), false);
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.3")), true, "свежий .3 остался");
+  assert.equal(real.kept.length, 1);
+});
+
+test("createStore: кастомный pendingLimit применяется и при чтении, и при записи", (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "state.json");
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    pending: Array.from({ length: 10 }, (_, index) => ({ shortId: `s-${index}` })),
+  }));
+
+  const store = createStore({ file, pendingLimit: 3 });
+  assert.equal(store.pendingLimit, 3);
+  assert.equal(store.read().pending.length, 3, "read учитывает лимит");
+  assert.deepEqual(store.read().pending.map((item) => item.shortId), ["s-7", "s-8", "s-9"]);
+
+  store.update((state) => {
+    state.pending.push({ shortId: "s-10" });
+    return state;
+  });
+  assert.equal(store.read().pending.length, 3, "write учитывает лимит");
+  assert.equal(store.read().pending.at(-1).shortId, "s-10", "новое не потерялось");
+});
+
+test("/remote vacuum: команда работает, --dry-run безопасен", async (t) => {
+  const { createRemoteCommands } = await import("../lib/commands.js");
+  const { createStore } = await import("../lib/store.js");
+  const dir = tempDir(t);
+  const store = createStore({ file: path.join(dir, "state.json") });
+  for (let index = 1; index <= 7; index += 1) fs.writeFileSync(path.join(dir, `audit.jsonl.${index}`), "x".repeat(100));
+  for (let index = 1; index <= 2; index += 1) fs.writeFileSync(path.join(dir, `log.jsonl.${index}`), "y".repeat(50));
+
+  const ctx = { get: () => null, on: () => () => {}, effect: (execute) => {
+    const disposable = execute();
+    return () => disposable?.();
+  } };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => 1_700_000_000_000 });
+  const invoke = (rawInput) => ({
+    commandId: "c1",
+    agent: { id: "s1", session: { id: "s1" } },
+    rawInput,
+    signal: new AbortController().signal,
+  });
+
+  const dry = await remote.handler(invoke("vacuum --dry-run"));
+  assert.equal(dry.kind, "success", dry.text);
+  assert.match(dry.text, /--dry-run: будет удалено 2 файлов/);
+  assert.match(dry.text, /audit\.jsonl\.1/);
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.1")), true, "dry-run не удалил");
+
+  const real = await remote.handler(invoke("vacuum"));
+  assert.equal(real.kind, "success", real.text);
+  assert.match(real.text, /удалено 2 файлов, освобождено/);
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.1")), false);
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.2")), false);
+  assert.equal(fs.existsSync(path.join(dir, "audit.jsonl.3")), true, "оставлены последние 5");
+  assert.equal(fs.existsSync(path.join(dir, "log.jsonl.1")), true, "log в пределах keep не тронут");
+  assert.match(real.text, /оставлено ротированных файлов: 7/);
+
+  const again = await remote.handler(invoke("vacuum"));
+  assert.match(again.text, /очистка не требуется/);
+});

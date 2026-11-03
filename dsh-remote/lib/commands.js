@@ -23,6 +23,7 @@
  */
 
 import fs from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createRegistry } from "./domain/registry.js";
@@ -1021,6 +1022,32 @@ export function createRemoteCommands({
     }
     return success(`проект ${name} (${channel.transport ?? store.read().bindings?.transport ?? "default"}) → чат ${channel.chatId}`
       + `${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
+  }
+
+  /**
+   * `/remote vacuum [--dry-run]` — принудительная очистка старых журналов (033).
+   *
+   * Оставляем последние `keep` (5) ротированных файлов на каждый журнал;
+   * `--dry-run` только показывает, что было бы удалено.
+   */
+  async function vacuumCommand(invocation, flags) {
+    const dir = typeof store?.paths?.dir === "string" ? store.paths.dir : null;
+    if (dir === null) return failure("хранилище не найдено: сначала /remote connect");
+    const dryRun = flags?.has?.("dry-run") === true;
+    const result = vacuum(fs, { dir, keep: DEFAULT_KEEP, dryRun, log: (message) => log(message) });
+    const size = (bytes) => `${(bytes / 1024).toFixed(1)} КБ`;
+    const lines = [];
+    if (result.removed.length === 0) {
+      lines.push(dryRun ? "удалять нечего: старых журналов нет" : "очистка не требуется: старых журналов нет");
+    } else if (dryRun) {
+      lines.push(`--dry-run: будет удалено ${result.removed.length} файлов (${size(result.freedBytes)}):`);
+      lines.push(...result.removed.map((item) => `  ${path.basename(item.path)} — ${size(item.size)}`));
+    } else {
+      lines.push(`удалено ${result.removed.length} файлов, освобождено ${size(result.freedBytes)}:`);
+      lines.push(...result.removed.map((item) => `  ${path.basename(item.path)} — ${size(item.size)}`));
+    }
+    lines.push(`оставлено ротированных файлов: ${result.kept.length} (keep=${DEFAULT_KEEP})`);
+    return success(lines.join("\n"));
   }
 
   /**

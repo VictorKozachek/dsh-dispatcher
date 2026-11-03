@@ -210,7 +210,7 @@ export function createJournalLog({ file, maxBytes = 5 * 1024 * 1024, keep = 5, n
     const line = JSON.stringify(redactEntry({ at: now(), ...entry }));
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      rotateIfNeeded(fs, file, line.length, { maxBytes, keep, log: logger });
+      rotateIfNeeded(fs, file, line.length + 1, { maxBytes, keep, log: logger });
       fs.appendFileSync(file, `${line}\n`, { mode: 0o600 });
       try {
         fs.chmodSync(file, 0o600);

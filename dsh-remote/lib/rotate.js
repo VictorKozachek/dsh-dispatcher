@@ -95,17 +95,27 @@ export function vacuum(fsImpl, { dir, bases = ["audit.jsonl", "log.jsonl"], keep
   for (const base of bases) {
     const file = path.join(dir, base);
     const candidates = [];
-    for (let index = 1; ; index += 1) {
-      const target = `${file}.${index}`;
+    const prefix = `${base}.`;
+    let names = [];
+    try {
+      names = fsImpl.readdirSync(dir);
+    } catch (error) {
+      log(`вакуум: прочитать ${dir} не удалось (${error?.message ?? error})`);
+      continue;
+    }
+    for (const name of names) {
+      if (!name.startsWith(prefix)) continue;
+      const suffix = name.slice(prefix.length);
+      if (!/^\d+$/.test(suffix)) continue;
+      const target = path.join(dir, name);
       try {
         const stat = fsImpl.statSync(target);
-        candidates.push({ path: target, size: stat.size, index });
+        candidates.push({ path: target, size: stat.size, index: Number(suffix) });
       } catch (error) {
-        if (error?.code === "ENOENT") break;
-        log(`вакуум: stat ${target} не удался (${error?.message ?? error})`);
-        break;
+        if (error?.code !== "ENOENT") log(`вакуум: stat ${target} не удался (${error?.message ?? error})`);
       }
     }
+    candidates.sort((a, b) => a.index - b.index);
     // Оставляем файлы с наибольшими индексами (самые свежие ротации).
     const drop = candidates.slice(0, Math.max(0, candidates.length - Math.max(0, Math.floor(keep))));
     for (const item of candidates) {

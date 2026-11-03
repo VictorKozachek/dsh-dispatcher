@@ -304,7 +304,7 @@ export function createStore({
     }
     try {
       const parsed = JSON.parse(text);
-      return normalizeState(parsed, log, recentLimit);
+      return normalizeState(parsed, log, recentLimit, pendingLimit);
     } catch (error) {
       log(`состояние: битый JSON в ${paths.file} (${error?.message ?? error}) — работаю с дефолтом`);
       return defaultState();
@@ -313,7 +313,7 @@ export function createStore({
 
   /** Записать состояние атомарно: tmp → chmod 600 → rename. */
   function write(state) {
-    const normalized = normalizeState(state, log, recentLimit);
+    const normalized = normalizeState(state, log, recentLimit, pendingLimit);
     fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
     const tmp = path.join(paths.dir, `.${DEFAULT_FILE_NAME}.${process.pid}.${randomUUID()}.tmp`);
     const payload = `${JSON.stringify(normalized, null, 2)}\n`;
