@@ -15,6 +15,7 @@ import path from "node:path";
 
 import { createStore } from "../lib/store.js";
 import { commandsFeature } from "../lib/features/commands.js";
+import { answererFeature } from "../lib/features/answerer.js";
 import {
   PAIRING_TTL_MS,
   TELEGRAM_TOKEN_REF,
@@ -171,12 +172,12 @@ function harness(t, {
 }
 
 /** Вызов команды: `rawInput` — то, что идёт после `/remote`. */
-function invoke(rawInput) {
+function invoke(rawInput, { signal } = {}) {
   return {
     commandId: "c1",
     agent: { id: "agent-1", session: { id: SESSION_ID } },
     rawInput,
-    signal: new AbortController().signal,
+    signal: signal ?? new AbortController().signal,
   };
 }
 
@@ -584,12 +585,13 @@ test("фича commands: сохранённая привязка поднима�
 
   await commandsFeature.apply(ctx, {}, deps);
 
-  assert.equal(provided.length, 1, "сервис зарегистрирован");
-  assert.equal(provided[0].name, "remoteTransport");
-  assert.equal(provided[0].service.polling, true, "поллинг запущен");
+  const names = provided.map((entry) => entry.name).sort();
+  assert.deepEqual(names, ["remoteStore", "remoteTransport"], "состояние и транспорт как сервисы");
+  const transportEntry = provided.find((entry) => entry.name === "remoteTransport");
+  assert.equal(transportEntry.service.current.polling, true, "поллинг запущен");
   assert.match(logs.join("\n"), /канал поднят из сохранённой привязки/);
 
-  await provided[0].service.stop();
+  await transportEntry.service.stop();
 });
 
 test("фича commands: без привязки транспорт не поднимается", async (t) => {
@@ -610,7 +612,11 @@ test("фича commands: без привязки транспорт не под�
 
   await commandsFeature.apply(ctx, {}, deps);
 
-  assert.deepEqual(provided, [], "нечего поднимать — вопрос уходит в GUI");
+  // Сервисы регистрируются всегда (состояние и стабильный фасад), но канала нет:
+  // фасад пуст, вопрос уходит в GUI.
+  const transportEntry = provided.find((entry) => entry.name === "remoteTransport");
+  assert.ok(transportEntry, "фасад транспорта зарегистрирован");
+  assert.equal(transportEntry.service.current, null, "транспорт не поднят");
 });
 
 test("connect: ensureTransport поднимает канал в той же сессии", async (t) => {
@@ -638,4 +644,306 @@ test("connect: ensureTransport поднимает канал в той же се
   assert.equal(ensured, 1, "фичу попросили поднять канал");
   assert.deepEqual(started, ["start"], "транспорт запущен");
   assert.match(result.text, /канал поднят/);
+});
+
+// --- правки по ревью 005 ---------------------------------------------------
+
+/** Дать отработать микрозадачам. */
+const tick = async (times = 4) => {
+  for (let index = 0; index < times; index += 1) await new Promise((resolve) => setImmediate(resolve));
+};
+
+test("ответчик видит режим из remoteStore: включённый state забирает вопрос", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-state-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json") });
+  store.setEnabled({ kind: "workspace", id: "/p" }, true);
+
+  const sent = [];
+  const transport = {
+    id: "telegram",
+    caps: { inlineText: true, inlineButtons: true, editAfterAnswer: true, maxText: 4096, maxOptions: 8 },
+    sendQuestion: async (question) => sent.push(question),
+    closeQuestion: async () => {},
+    onAnswer: () => () => {},
+    stop: async () => {},
+  };
+  const hooks = new Map();
+  const ctx = {
+    get: (name) => (name === "remoteTransport" ? transport : name === "remoteStore" ? store : name === "sessions" ? { get: () => ({ header: { cwd: "/p" } }) } : null),
+    on: (event, handler, options) => {
+      hooks.set(event, (hooks.get(event) ?? []).concat([{ handler, options }]));
+      return () => {};
+    },
+  };
+  const { deps, disposers } = fakeDeps();
+  deps.get = (name) => ctx.get(name);
+
+  answererFeature.apply(ctx, {}, deps);
+  const [entry] = hooks.get("user-questions/request");
+  assert.equal(entry?.options?.prepend, true, "ответчик подписан с prepend");
+
+  const controller = new AbortController();
+  const pending = entry.handler(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: SESSION_ID }, signal: controller.signal },
+    () => assert.fail("режим включён — next() звать нельзя"),
+  );
+  await tick();
+  assert.equal(sent.length, 1, "вопрос ушёл в транспорт, а не в GUI");
+
+  controller.abort();
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+  disposeAll(disposers);
+});
+
+/** Аккуратно вызвать все disposer'ы (фича могла зарегистрировать несколько). */
+function disposeAll(disposers) {
+  for (const dispose of [...disposers].reverse()) {
+    try {
+      dispose();
+    } catch {
+      /* не мешает тесту */
+    }
+  }
+}
+
+test("connect при включённом режиме: просим сначала выключить", async (t) => {
+  const stand = harness(t, { answers: CONNECT_ANSWERS });
+  stand.store.setEnabled({ kind: "workspace", id: WORKSPACE }, true);
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "error");
+  assert.match(result.text, /выключите удалённый режим/);
+  assert.equal(stand.store.read().bindings, null);
+});
+
+test("connect: без ctx.credentials, но с токеном в окружении — привязка проходит", async (t) => {
+  const previous = process.env[TELEGRAM_TOKEN_REF];
+  process.env[TELEGRAM_TOKEN_REF] = TOKEN;
+  t.after(() => {
+    if (previous === undefined) delete process.env[TELEGRAM_TOKEN_REF];
+    else process.env[TELEGRAM_TOKEN_REF] = previous;
+  });
+  const telegram = telegramFetch();
+  const stand = harness(t, { answers: CONNECT_ANSWERS, credentials: null, fetchImpl: telegram.fetch });
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "success", result.text);
+  assert.match(result.text, /из окружения/);
+  assert.equal(stand.store.read().bindings.botUsername, "test_bot");
+  assert.equal(stand.store.read().enabled.workspaces[WORKSPACE], true);
+});
+
+test("status без ctx.credentials: секрет из окружения и только для чтения", async (t) => {
+  const previous = process.env[TELEGRAM_TOKEN_REF];
+  process.env[TELEGRAM_TOKEN_REF] = TOKEN;
+  t.after(() => {
+    if (previous === undefined) delete process.env[TELEGRAM_TOKEN_REF];
+    else process.env[TELEGRAM_TOKEN_REF] = previous;
+  });
+  const stand = harness(t, { credentials: null });
+
+  const result = await stand.remote.handler(invoke("status"));
+
+  assert.equal(result.kind, "success");
+  assert.match(result.text, /источник env \(только чтение\)/);
+  assert.equal(result.text.includes(TOKEN), false);
+});
+
+test("connect отменяется по signal, lock освобождается", async (t) => {
+  const controller = new AbortController();
+  const stand = harness(t, {
+    answers: CONNECT_ANSWERS,
+    fetchImpl: async (url, init = {}) => {
+      const method = url.split("/").pop();
+      if (method === "getMe") return { ok: true, status: 200, async json() { return { ok: true, result: { username: "test_bot" } }; } };
+      return new Promise((_, reject) => {
+        init.signal?.addEventListener?.("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    },
+  });
+
+  const pending = stand.remote.handler(invoke("connect", { signal: controller.signal }));
+  await tick(2);
+  controller.abort();
+  const result = await pending;
+
+  assert.equal(result.kind, "error");
+  assert.equal(stand.store.read().bindings, null, "привязки нет");
+  assert.equal(fs.existsSync(stand.store.paths.lock), false, "lock снят после отмены");
+});
+
+test("/remote test: клик по кнопке закрывает тестовое сообщение", async (t) => {
+  const sent = [];
+  const closed = [];
+  let emit = null;
+  const transport = {
+    id: "telegram",
+    sendQuestion: async (question) => {
+      sent.push(question);
+      return { messageId: 1 };
+    },
+    closeQuestion: async (question, summary) => closed.push({ question, summary }),
+    onAnswer: (handler) => {
+      emit = handler;
+      return () => {
+        emit = null;
+      };
+    },
+    stop: async () => {},
+  };
+  const stand = harness(t, { transport });
+  stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+
+  const result = await stand.remote.handler(invoke("test"));
+  assert.equal(result.kind, "success", result.text);
+  assert.equal(sent.length, 1);
+
+  emit({ shortId: sent[0].shortId, optionIds: ["o1"], answeredBy: "7" });
+  await tick(2);
+
+  assert.equal(closed.length, 1, "ответ закрывает тестовое сообщение");
+  assert.equal(emit, null, "подписка снята");
+});
+
+test("connect: ошибка хранилища на записи — привязки нет, текст без стека", async (t) => {
+  const stand = harness(t, { answers: CONNECT_ANSWERS });
+  const broken = {
+    ...stand.store,
+    update() {
+      throw new Error("диск кончился");
+    },
+  };
+  const telegram = telegramFetch();
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: broken,
+    log: () => {},
+    now: () => stand.clock,
+    sleep: async () => {},
+    random: () => CODE_RANDOM,
+    fetch: telegram.fetch,
+  });
+
+  const result = await remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "error");
+  assert.match(result.text, /привязка не сохранена: диск кончился/);
+  assert.equal(result.text.includes("    at "), false);
+  assert.equal(stand.store.read().bindings, null, "частичной записи нет");
+});
+
+test("фича commands: смена привязки и токена пересоздаёт транспорт", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-reconnect-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "state.json");
+  const store = createStore({ file });
+  store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+
+  const previousState = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = file;
+  t.after(() => {
+    if (previousState === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previousState;
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = hangingTelegramFetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let token = "111:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  const services = new Map();
+  const ctx = {
+    provide: (name, service) => services.set(name, service),
+    get: (name) => (name === "credentials" ? { resolve: async () => ({ value: token, source: "file" }) } : services.get(name) ?? null),
+    commands: { register: () => () => {} },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+    logger: () => ({ debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }),
+  };
+  const { deps } = fakeDeps();
+  deps.get = (name) => ctx.get(name);
+
+  const api = await commandsFeature.apply(ctx, {}, deps);
+  const first = api.facade.current;
+  assert.ok(first !== null, "канал поднят");
+  assert.equal(first.polling, true);
+
+  // Новая привязка и новый токен — старый поллер не должен остаться.
+  createStore({ file }).setBinding({ transport: "telegram", chatId: 43, userId: 8, botUsername: "test_bot" });
+  token = "222:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+  const second = await api.ensureTransport();
+
+  assert.notEqual(second, first, "транспорт пересоздан");
+  assert.equal(first.polling, false, "старый поллинг остановлен");
+  assert.equal(api.facade.current, second);
+  await api.facade.stop();
+});
+
+test("фича commands: выгрузка во время credentials.resolve не поднимает канал", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-dispose-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "state.json");
+  createStore({ file }).setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+
+  const previousState = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = file;
+  t.after(() => {
+    if (previousState === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previousState;
+  });
+
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+  globalThis.fetch = async (...args) => {
+    fetchCalls += 1;
+    return originalFetch(...args);
+  };
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let releaseResolve;
+  const services = new Map();
+  const ctx = {
+    provide: (name, service) => services.set(name, service),
+    get: (name) => (name === "credentials"
+      ? { resolve: () => new Promise((resolve) => { releaseResolve = resolve; }) }
+      : services.get(name) ?? null),
+    commands: { register: () => () => {} },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+    logger: () => ({ debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }),
+  };
+  const { deps, disposers } = fakeDeps();
+  deps.get = (name) => ctx.get(name);
+
+  const pending = commandsFeature.apply(ctx, {}, deps);
+  await tick(2);
+  // Плагин выгружают, пока резолв токена висит.
+  disposeAll(disposers);
+  releaseResolve({ value: "123456:TEST-TOKEN", source: "file" });
+  await pending;
+
+  const facade = services.get("remoteTransport");
+  assert.ok(facade, "сервис зарегистрирован");
+  assert.equal(facade.current, null, "канал не поднят после выгрузки");
+  assert.equal(fetchCalls, 0, "сеть не тронули");
 });

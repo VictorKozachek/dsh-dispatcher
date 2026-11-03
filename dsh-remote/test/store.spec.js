@@ -191,6 +191,25 @@ test("lock: второй процесс не занимает, освобожд�
   third.releaseLock();
 });
 
+test("lock: живой процесс с давним временем не считается устаревшим", (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "state.json");
+  const started = createStore({ file, now: () => 0 });
+  const later = createStore({ file, now: () => 10 * 60 * 1000 });
+
+  assert.equal(started.acquireLock().ok, true);
+  // Через 10 минут lock всё ещё наш и живой: connect держит его все шаги pairing.
+  const second = later.acquireLock({ staleAfterMs: 60_000 });
+  assert.equal(second.ok, false, "живой lock не снимается по времени");
+  assert.equal(second.holder.pid, process.pid);
+  started.releaseLock();
+
+  // Мёртвый pid — устаревший, даже если время свежее.
+  fs.writeFileSync(path.join(dir, "lock"), JSON.stringify({ pid: 999_999, at: 10 * 60 * 1000 }));
+  assert.equal(later.acquireLock({ staleAfterMs: 60_000 }).ok, true);
+  later.releaseLock();
+});
+
 test("параллельная запись двумя процессами не рвёт файл", async (t) => {
   const dir = tempDir(t);
   const file = path.join(dir, "state.json");

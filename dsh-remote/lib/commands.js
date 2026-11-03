@@ -156,13 +156,14 @@ export function createRemoteCommands({
   }
 
   /** Один вызов Bot API: `ok:false` превращается в ошибку с кодом. */
-  async function telegramCall(token, method, payload = {}) {
+  async function telegramCall(token, method, payload = {}, { signal } = {}) {
     let response;
     try {
       response = await fetchImpl(`${baseUrl}/bot${token}/${method}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
+        ...(signal === undefined ? {} : { signal }),
       });
     } catch (error) {
       throw new Error(`Telegram ${method}: сеть недоступна (${humanError(error, token)})`);
@@ -185,16 +186,17 @@ export function createRemoteCommands({
    * Ждём сообщение с кодом боту. Пока человек отправляет код, поллинг идёт
    * параллельно; по истечении TTL возвращаем null — привязки не будет.
    */
-  async function pollForCode({ token, code, deadline }) {
+  async function pollForCode({ token, code, deadline, signal }) {
     let offset = 0;
     while (now() < deadline) {
+      if (signal?.aborted) throw new Error("подключение отменено");
       let updates;
       try {
         updates = await telegramCall(token, "getUpdates", {
           offset,
           timeout: PAIRING_POLL_TIMEOUT_SEC,
           allowed_updates: ["message"],
-        });
+        }, { signal });
       } catch (error) {
         if (error?.code === 409) {
           throw new Error("на этот токен уже запущен другой поллер — остановите его и повторите /remote connect");
@@ -217,26 +219,36 @@ export function createRemoteCommands({
     return null;
   }
 
-  /** Применить выбранный scope режима при подключении. */
-  function applyConnectScope(answer, invocation) {
+  /**
+   * Выбранный scope режима — планом, без записи.
+   *
+   * Запись делает connect одним `store.update` вместе с привязкой: если что-то
+   * упадёт, состояние не останется «наполовину обновлённым».
+   */
+  function planConnectScope(answer, invocation) {
     const selected = answer.selected[0] ?? "";
     if (/все проекты/i.test(selected)) {
-      store.setEnabled({ kind: "global" }, true);
-      return "включён для всех проектов";
+      return { plan: { kind: "global" }, note: "включён для всех проектов" };
     }
     if (/только этот проект/i.test(selected)) {
       const { cwd } = sessionInfo(invocation);
-      if (cwd === null) return "привязка есть, но режим не включён: у сессии нет cwd";
-      store.setEnabled({ kind: "workspace", id: cwd }, true);
-      return `включён для воркспейса ${cwd}`;
+      if (cwd === null) return { plan: null, note: "привязка есть, но режим не включён: у сессии нет cwd" };
+      return { plan: { kind: "workspace", id: cwd }, note: `включён для воркспейса ${cwd}` };
     }
-    return "режим пока выключен: включите его /remote on";
+    return { plan: null, note: "режим пока выключен: включите его /remote on" };
   }
 
   /** `/remote connect` — пошаговая привязка бота. */
   async function connect(invocation) {
-    if (!credentials.available) {
-      return failure("ctx.credentials недоступен: токен сохранить некуда, привязка невозможна");
+    if (!credentials.availableFor(TELEGRAM_TOKEN_REF)) {
+      return failure(`токен неоткуда взять: нет ctx.credentials и нет переменной ${TELEGRAM_TOKEN_REF}`);
+    }
+    // Шаги connect спрашиваются локальными вопросами. Если удалённый режим уже
+    // включён, ответчик перехватит их и отправит в мессенджер — в том числе
+    // вопрос про токен. Поэтому сначала просим выключить.
+    const modeInfo = sessionInfo(invocation);
+    if (registry.resolve({ sessionId: modeInfo.sessionId, workspace: modeInfo.cwd }).enabled) {
+      return failure("сначала выключите удалённый режим (/remote off): иначе шаги connect уйдут в мессенджер");
     }
     const lock = store.acquireLock();
     if (!lock.ok) {
@@ -274,7 +286,7 @@ export function createRemoteCommands({
         options: ["Отправил"],
       });
 
-      const match = await pollForCode({ token, code, deadline });
+      const match = await pollForCode({ token, code, deadline, signal: invocation?.signal });
       if (match === null) {
         return failure(`код ${code} не пришёл боту за 10 минут — привязки нет, повторите /remote connect`);
       }
@@ -290,19 +302,31 @@ export function createRemoteCommands({
         options: ["Только этот проект", "Все проекты", "Пока не включать"],
       });
 
-      store.setBinding({
-        transport: "telegram",
-        chatId: match.chatId,
-        userId: match.userId,
-        botUsername,
-        createdAt: now(),
-      });
+      const scope = planConnectScope(scopeAnswer, invocation);
+      try {
+        store.update((state) => {
+          state.bindings = {
+            transport: "telegram",
+            chatId: match.chatId,
+            userId: match.userId,
+            botUsername,
+            createdAt: now(),
+          };
+          if (scope.plan?.kind === "global") state.enabled.global = true;
+          if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
+          return state;
+        });
+      } catch (error) {
+        return failure(`привязка не сохранена: ${humanError(error, token)}`);
+      }
 
       const saved = await credentials.set(TELEGRAM_TOKEN_REF, token);
       const tokenNote = saved
         ? `токен сохранён как ${TELEGRAM_TOKEN_REF}`
-        : `токен не сохранён: источник ${TELEGRAM_TOKEN_REF} только для чтения (переменная окружения)`;
-      const scopeNote = applyConnectScope(scopeAnswer, invocation);
+        : credentials.available
+          ? `токен не сохранён: источник ${TELEGRAM_TOKEN_REF} только для чтения`
+          : `токен взят из окружения (${TELEGRAM_TOKEN_REF}) и не сохранён`;
+      const scopeNote = scope.note;
 
       // Транспорт мог подняться ещё до привязки (фича telegram спит без неё), а
       // мог и не подняться вовсе (привязки не было при старте профиля). Просим
@@ -410,18 +434,32 @@ export function createRemoteCommands({
       return failure("транспорт не поднят: проверьте привязку и токен (/remote status)");
     }
     const shortId = String(Math.floor(random() * 0xffffffff)).padStart(8, "0").slice(0, 8);
+    const question = {
+      shortId,
+      title: "Проверка канала",
+      body: "Это тестовый вопрос от dsh-remote. Ответьте любым вариантом.",
+      options: [{ id: "o1", label: "Ок" }],
+    };
+    // Тестовый вопрос не проходит через ответчик (у него свой реестр), поэтому
+    // ответ на кнопку закрываем здесь: сообщение не останется с кнопками.
+    let off = null;
     try {
-      await transport.sendQuestion({
-        shortId,
-        title: "Проверка канала",
-        body: "Это тестовый вопрос от dsh-remote. Ответьте любым вариантом.",
-        options: [{ id: "o1", label: "Ок" }],
-      });
+      if (typeof transport.onAnswer === "function") {
+        off = transport.onAnswer((event) => {
+          if (event?.shortId !== shortId) return;
+          off?.();
+          off = null;
+          void transport.closeQuestion?.(question, "тест пройден");
+        });
+      }
+      await transport.sendQuestion(question);
     } catch (error) {
+      off?.();
+      off = null;
       return failure(`отправить не удалось: ${humanError(error)}`);
     }
     store.addRecent({ shortId, sessionId: sessionInfo(invocation).sessionId, status: "test" });
-    return success("тестовый вопрос отправлен — проверьте мессенджер");
+    return success("тестовый вопрос отправлен — нажмите кнопку в мессенджере, сообщение закроется");
   }
 
   /** `/remote who` — кто мы и в каком режиме. */
@@ -472,6 +510,15 @@ export function createRemoteCommands({
         await transport.stop();
       } catch (error) {
         log(`transport.stop: ${humanError(error)}`);
+      }
+    }
+    // Фасад после disconnect пуст: следующий connect поднимет новый транспорт
+    // с новым токеном, а не переиспользует старый поллер.
+    if (typeof transport?.clear === "function") {
+      try {
+        transport.clear();
+      } catch (error) {
+        log(`transport.clear: ${humanError(error)}`);
       }
     }
 

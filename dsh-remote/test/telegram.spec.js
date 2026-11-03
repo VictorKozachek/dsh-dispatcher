@@ -593,9 +593,11 @@ test("плагин: async apply -> remoteTransport -> answerer подписан 
     telegram: { tokenRef: "tg", chatId: 42, allowedUserIds: [7], pollTimeoutSec: 25 },
   });
 
-  assert.equal(provided.length, 1, "транспорт зарегистрирован ровно один раз");
-  assert.equal(provided[0].name, "remoteTransport");
-  const transport = provided[0].service;
+  // Команды (005) дополнительно регистрируют сервис состояния.
+  const transportEntries = provided.filter((entry) => entry.name === "remoteTransport");
+  assert.equal(transportEntries.length, 1, "транспорт зарегистрирован ровно один раз");
+  assert.ok(provided.some((entry) => entry.name === "remoteStore"), "состояние зарегистрировано как сервис");
+  const transport = transportEntries[0].service;
   assert.equal(transport.polling, true, "поллинг запущен после async-привязки");
 
   // Главное: ответчик не пропущен — его needs увидел сервис, подписка встала.

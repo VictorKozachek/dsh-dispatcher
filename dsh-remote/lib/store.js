@@ -75,10 +75,17 @@ export function credentialRef(name) {
  * Резолв делается на каждую операцию (кэшировать нельзя — это механизм ротации),
  * а `describe().writable === false` означает «секрет пришёл из окружения»: писать
  * его бессмысленно, и `status` обязан это показать.
+ *
+ * Если сервиса секретов нет вовсе (урезанный профиль), остаётся **fallback на
+ * переменные окружения**: токен можно прочитать, но не записать — и это тоже
+ * видно в `status`.
  */
-export function createCredentialAccess(ctx, { log = () => {} } = {}) {
+export function createCredentialAccess(ctx, { log = () => {}, env = process.env } = {}) {
   const service = ctx?.get?.("credentials") ?? null;
   const has = (method) => typeof service?.[method] === "function";
+
+  /** Значение из окружения (fallback, только чтение). */
+  const fromEnv = (ref) => (typeof env?.[ref] === "string" && env[ref] !== "" ? env[ref] : null);
 
   /** Вызов сервиса: любой отказ — null и строка в лог, без исключения. */
   async function settle(method, ...args) {
@@ -91,30 +98,36 @@ export function createCredentialAccess(ctx, { log = () => {} } = {}) {
     }
   }
 
-  return {
-    /** Есть ли сервис: без него токен взять неоткуда. */
+  const access = {
+    /** Есть ли настоящий провайдер секретов. */
     get available() {
       return has("resolve");
+    },
+    /** Можно ли получить этот секрет: сервис или переменная окружения. */
+    availableFor(ref) {
+      return access.available || fromEnv(ref) !== null;
     },
     /** Значение секрета или null (не бросает, принимает строку и `{value}`). */
     async resolve(ref) {
       const value = await settle("resolve", ref);
       if (typeof value === "string") return value;
       if (typeof value?.value === "string") return value.value;
-      return null;
+      return fromEnv(ref);
     },
     /** `{source, writable, present}`: откуда секрет и можно ли его записать. */
     async describe(ref) {
       const info = await settle("describe", ref);
-      if (info === null || typeof info !== "object") {
-        return { source: null, writable: false, present: false };
+      if (info !== null && typeof info === "object") {
+        const source = typeof info.source === "string" ? info.source : null;
+        return {
+          source,
+          writable: info.writable === true,
+          present: info.configured === true || info.present === true || source !== null,
+        };
       }
-      const source = typeof info.source === "string" ? info.source : null;
-      return {
-        source,
-        writable: info.writable === true,
-        present: info.configured === true || info.present === true || source !== null,
-      };
+      return fromEnv(ref) === null
+        ? { source: null, writable: false, present: false }
+        : { source: "env", writable: false, present: true };
     },
     /** Записать секрет. Успех — отсутствие исключения: сервис возвращает void. */
     async set(ref, value) {
@@ -139,6 +152,7 @@ export function createCredentialAccess(ctx, { log = () => {} } = {}) {
       }
     },
   };
+  return access;
 }
 
 /**
@@ -325,18 +339,27 @@ export function createStore({
     }
   }
 
+  /**
+   * Устарел ли lock.
+   *
+   * Сначала проверяем живость pid: `connect` держит lock все шаги (до 10 минут
+   * pairing), поэтому «старый по времени, но живой» — нормальный lock, а не
+   * устаревший. Время решает только когда pid неизвестен или проверить его
+   * нельзя.
+   */
   function isStaleLock(holder, { staleAfterMs }) {
     if (holder === null) return false;
-    if (Number.isFinite(holder.at) && now() - holder.at > staleAfterMs) return true;
-    if (Number.isInteger(holder.pid) && holder.pid !== process.pid) {
+    if (Number.isInteger(holder.pid)) {
+      if (holder.pid === process.pid) return false; // наш собственный lock жив по определению
       try {
         process.kill(holder.pid, 0);
-        return false; // процесс жив
+        return false; // процесс жив — lock не трогаем
       } catch (error) {
-        return error?.code === "ESRCH";
+        if (error?.code === "EPERM") return false; // жив, просто чужой
+        if (error?.code === "ESRCH") return true; // мёртв — снимаем
       }
     }
-    return false;
+    return Number.isFinite(holder.at) && now() - holder.at > staleAfterMs;
   }
 
   return {
