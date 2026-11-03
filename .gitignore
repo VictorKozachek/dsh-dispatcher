@@ -1,0 +1,18 @@
+# Служебные файлы доски: живут только на этой машине, в набор не входят.
+.kanban/.watcher-state.json
+.kanban/.watcher-roles.json
+.kanban/.watcher-pending.json
+.kanban/.workers.json
+.kanban/worktrees.json
+
+# Рабочие деревья задач лежат внутри проекта (bin/task-new.sh).
+worktrees/
+.worktrees/
+
+# Python-кэш (создают painter/mockup-проверки)
+__pycache__/
+
+# macOS / IDE
+.DS_Store
+.idea/
+*.log
