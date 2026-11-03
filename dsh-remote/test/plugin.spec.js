@@ -99,11 +99,14 @@ function significantLines(text) {
     .map((line) => line.trim());
 }
 
-/** Временная фича в реестре: тест не должен оставлять реестр изменённым. */
-function withFeatures(extra, run) {
+/**
+ * Временная фича в реестре: тест не должен оставлять реестр изменённым.
+ * `apply` каркаса асинхронный (ждёт async фичи), поэтому и прогон асинхронный.
+ */
+async function withFeatures(extra, run) {
   features.push(...extra);
   try {
-    return run();
+    return await run();
   } finally {
     features.splice(features.length - extra.length, extra.length);
   }
@@ -119,12 +122,14 @@ test("каркас: имя плагина, пустой inject и фичи с к
     assert.equal(typeof feature.apply, "function", "у фичи есть apply");
     assert.ok(Array.isArray(feature.needs ?? []), "needs — список сервисов или отсутствует");
   }
-  assert.deepEqual(features.map((feature) => feature.name), ["answerer"]);
+  // Порядок не косметика: транспорт поднимается первым, иначе ответчик с
+  // `needs: [remoteTransport]` пропускается, не дождавшись сервиса.
+  assert.deepEqual(features.map((feature) => feature.name), ["telegram", "answerer"]);
 });
 
-test("apply поднимается на пустом ctx без сервисов и не бросает", () => {
+test("apply поднимается на пустом ctx без сервисов и не бросает", async () => {
   const { ctx, calls, scopes, handlers, effects } = fakeCtx();
-  assert.doesNotThrow(() => apply(ctx, {}));
+  await assert.doesNotReject(() => apply(ctx, {}));
   assert.equal(scopes[0], "dsh-remote", "логгер создаётся со scope [dsh-remote]");
   assert.deepEqual(messages(calls, "error"), []);
   assert.match(messages(calls, "info").join("\n"), /каркас поднят/);
@@ -132,27 +137,27 @@ test("apply поднимается на пустом ctx без сервисов
   assert.deepEqual(handlers.map((item) => item.event), ["dispose"], "событие dispose — хук для хостов");
 });
 
-test("apply не падает на ctx без logger, get и on", () => {
-  assert.doesNotThrow(() => apply({}, {}));
-  assert.doesNotThrow(() => apply(undefined, undefined));
+test("apply не падает на ctx без logger, get и on", async () => {
+  await assert.doesNotReject(() => apply({}, {}));
+  await assert.doesNotReject(() => apply(undefined, undefined));
 });
 
-test("apply не падает, когда ctx.get, ctx.on, ctx.effect и ctx.logger сами бросают", () => {
+test("apply не падает, когда ctx.get, ctx.on, ctx.effect и ctx.logger сами бросают", async () => {
   const { ctx } = fakeCtx({ loggerShape: "throwing" });
-  assert.doesNotThrow(() => apply(ctx, {}));
-  assert.doesNotThrow(() => apply(fakeCtx({ getThrows: true }).ctx, {}));
-  assert.doesNotThrow(() => apply(fakeCtx({ onThrows: true }).ctx, {}));
-  assert.doesNotThrow(() => apply(fakeCtx({ effectThrows: true }).ctx, {}));
-  assert.doesNotThrow(() => apply(fakeCtx({ loggerShape: "object" }).ctx, {}));
+  await assert.doesNotReject(() => apply(ctx, {}));
+  await assert.doesNotReject(() => apply(fakeCtx({ getThrows: true }).ctx, {}));
+  await assert.doesNotReject(() => apply(fakeCtx({ onThrows: true }).ctx, {}));
+  await assert.doesNotReject(() => apply(fakeCtx({ effectThrows: true }).ctx, {}));
+  await assert.doesNotReject(() => apply(fakeCtx({ loggerShape: "object" }).ctx, {}));
 });
 
-test("config не объект: warn вместо падения", () => {
+test("config не объект: warn вместо падения", async () => {
   const { ctx, calls } = fakeCtx();
-  assert.doesNotThrow(() => apply(ctx, "строка"));
+  await assert.doesNotReject(() => apply(ctx, "строка"));
   assert.match(messages(calls, "warn").join("\n"), /config/);
 });
 
-test("фича без своего сервиса пропускается с warn, остальные запускаются", () => {
+test("фича без своего сервиса пропускается с warn, остальные запускаются", async () => {
   const { ctx, calls } = fakeCtx();
   const called = [];
   const withoutService = {
@@ -162,7 +167,7 @@ test("фича без своего сервиса пропускается с wa
   };
   const plain = { name: "обычная", apply: () => called.push("обычная") };
 
-  withFeatures([withoutService, plain], () => apply(ctx, {}));
+  await withFeatures([withoutService, plain], () => apply(ctx, {}));
 
   assert.deepEqual(called, ["обычная"]);
   const warn = messages(calls, "warn").join("\n");
@@ -170,7 +175,7 @@ test("фича без своего сервиса пропускается с wa
   assert.match(warn, /userQuestions/);
 });
 
-test("фича с сервисом из ctx запускается", () => {
+test("фича с сервисом из ctx запускается", async () => {
   const { ctx } = fakeCtx({ services: { userQuestions: { ask: () => {} } } });
   const got = [];
   const feature = {
@@ -179,12 +184,12 @@ test("фича с сервисом из ctx запускается", () => {
     apply: (_ctx, _config, deps) => got.push(deps.get("userQuestions")),
   };
 
-  withFeatures([feature], () => apply(ctx, {}));
+  await withFeatures([feature], () => apply(ctx, {}));
   assert.equal(got.length, 1);
   assert.equal(typeof got[0].ask, "function");
 });
 
-test("упавшая фича не роняет apply и не мешает следующей", () => {
+test("упавшая фича не роняет apply и не мешает следующей", async () => {
   const { ctx, calls } = fakeCtx();
   const called = [];
   const broken = {
@@ -195,7 +200,7 @@ test("упавшая фича не роняет apply и не мешает сл�
   };
   const plain = { name: "после-аварии", apply: () => called.push("ok") };
 
-  withFeatures([broken, plain], () => assert.doesNotThrow(() => apply(ctx, {})));
+  await withFeatures([broken, plain], () => assert.doesNotReject(() => apply(ctx, {})));
 
   assert.deepEqual(called, ["ok"]);
   assert.match(messages(calls, "warn").join("\n"), /падает/);
@@ -206,15 +211,12 @@ test("отказ асинхронной фичи уходит в warn, а не �
   const { ctx, calls } = fakeCtx();
   const broken = { name: "async-падает", apply: async () => { throw new Error("async boom"); } };
 
-  await withFeatures([broken], async () => {
-    apply(ctx, {});
-    await new Promise((resolve) => setImmediate(resolve));
-  });
+  await withFeatures([broken], () => apply(ctx, {}));
 
   assert.match(messages(calls, "warn").join("\n"), /async boom/);
 });
 
-test("выгрузка плагина через ctx.effect снимает ресурсы фичи", () => {
+test("выгрузка плагина через ctx.effect снимает ресурсы фичи", async () => {
   const fake = fakeCtx();
   let released = 0;
   const feature = {
@@ -224,7 +226,7 @@ test("выгрузка плагина через ctx.effect снимает ре�
     }),
   };
 
-  withFeatures([feature], () => apply(fake.ctx, {}));
+  await withFeatures([feature], () => apply(fake.ctx, {}));
   assert.equal(released, 0, "до выгрузки ресурс жив");
 
   // cordis при выгрузке файбера вызывает disposer, который вернул effect().

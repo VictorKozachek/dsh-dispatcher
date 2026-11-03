@@ -81,7 +81,7 @@ function readConfig(config) {
  * `cordis.patch.yml` (сейчас `{}`, потому что включение режима живёт в состоянии,
  * а не в профиле).
  */
-export function apply(ctx, config = {}) {
+export async function apply(ctx, config = {}) {
   const logger = createLogger(ctx);
   const { settings, invalid } = readConfig(config);
   if (invalid) logger.warn("config плагина не объект — работаю с пустым конфигом");
@@ -168,13 +168,18 @@ export function apply(ctx, config = {}) {
     }
 
     try {
+      // Фича может быть асинхронной (например, ждёт `credentials.resolve`):
+      // дожидаемся её, иначе следующая фича проверит свои `needs` до того, как
+      // сервис появится, и будет пропущена навсегда.
       const result = feature.apply(ctx, settings, deps);
-      if (result && typeof result.then === "function") {
-        result.catch((error) => logger.warn(`фича ${label} упала: ${describeError(error)}`));
-      }
+      if (result !== null && typeof result?.then === "function") await result;
       started += 1;
     } catch (error) {
       logger.warn(`фича ${label} упала: ${describeError(error)}`);
+    }
+    if (disposed) {
+      logger.warn("плагин выгружен во время запуска фич — остальные не запускаю");
+      break;
     }
   }
 
