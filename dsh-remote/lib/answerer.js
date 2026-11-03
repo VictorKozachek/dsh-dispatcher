@@ -121,7 +121,15 @@ function answerSummary(question) {
  * @param {() => number} [options.now] — часы (мс epoch), в тестах подменяются.
  * @returns {{attach: (ctx: object) => () => void, handler: Function, dispose: (reason?: string) => void}}
  */
-export function createAnswerer({ transport, registry, log = noopLog, now = Date.now } = {}) {
+export function createAnswerer({ transport, registry, log = noopLog, now = Date.now, deliver = null } = {}) {
+  /**
+   * Доставка вопроса: по умолчанию — транспорт, но 008 подставляет сюда
+   * `reliability.deliver` с повторами. Сигнал `'give-up'` означает «за
+   * `connectTimeoutMs` не доставили» — тогда вопрос достаётся GUI через `next()`.
+   */
+  const sendOne = typeof deliver === "function"
+    ? async (question) => deliver({ question })
+    : async (question) => transport.sendQuestion(question);
   /** Открытые вопросы по короткому id: ждём ответа транспорта. */
   const pending = new Map();
   /** Контекст плагина: из него берём cwd сессии для scope воркспейса. */
@@ -231,7 +239,7 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       log(`вопрос ${sessionId ?? "(без агента)"}: режим выключен — отдаю GUI (next)`);
       return next();
     }
-    if (typeof transport?.sendQuestion !== "function") {
+    if (typeof deliver !== "function" && typeof transport?.sendQuestion !== "function") {
       log("вопрос: транспорт не умеет sendQuestion — отдаю GUI (next)");
       return next();
     }
@@ -285,7 +293,13 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       try {
         for (const question of questions) {
           attempted.add(question);
-          await Promise.race([transport.sendQuestion(question), aborted]);
+          const outcome = await Promise.race([sendOne(question), aborted]);
+          if (outcome === "give-up") {
+            // Недоставка за отведённое время: вопрос достаётся GUI, сессия не висит.
+            log(`вопрос ${question.shortId}: не доставлен — отдаю GUI (next)`);
+            await closeQuestions(questions, "undelivered", attempted);
+            return next();
+          }
         }
       } catch (error) {
         if (error?.name === "AbortError") {

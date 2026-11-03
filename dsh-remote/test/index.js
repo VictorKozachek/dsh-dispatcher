@@ -17,3 +17,4 @@ import "./question.spec.js";
 import "./registry.spec.js";
 import "./answerer.spec.js";
 import "./telegram.spec.js";
+import "./reliability.spec.js";
