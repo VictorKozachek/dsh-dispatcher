@@ -13,6 +13,7 @@
  */
 
 import { DEFAULT_HYBRID_WAIT_MS, createApprovals } from "../approvals.js";
+import { createApprovalPolicy } from "../approvals/policy.js";
 import { createAudit } from "../audit.js";
 import { createRegistry } from "../domain/registry.js";
 import { resolveChannel } from "../store.js";
@@ -77,8 +78,17 @@ export const approvalsFeature = {
       if (transports.length <= 1) transports = null;
     }
 
+    // 025: политика по умолчанию — безопасная (allowlist, denyRemote,
+    // таймаут = отказ); конфиг может только сузить права, но не расширить
+    // их молча.
+    const policy = createApprovalPolicy(config?.approvals, {
+      log: (message) => deps.logger.warn(message),
+    });
+    deps.logger.debug(`approvals: ${policy.describe().join("; ")}`);
+
     // Аудит решений (026): `audit.jsonl` рядом с state.json; путь можно
-    // переопределить через DSH_REMOTE_AUDIT (тесты).
+    // переопределить через DSH_REMOTE_AUDIT (тесты). Решения 025 (policy-GUI и
+    // TTL-таймаут) пишутся в тот же журнал через `audit` ниже.
     const audit = createAudit({
       ...(typeof store?.paths?.dir === "string" && store.paths.dir !== "" ? { dir: store.paths.dir } : {}),
       log: (message) => deps.logger.debug(message),
@@ -95,13 +105,18 @@ export const approvalsFeature = {
       hybrid,
       // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
       channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
+      policy,
+      ttlMs: policy.ttlMs,
+      onTimeout: () => policy.timeoutOutcome(),
       log: (message) => deps.logger.debug(message),
     });
 
     deps.onDispose(approvals.attach(ctx));
 
     try {
-      ctx.provide?.(APPROVALS_SERVICE, { stats: approvals.stats });
+      ctx.provide?.(APPROVALS_SERVICE, { stats: approvals.stats, policy });
+      // Для `/remote status` (025): действующая политика.
+      ctx.provide?.("remoteApprovalPolicy", policy);
     } catch (error) {
       deps.logger.debug(`approvals: сервис статистики не зарегистрирован (${error?.message ?? error})`);
     }
