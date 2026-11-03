@@ -1,0 +1,310 @@
+{
+  "version": 1,
+  "cryptoVersion": "dsh-relay-e2e-v1",
+  "notes": "Общие векторы e2e (задача 021). Канонический plaintext и порядок полей описаны в docs/relay/CRYPTO.md §7. Тесты JS, Kotlin и Swift читают этот файл и обязаны получить байт-в-байт те же конверты. Ключи здесь ТЕСТОВЫЕ: сгенерированы из фиксированных сидов sha256, в продакшене не используются и переиспользовать их нельзя.",
+  "keys": {
+    "device": {
+      "privateKey": "u2pN1DmvT8VZMmkLr2my0pbGG2BaQjL9fDFmxJgWCEA",
+      "publicKey": "base64:aebZVF2Bybs/hC8FmcEOKXWZCoGHSNiRRppGomidI2M="
+    },
+    "plugin": {
+      "privateKey": "OmD4dTaVTy6ejkG7ZYMbGjQAjGNcl7COGOL7W-XZJ0E",
+      "publicKey": "base64:C3fyI2jkzRqslzTWoxdpcgjtaRnPSvPu1XmOEt7ZXT8="
+    }
+  },
+  "keyId": "dpk-SrLMcCgMQqWdeCm8",
+  "valid": [
+    {
+      "name": "question-options",
+      "kind": "question",
+      "alg": "xchacha20poly1305",
+      "meta": {
+        "id": "b1e2c3d4-0000-4000-8000-000000000010",
+        "shortId": "a1b2c3d4",
+        "createdAt": "2026-11-03T18:00:00Z",
+        "expiresAt": "2026-11-03T18:30:00Z"
+      },
+      "plaintext": {
+        "body": "Продолжать?",
+        "title": "Вопрос агента",
+        "options": [
+          {
+            "id": "o1",
+            "label": "Да"
+          },
+          {
+            "id": "o2",
+            "label": "Нет"
+          }
+        ]
+      },
+      "plaintextCanonical": "{\"body\":\"Продолжать?\",\"title\":\"Вопрос агента\",\"options\":[{\"id\":\"o1\",\"label\":\"Да\"},{\"id\":\"o2\",\"label\":\"Нет\"}]}",
+      "nonce": "6ahuYeGAAq4sHXWn",
+      "envelope": {
+        "enc": "AbyOFT3b5gu64dCZ7s16jXFwZgykJEVOp87cyx1sTGPtFuWS2GbgV1xZQCB7mGovjbPqFJ5Ddne0qLOnwBk+0R5IHHpcE6i2KhxzHs/gSgrU1t+ra+9J8oHauNvxVBcow//J170iDdMNCjzCO3mF86lw9abebr3rA2z5fgkBNHmDvqRUg4Np5HWE5VHlA5CZEs093PXQAUs=",
+        "nonce": "6ahuYeGAAq4sHXWn",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "xchacha20poly1305",
+        "plainSize": 136
+      }
+    },
+    {
+      "name": "question-detail",
+      "kind": "question",
+      "alg": "xchacha20poly1305",
+      "meta": {
+        "id": "b1e2c3d4-0000-4000-8000-000000000010",
+        "shortId": "a1b2c3d4",
+        "createdAt": "2026-11-03T18:00:00Z",
+        "expiresAt": "2026-11-03T18:30:00Z"
+      },
+      "plaintext": {
+        "body": "Продолжать?",
+        "detail": "Проверка деталей вопроса"
+      },
+      "plaintextCanonical": "{\"body\":\"Продолжать?\",\"detail\":\"Проверка деталей вопроса\"}",
+      "nonce": "nKywnjso7FL9sU5j",
+      "envelope": {
+        "enc": "Y361uvYqA2DDhxnR8jnIIn+SFu2ofa3TRb/ihFMlKo84mE3ToO6hDsYX22YIS1tYTQTb7FHEKjFsvG5axLHVyOvGBdTKBZ9GAHtYiFjphAH3NmGhcMa5TyF6Pzbjw+pJCzJuq2hfPnG3HQ==",
+        "nonce": "nKywnjso7FL9sU5j",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "xchacha20poly1305",
+        "plainSize": 90
+      }
+    },
+    {
+      "name": "question-emoji",
+      "kind": "question",
+      "alg": "xchacha20poly1305",
+      "meta": {
+        "id": "b1e2c3d4-0000-4000-8000-000000000010",
+        "shortId": "a1b2c3d4",
+        "createdAt": "2026-11-03T18:00:00Z",
+        "expiresAt": "2026-11-03T18:30:00Z"
+      },
+      "plaintext": {
+        "body": "Запускать деплой? 🚀",
+        "title": "Деплой"
+      },
+      "plaintextCanonical": "{\"body\":\"Запускать деплой? 🚀\",\"title\":\"Деплой\"}",
+      "nonce": "OzKWNqZZRsX1da3S",
+      "envelope": {
+        "enc": "3HqOoEpHZNpqycE+svfmpOIj1BKzkUR3RtZdHA8eA2oyLZQcaNIhXAz3auEpDbdtmI+JELjy9nLvNi1+f2LUzl/ddjYRWKg2I0gDY5H79BMv5aVYboPI",
+        "nonce": "OzKWNqZZRsX1da3S",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "xchacha20poly1305",
+        "plainSize": 71
+      }
+    },
+    {
+      "name": "question-aes",
+      "kind": "question",
+      "alg": "aes256gcm",
+      "meta": {
+        "id": "b1e2c3d4-0000-4000-8000-000000000010",
+        "shortId": "a1b2c3d4",
+        "createdAt": "2026-11-03T18:00:00Z",
+        "expiresAt": "2026-11-03T18:30:00Z"
+      },
+      "plaintext": {
+        "body": "Продолжать?",
+        "options": [
+          {
+            "id": "o1",
+            "label": "Да"
+          }
+        ]
+      },
+      "plaintextCanonical": "{\"body\":\"Продолжать?\",\"options\":[{\"id\":\"o1\",\"label\":\"Да\"}]}",
+      "nonce": "8LxyQZ91pD8Zjv6n",
+      "envelope": {
+        "enc": "KgOq0gpmrEkfsscgyoiN1lQwBJxK6utLH8rnOZiOy/2f2JRD65sQptTJ12Tkd1mvUTjPO32O9cQe0eGEYtN8bLLEGHuPYyPdA6ywS7fi8AUQUO5zKKDX",
+        "nonce": "8LxyQZ91pD8Zjv6n",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "aes256gcm",
+        "plainSize": 71
+      }
+    },
+    {
+      "name": "answer-selected",
+      "kind": "answer",
+      "alg": "xchacha20poly1305",
+      "meta": {
+        "questionId": "b1e2c3d4-0000-4000-8000-000000000010",
+        "answeredAt": "2026-11-03T18:05:00Z",
+        "idempotencyKey": "3f2a1b0c-9d8e-4f70-a1b2-c3d4e5f60718"
+      },
+      "plaintext": {
+        "selected": [
+          "o1"
+        ]
+      },
+      "plaintextCanonical": "{\"selected\":[\"o1\"]}",
+      "nonce": "4cpdCYSYoYmTNcdD",
+      "envelope": {
+        "enc": "MKf2juJUZ8UHmLRhStCe/6OfMsGyiz3uR+qLK5hM/3+Y/mw=",
+        "nonce": "4cpdCYSYoYmTNcdD",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "xchacha20poly1305",
+        "plainSize": 19
+      }
+    },
+    {
+      "name": "answer-custom",
+      "kind": "answer",
+      "alg": "aes256gcm",
+      "meta": {
+        "questionId": "b1e2c3d4-0000-4000-8000-000000000010",
+        "answeredAt": "2026-11-03T18:05:00Z",
+        "idempotencyKey": "3f2a1b0c-9d8e-4f70-a1b2-c3d4e5f60718"
+      },
+      "plaintext": {
+        "custom": "ок, только без спешки"
+      },
+      "plaintextCanonical": "{\"custom\":\"ок, только без спешки\"}",
+      "nonce": "2H4NbjTsNcObhKJY",
+      "envelope": {
+        "enc": "fgNaWcj8qHAaERR/ll1vXmuxaC2exwniWwXR+U6ynHnW9VVlPa4A4+N1uB0mYWzNOyGE1d4dMOkbO59qiCdzGRihkQ==",
+        "nonce": "2H4NbjTsNcObhKJY",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "aes256gcm",
+        "plainSize": 51
+      }
+    },
+    {
+      "name": "answer-both",
+      "kind": "answer",
+      "alg": "xchacha20poly1305",
+      "meta": {
+        "questionId": "b1e2c3d4-0000-4000-8000-000000000010",
+        "answeredAt": "2026-11-03T18:05:00Z",
+        "idempotencyKey": "3f2a1b0c-9d8e-4f70-a1b2-c3d4e5f60718"
+      },
+      "plaintext": {
+        "selected": [
+          "o2"
+        ],
+        "custom": "через час"
+      },
+      "plaintextCanonical": "{\"selected\":[\"o2\"],\"custom\":\"через час\"}",
+      "nonce": "1kVpHO5EjQBRi3E3",
+      "envelope": {
+        "enc": "1yz101imGr9hem3gYxD98JgTAWhGNMuIzV3BmQGGmIfCXW2GqfSOBdNop/goglF3CHZt5CaGt920dpv5pWIXNA==",
+        "nonce": "1kVpHO5EjQBRi3E3",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "xchacha20poly1305",
+        "plainSize": 48
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "tampered-question",
+      "kind": "question",
+      "meta": {
+        "id": "b1e2c3d4-0000-4000-8000-000000000010",
+        "shortId": "a1b2c3d4",
+        "createdAt": "2026-11-03T18:00:00Z",
+        "expiresAt": "2026-11-03T18:30:00Z"
+      },
+      "envelope": {
+        "enc": "AbyOFT3b5gu64dCZ7s16jXFwZgykJEVOp87cyx1sTGPtFuWS2GbgV1xZQCB7mGovjbPqFJ5Ddne0qLOnwBk+0R5IHHpcE6i2KhxzHs/gSgrU1t+ra+9J8oHauNvxVBcow//J170iDdMNCjzCO3mF86lw9abebr3rA2z5fgkBNHmDvqRUg4Np5HWE5VHlA5CZEs093PXQAUA=",
+        "nonce": "6ahuYeGAAq4sHXWn",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "xchacha20poly1305",
+        "plainSize": 136
+      },
+      "error": "decrypt-failed"
+    },
+    {
+      "name": "aad-mismatch-question",
+      "kind": "question",
+      "meta": {
+        "id": "b1e2c3d4-0000-4000-8000-000000000010",
+        "shortId": "a1b2c3d4",
+        "createdAt": "2026-11-03T18:00:00Z",
+        "expiresAt": "2026-11-03T19:00:00Z"
+      },
+      "envelope": {
+        "enc": "AbyOFT3b5gu64dCZ7s16jXFwZgykJEVOp87cyx1sTGPtFuWS2GbgV1xZQCB7mGovjbPqFJ5Ddne0qLOnwBk+0R5IHHpcE6i2KhxzHs/gSgrU1t+ra+9J8oHauNvxVBcow//J170iDdMNCjzCO3mF86lw9abebr3rA2z5fgkBNHmDvqRUg4Np5HWE5VHlA5CZEs093PXQAUs=",
+        "nonce": "6ahuYeGAAq4sHXWn",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "xchacha20poly1305",
+        "plainSize": 136
+      },
+      "error": "decrypt-failed"
+    },
+    {
+      "name": "wrong-key",
+      "kind": "question",
+      "meta": {
+        "id": "b1e2c3d4-0000-4000-8000-000000000010",
+        "shortId": "a1b2c3d4",
+        "createdAt": "2026-11-03T18:00:00Z",
+        "expiresAt": "2026-11-03T18:30:00Z"
+      },
+      "envelope": {
+        "enc": "AbyOFT3b5gu64dCZ7s16jXFwZgykJEVOp87cyx1sTGPtFuWS2GbgV1xZQCB7mGovjbPqFJ5Ddne0qLOnwBk+0R5IHHpcE6i2KhxzHs/gSgrU1t+ra+9J8oHauNvxVBcow//J170iDdMNCjzCO3mF86lw9abebr3rA2z5fgkBNHmDvqRUg4Np5HWE5VHlA5CZEs093PXQAUs=",
+        "nonce": "6ahuYeGAAq4sHXWn",
+        "keyId": "dpk-AAAAAAAAAAAAAAAA",
+        "alg": "xchacha20poly1305",
+        "plainSize": 136
+      },
+      "error": "key-mismatch"
+    },
+    {
+      "name": "short-nonce",
+      "kind": "question",
+      "meta": {
+        "id": "b1e2c3d4-0000-4000-8000-000000000010",
+        "shortId": "a1b2c3d4",
+        "createdAt": "2026-11-03T18:00:00Z",
+        "expiresAt": "2026-11-03T18:30:00Z"
+      },
+      "envelope": {
+        "enc": "AbyOFT3b5gu64dCZ7s16jXFwZgykJEVOp87cyx1sTGPtFuWS2GbgV1xZQCB7mGovjbPqFJ5Ddne0qLOnwBk+0R5IHHpcE6i2KhxzHs/gSgrU1t+ra+9J8oHauNvxVBcow//J170iDdMNCjzCO3mF86lw9abebr3rA2z5fgkBNHmDvqRUg4Np5HWE5VHlA5CZEs093PXQAUs=",
+        "nonce": "AAAAAAAAAAAAAAA=",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "xchacha20poly1305",
+        "plainSize": 136
+      },
+      "error": "bad-envelope"
+    },
+    {
+      "name": "unknown-alg",
+      "kind": "question",
+      "meta": {
+        "id": "b1e2c3d4-0000-4000-8000-000000000010",
+        "shortId": "a1b2c3d4",
+        "createdAt": "2026-11-03T18:00:00Z",
+        "expiresAt": "2026-11-03T18:30:00Z"
+      },
+      "envelope": {
+        "enc": "AbyOFT3b5gu64dCZ7s16jXFwZgykJEVOp87cyx1sTGPtFuWS2GbgV1xZQCB7mGovjbPqFJ5Ddne0qLOnwBk+0R5IHHpcE6i2KhxzHs/gSgrU1t+ra+9J8oHauNvxVBcow//J170iDdMNCjzCO3mF86lw9abebr3rA2z5fgkBNHmDvqRUg4Np5HWE5VHlA5CZEs093PXQAUs=",
+        "nonce": "6ahuYeGAAq4sHXWn",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "rot13",
+        "plainSize": 136
+      },
+      "error": "unsupported-alg"
+    },
+    {
+      "name": "bad-plainsize",
+      "kind": "question",
+      "meta": {
+        "id": "b1e2c3d4-0000-4000-8000-000000000010",
+        "shortId": "a1b2c3d4",
+        "createdAt": "2026-11-03T18:00:00Z",
+        "expiresAt": "2026-11-03T18:30:00Z"
+      },
+      "envelope": {
+        "enc": "AbyOFT3b5gu64dCZ7s16jXFwZgykJEVOp87cyx1sTGPtFuWS2GbgV1xZQCB7mGovjbPqFJ5Ddne0qLOnwBk+0R5IHHpcE6i2KhxzHs/gSgrU1t+ra+9J8oHauNvxVBcow//J170iDdMNCjzCO3mF86lw9abebr3rA2z5fgkBNHmDvqRUg4Np5HWE5VHlA5CZEs093PXQAUs=",
+        "nonce": "6ahuYeGAAq4sHXWn",
+        "keyId": "dpk-SrLMcCgMQqWdeCm8",
+        "alg": "xchacha20poly1305",
+        "plainSize": 137
+      },
+      "error": "bad-envelope"
+    }
+  ]
+}

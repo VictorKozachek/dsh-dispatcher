@@ -24,6 +24,7 @@
 
 import { randomUUID } from "node:crypto";
 
+import { CryptoError, createE2e } from "../crypto.js";
 import { DEFAULT_CAPS } from "./base.js";
 
 /** Заголовок версии протокола: обязателен для каждого запроса (016 §2). */
@@ -77,7 +78,11 @@ function joinUrl(base, path) {
  * @param {string} options.url — базовый URL релея (`https://relay.example`).
  * @param {string} options.agentToken — Bearer агента (публикация вопросов, чтение ответов).
  * @param {string|null} [options.deviceToken] — токен устройства (если релей различает).
- * @param {string|null} [options.keyId] — id ключа e2e (конверт подключается задачей 021).
+ * @param {string|null} [options.keyId] — устаревший id ключа e2e (021 передаёт его через `e2e.keyId`).
+ * @param {{privateKey: string, devicePublicKey: string, alg?: string, require?: boolean}|null} [options.e2e]
+ *   ключи e2e (задача 021): приватный ключ плагина (base64url) и публичный ключ
+ *   устройства (формат провода `base64:...`). Без них транспорт работает в открытом
+ *   режиме; `require: true` запрещает публиковать вопросы открытым текстом.
  * @param {typeof fetch} [options.fetch] — инжектируемая сеть.
  * @param {(url: string, headers: object) => object} [options.wsFactory] — фабрика WS.
  * @param {(ms: number) => Promise<void>} [options.sleep]
@@ -91,6 +96,7 @@ export function createRelayTransport({
   agentToken = null,
   deviceToken = null,
   keyId = null,
+  e2e = null,
   fetch: fetchImpl = globalThis.fetch,
   wsFactory = null,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -138,6 +144,40 @@ export function createRelayTransport({
 
   const safeLog = (message) => log(redact(message, token));
 
+  /**
+   * Криптослой e2e (задача 021). Включается, только когда есть оба ключа:
+   * приватный ключ плагина и публичный ключ устройства. Отсутствие ключей при
+   * `e2e.require = true` — ошибка конфига, а не молчаливый открытый режим.
+   */
+  let e2eCrypto = null;
+  if (e2e !== null && e2e !== undefined) {
+    if (typeof e2e !== "object") {
+      throw new TypeError("relay: e2e должен быть объектом {privateKey, devicePublicKey, alg?}");
+    }
+    const missing = [];
+    if (typeof e2e.privateKey !== "string" || e2e.privateKey === "") missing.push("privateKey");
+    if (typeof e2e.devicePublicKey !== "string" || e2e.devicePublicKey === "") missing.push("devicePublicKey");
+    if (missing.length > 0) {
+      if (e2e.require === true) {
+        throw new TypeError(`relay: для e2e нужны ${missing.join(", ")} (require: true, открытый режим запрещён)`);
+      }
+      safeLog(`relay: e2e выключен — нет ${missing.join(", ")}`);
+    } else {
+      try {
+        e2eCrypto = createE2e({
+          privateKey: e2e.privateKey,
+          peerPublicKey: e2e.devicePublicKey,
+          alg: e2e.alg,
+          keyId: e2e.keyId,
+        });
+        safeLog(`relay: e2e включён (keyId ${e2eCrypto.keyId}, alg ${e2eCrypto.alg})`);
+      } catch (error) {
+        if (e2e.require === true) throw error;
+        safeLog(`relay: e2e выключен — ${error?.message ?? error}`);
+      }
+    }
+  }
+
   function authHeaders() {
     return {
       authorization: `Bearer ${token}`,
@@ -184,28 +224,86 @@ export function createRelayTransport({
     return payload;
   }
 
-  /** Тело вопроса по контракту 023 (открытый режим; e2e — задача 021). */
+  /**
+   * Тело вопроса по контракту 023: открытый режим или e2e-конверт (задача 021).
+   *
+   * В e2e-режиме схема запрещает `body`/`title`/`detail`/`options` рядом с `enc`,
+   * поэтому открытыми остаются только метаданные: id, shortId, timestamps,
+   * workspace, taskId, role, optionCount, multiSelect, allowFreeText.
+   */
   function questionPayload(question) {
-    const body = {
-      id: question?.id,
-      shortId: question?.shortId,
-      createdAt: new Date(question?.createdAt ?? now()).toISOString(),
-      expiresAt: new Date(question?.expiresAt ?? now() + 30 * 60 * 1000).toISOString(),
-      options: (question?.options ?? []).map((option) => ({ id: option.id, label: option.label })),
-    };
+    const createdAt = new Date(question?.createdAt ?? now()).toISOString();
+    const expiresAt = new Date(question?.expiresAt ?? now() + 30 * 60 * 1000).toISOString();
+    const options = (question?.options ?? []).map((option) => ({ id: option.id, label: option.label }));
+    const meta = { id: question?.id, shortId: question?.shortId, createdAt, expiresAt };
+    const body = { ...meta };
+
     if (typeof question?.workspace === "string") body.workspace = question.workspace;
     if (typeof question?.taskId === "string") body.taskId = question.taskId;
     if (typeof question?.role === "string") body.role = question.role;
+    if (question?.multiSelect === true) body.multiSelect = true;
+    // allowFreeText — булево поле контракта: отправляем и true, и false.
+    if (typeof question?.allowFreeText === "boolean") body.allowFreeText = question.allowFreeText;
+
+    if (e2eCrypto !== null) {
+      body.optionCount = options.length;
+      body.enc = e2eCrypto.sealQuestion(
+        {
+          ...(typeof question?.body === "string" ? { body: question.body } : {}),
+          ...(typeof question?.title === "string" ? { title: question.title } : {}),
+          ...(typeof question?.detail === "string" ? { detail: question.detail } : {}),
+          ...(options.length === 0 ? {} : { options }),
+        },
+        meta,
+      );
+      return body;
+    }
+
+    body.options = options;
     if (typeof question?.title === "string") body.title = question.title;
     if (typeof question?.body === "string") body.body = question.body;
     if (typeof question?.detail === "string") body.detail = question.detail;
-    if (question?.multiSelect === true) body.multiSelect = true;
-    // 5) allowFreeText — булево поле контракта: отправляем и true, и false.
-    if (typeof question?.allowFreeText === "boolean") body.allowFreeText = question.allowFreeText;
-    // keyId здесь НЕ отправляем: в 016/023 у Question такого поля нет, а релей 017
-    // отвергает неизвестные поля (400). Он нужен только конверту e2e (задача 021),
-    // поэтому живёт в конфиге транспорта и попадёт в `enc`, а не в открытую часть.
+    // keyId в открытую часть не отправляем: у Question 016/023 такого поля нет.
     return body;
+  }
+
+  /**
+   * Разобрать ответ релея: открытый (`selected`/`custom`) или e2e-конверт (021).
+   *
+   * `null` — ответ не разобрать (битый конверт, чужой ключ, e2e не настроен):
+   * такой ответ не эмитим и снимаем из `sent`, иначе long-poll опрашивал бы его
+   * бесконечно, получая тот же битый конверт.
+   */
+  function decodeAnswer(answer, questionId) {
+    if (answer === null || typeof answer !== "object") return { selected: [], text: "" };
+    if (typeof answer.questionId === "string" && answer.questionId !== questionId) {
+      safeLog(`relay: ответ пришёл про другой вопрос (${answer.questionId} ≠ ${questionId}) — пропущен`);
+      return null;
+    }
+    if (answer.enc !== undefined && answer.enc !== null) {
+      if (e2eCrypto === null) {
+        safeLog("relay: ответ зашифрован, а e2e не настроен — ответ пропущен");
+        return null;
+      }
+      try {
+        const plain = e2eCrypto.openAnswer(answer.enc, {
+          questionId,
+          answeredAt: answer.answeredAt,
+          idempotencyKey: answer.idempotencyKey,
+        });
+        return {
+          selected: Array.isArray(plain.selected) ? plain.selected : [],
+          text: typeof plain.custom === "string" ? plain.custom : "",
+        };
+      } catch (error) {
+        safeLog(`relay: конверт ответа не расшифрован (${error?.code ?? error?.message ?? error}) — ответ пропущен`);
+        return null;
+      }
+    }
+    return {
+      selected: Array.isArray(answer.selected) ? answer.selected : [],
+      text: typeof answer.custom === "string" ? answer.custom : "",
+    };
   }
 
   function emit(answer) {
@@ -224,14 +322,14 @@ export function createRelayTransport({
     const record = sent.get(questionId);
     if (record === undefined) return null;
     const answer = await call("GET", `/v1/answers?questionId=${encodeURIComponent(questionId)}`);
-    const selected = Array.isArray(answer?.selected) ? answer.selected : [];
-    const text = typeof answer?.custom === "string" ? answer.custom : "";
+    const decoded = decodeAnswer(answer, questionId);
     settled.add(questionId);
     sent.delete(questionId);
+    if (decoded === null) return null;
     return {
       shortId: record.shortId,
-      optionIds: selected,
-      ...(text === "" ? {} : { text }),
+      optionIds: decoded.selected,
+      ...(decoded.text === "" ? {} : { text: decoded.text }),
     };
   }
 
@@ -266,12 +364,16 @@ export function createRelayTransport({
         }
         const record = sent.get(questionId);
         if (record === undefined || settled.has(questionId)) continue;
-        const selected = Array.isArray(answer?.selected) ? answer.selected : [];
-        const text = typeof answer?.custom === "string" ? answer.custom : "";
+        const decoded = decodeAnswer(answer, questionId);
         settled.add(questionId);
         sent.delete(questionId);
         progressed = true;
-        emit({ shortId: record.shortId, optionIds: selected, ...(text === "" ? {} : { text }) });
+        if (decoded === null) continue;
+        emit({
+          shortId: record.shortId,
+          optionIds: decoded.selected,
+          ...(decoded.text === "" ? {} : { text: decoded.text }),
+        });
       }
       if (!progressed) await sleep(250);
     }
@@ -479,6 +581,11 @@ export function createRelayTransport({
     /** Для `/remote status`: сколько вопросов ждёт ответа. */
     get pending() {
       return sent.size;
+    },
+
+    /** Для `/remote status`: включён ли e2e и каким ключом (без секретов). */
+    get e2e() {
+      return e2eCrypto === null ? null : { keyId: e2eCrypto.keyId, alg: e2eCrypto.alg };
     },
   };
 

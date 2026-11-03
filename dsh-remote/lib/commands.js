@@ -774,6 +774,10 @@ export function createRemoteCommands({
         const health = typeof relay?.healthCheck === "function" ? await relay.healthCheck() : { ok: false, detail: "канал не поднят" };
         lines.push(`релей: ${state.bindings.url ?? "?"}, ${health.ok ? "на связи" : `нет связи (${health.detail})`}`
           + `${Number.isFinite(relay?.pending) ? `, ждёт ответа: ${relay.pending}` : ""}`);
+        const e2e = relay?.e2e ?? null;
+        lines.push(e2e === null
+          ? "e2e: выключен — тело вопроса и варианты идут открытым текстом"
+          : `e2e: включён (keyId ${e2e.keyId}, alg ${e2e.alg}) — тело вопроса и варианты шифруются`);
       } else {
         lines.push(`бот: @${state.bindings.botUsername ?? "?"} (${state.bindings.transport}), чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
       }
