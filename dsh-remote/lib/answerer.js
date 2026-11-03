@@ -103,6 +103,14 @@ function choiceFor(question, event) {
   };
 }
 
+/** Сводка ответа для правки сообщения: выбранные варианты и/или текст. */
+function answerSummary(question) {
+  const selected = Array.isArray(question?.answer?.selected) ? question.answer.selected : [];
+  const custom = typeof question?.answer?.custom === "string" ? question.answer.custom : "";
+  const parts = [...selected, ...(custom === "" ? [] : [custom])];
+  return parts.join(", ");
+}
+
 /**
  * Ответчик.
  *
@@ -161,8 +169,15 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
   }
 
-  /** Ответ транспорта: разнести по ожидающим вопросам и разбудить слушатель. */
-  function onTransportAnswer(event) {
+  /**
+   * Ответ транспорта: разнести по ожидающим вопросам, закрыть сообщение и
+   * разбудить слушатель.
+   *
+   * Сообщение правится на «✅ Отвечено: …» именно здесь: ответ уже принят доменом,
+   * и человеку в мессенджере незачем видеть кнопки вопроса, на который он ответил.
+   * Ошибка правки не мешает ответу — ответ всё равно уходит в сессию.
+   */
+  async function onTransportAnswer(event) {
     const normalized = normalizeAnswerEvent(event);
     if (normalized === null) {
       log("ответ транспорта: событие без shortId — игнор");
@@ -180,6 +195,11 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     }
     if (!entry.question.accept(parsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
     pending.delete(normalized.shortId);
+    try {
+      await transport?.closeQuestion?.(entry.question, answerSummary(entry.question));
+    } catch (error) {
+      log(`вопрос ${normalized.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
+    }
     entry.resolve(entry.question);
   }
 

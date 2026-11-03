@@ -11,6 +11,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createTelegramTransport, TelegramError } from "../lib/transport/telegram.js";
+import { createAnswerer } from "../lib/answerer.js";
+import { createRegistry } from "../lib/domain/registry.js";
 import { checkTransport } from "../lib/transport/base.js";
 import { telegramFeature } from "../lib/features/telegram.js";
 
@@ -525,6 +527,61 @@ function fakeDeps({ services = {} } = {}) {
   };
 }
 
+test("фича telegram: credentials.resolve -> сервис remoteTransport и поллинг", async (t) => {
+  const polls = [];
+  let provided = null;
+  let disposed = false;
+  const fetchImpl = async (url, init = {}) => {
+    const method = url.split("/").pop();
+    const signal = init.signal;
+    if (method === "getUpdates") {
+      // Висим до отмены: так видно, что dispose действительно останавливает цикл.
+      return new Promise((resolve, reject) => {
+        polls.push({ resolve });
+        signal?.addEventListener?.("abort", () => reject(abortError()), { once: true });
+      });
+    }
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return { ok: true, result: { message_id: 100, username: "test_bot" } };
+      },
+    };
+  };
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const ctx = {
+    provide: (name, transport) => {
+      provided = { name, transport };
+    },
+  };
+  const { deps, logs, disposers } = fakeDeps({
+    services: {
+      credentials: { resolve: async () => ({ value: "123456:TEST-TOKEN", source: "file" }) },
+    },
+  });
+
+  await telegramFeature.apply(ctx, {
+    telegram: { tokenRef: "tg", chatId: 42, allowedUserIds: [7], pollTimeoutSec: 25 },
+  }, deps);
+
+  assert.equal(provided?.name, "remoteTransport", "сервис зарегистрирован под общим именем");
+  assert.equal(provided?.transport.id, "telegram");
+  assert.equal(provided?.transport.polling, true, "поллинг запущен");
+  assert.equal(disposers.length, 1, "выгрузка плагина останавливает транспорт");
+  assert.match(logs.join("\n"), /зарегистрирован как remoteTransport/);
+
+  await provided.transport.stop();
+  await settle();
+  assert.equal(provided.transport.polling, false, "stop() останавливает цикл");
+});
+
 test("фича telegram заявляет имя и не требует сервисов", () => {
   assert.equal(telegramFeature.name, "telegram");
   assert.deepEqual(telegramFeature.needs, []);
@@ -543,29 +600,132 @@ test("фича telegram без привязки спит: ни транспор�
   assert.equal(disposers.length, 0, "снимать нечего");
 });
 
-test("фича telegram без токена в credentials спит с предупреждением", () => {
+test("фича telegram без токена в credentials спит с предупреждением", async () => {
   const ctx = {
     provide: () => assert.fail("без токена сервис не регистрируется"),
   };
   const { deps, logs, disposers } = fakeDeps({
-    services: { credentials: { get: () => null } },
+    // Настоящий провайдер: асинхронный resolve -> {value, source} | undefined.
+    services: { credentials: { resolve: async () => undefined } },
   });
 
-  assert.doesNotThrow(() => telegramFeature.apply(ctx, { telegram: { tokenRef: "tg", chatId: 42 } }, deps));
+  await telegramFeature.apply(ctx, { telegram: { tokenRef: "tg", chatId: 42 } }, deps);
 
   assert.match(logs.join("\n"), /токена нет в ctx.credentials/);
   assert.equal(disposers.length, 0);
 });
 
-test("фича telegram без chatId спит с предупреждением", () => {
+test("фича telegram без chatId спит с предупреждением", async () => {
   const ctx = {
     provide: () => assert.fail("без chatId сервис не регистрируется"),
   };
   const { deps, logs } = fakeDeps({
-    services: { credentials: { get: () => "123456:TEST-TOKEN" } },
+    services: { credentials: { resolve: async () => ({ value: "123456:TEST-TOKEN", source: "file" }) } },
   });
 
-  assert.doesNotThrow(() => telegramFeature.apply(ctx, { telegram: { tokenRef: "tg" } }, deps));
+  await telegramFeature.apply(ctx, { telegram: { tokenRef: "tg" } }, deps);
 
   assert.match(logs.join("\n"), /нет chatId/);
+});
+
+// --- регрессии по ревью 004 -------------------------------------------------
+
+/** Элемент `AskUserQuestionItem` для ответчика (задача 002). */
+function askItem(overrides = {}) {
+  return {
+    id: "q1",
+    question: "Продолжать деплой?",
+    options: [{ label: "Да" }, { label: "Нет" }],
+    ...overrides,
+  };
+}
+
+/** HTML-строка валидна для Telegram: сущности целые, теги сбалансированы. */
+function assertValidHtml(text, limit) {
+  assert.ok(text.length <= limit, `сообщение длиннее ${limit}: ${JSON.stringify(text)}`);
+  assert.equal(/&(?!(amp|lt|gt);)/.test(text), false, `оборванная сущность: ${JSON.stringify(text)}`);
+  const open = (text.match(/<(b|i)>/g) ?? []).length;
+  const close = (text.match(/<\/(b|i)>/g) ?? []).length;
+  assert.equal(open, close, `теги не сбалансированы: ${JSON.stringify(text)}`);
+}
+
+test("длинный текст с & и < режется без разрыва сущностей и тегов", async () => {
+  const { transport, calls } = setup({ caps: { maxText: 12 } });
+
+  await transport.sendQuestion({
+    shortId: SHORT,
+    title: "Заголовок с < > &",
+    body: "xxxxxxxxxxxxxxxxxx&xxxxxxxxxxxxxxxxxx",
+    detail: "хвост & < >",
+    options: [{ id: "o1", label: "Да" }],
+  });
+
+  const sends = calls.filter((call) => call.method === "sendMessage");
+  assert.ok(sends.length > 1, "текст разбит на несколько сообщений");
+  for (const send of sends) assertValidHtml(send.payload.text, 12);
+  assert.equal(sends.at(-1).payload.reply_markup.inline_keyboard.length, 1, "кнопки на последнем");
+});
+
+test("полный цикл: ответчик + telegram — ответ правит сообщение и снимает кнопки", async () => {
+  const { transport, calls, polls } = setup();
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({ transport, registry, log: () => {}, now: () => 1_000 });
+  answerer.attach({ on: () => () => {}, get: () => null });
+
+  const pending = answerer.handler(
+    { questions: [askItem()], agent: { id: "s1" } },
+    () => assert.fail("next() звать нельзя: вопрос забрали"),
+  );
+  await settle();
+  await transport.start();
+  // shortId вопроса генерирует домен, поэтому берём его из отправленного сообщения.
+  const [sentShortId] = transport.messages.keys();
+  polls.shift()(response({ ok: true, result: [callbackUpdate({ updateId: 90, data: `q:${sentShortId}:o1` })] }));
+
+  const result = await pending;
+
+  assert.deepEqual(result, { answers: [{ id: "q1", selected: ["Да"] }] });
+  const edit = calls.find((call) => call.method === "editMessageText");
+  assert.ok(edit, "сообщение правится на «Отвечено»");
+  assert.match(edit.payload.text, /✅ <b>Отвечено<\/b>: Да/);
+  assert.deepEqual(edit.payload.reply_markup, { inline_keyboard: [] }, "кнопки сняты");
+  assert.equal(transport.messages.has(sentShortId), false, "закрытая запись снята из карты");
+  await transport.stop();
+});
+
+test("аборт во время отправки: сообщение закрывается после завершения sendMessage", async () => {
+  let releaseSend;
+  const { transport, calls } = setup({
+    routes: {
+      sendMessage: () => new Promise((resolve) => {
+        releaseSend = resolve;
+      }),
+    },
+  });
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({ transport, registry, log: () => {}, now: () => 1_000 });
+  answerer.attach({ on: () => () => {}, get: () => null });
+
+  const controller = new AbortController();
+  const pending = answerer.handler(
+    { questions: [askItem()], agent: { id: "s1" }, signal: controller.signal },
+    () => assert.fail("next() звать нельзя"),
+  );
+  await settle();
+  controller.abort();
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+
+  assert.equal(calls.some((call) => call.method === "editMessageReplyMarkup"), false, "править пока нечего");
+  // Запись заводится до отправки; shortId вопроса генерирует домен.
+  const [shortId] = transport.messages.keys();
+  assert.ok(shortId !== undefined, "запись ждёт завершения отправки");
+
+  releaseSend(response({ ok: true, result: { message_id: 500 } }));
+  await settle(6);
+
+  const edit = calls.find((call) => call.method === "editMessageReplyMarkup");
+  assert.ok(edit, "сообщение закрыто, когда отправка завершилась");
+  assert.equal(edit.payload.message_id, 500);
+  assert.deepEqual(edit.payload.reply_markup, { inline_keyboard: [] }, "кнопки сняты");
+  assert.equal(transport.messages.has(shortId), false, "открытых записей не осталось");
 });

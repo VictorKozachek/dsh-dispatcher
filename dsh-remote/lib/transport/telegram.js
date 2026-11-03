@@ -32,7 +32,6 @@ import {
   checkTransport,
   chrome,
   parseCallbackData,
-  splitText,
 } from "./base.js";
 
 /** Базовый адрес Bot API: тот же формат, что в доке (`/bot<token>/<method>`). */
@@ -116,13 +115,106 @@ function escapeHtml(text) {
     .replaceAll(">", "&gt;");
 }
 
-/** Сообщение вопроса: заголовок жирным, тело, подробности курсивом. */
-function renderText(question) {
-  const title = question?.title ? `<b>${escapeHtml(question.title)}</b>\n` : "";
-  const body = escapeHtml(question?.body ?? "");
-  const detail = question?.detail ? `\n\n<i>${escapeHtml(question.detail)}</i>` : "";
-  const text = `${title}${body}${detail}`;
-  return text === "" ? "(пустой вопрос)" : text;
+/**
+ * Токены HTML-безопасной нарезки: сущность (`&amp;`) и code point неделимы.
+ *
+ * Резать уже собранную HTML-строку нельзя: граница может попасть внутрь
+ * `&amp;`/`&lt;` или между `<b>` и текстом, и `parse_mode: "HTML"` получит
+ * сломанную разметку. Поэтому экранируем по одному символу и режем по токенам.
+ */
+function htmlTokens(text) {
+  const tokens = [];
+  for (const point of String(text ?? "")) {
+    if (point === "&") tokens.push({ text: "&amp;", space: false });
+    else if (point === "<") tokens.push({ text: "&lt;", space: false });
+    else if (point === ">") tokens.push({ text: "&gt;", space: false });
+    else tokens.push({ text: point, space: /\s/.test(point) });
+  }
+  return tokens;
+}
+
+/**
+ * Нарезать **простой** текст под предел сообщения, экранируя HTML по дороге.
+ *
+ * Предел считается по длине готовой HTML-строки (Telegram считает символы после
+ * парсинга entities, то есть строже), поэтому кусок гарантированно влезает.
+ * Перенос предпочитаем по пробелу, но никогда не рвём сущность или суррогатную пару.
+ */
+export function splitHtml(text, limit) {
+  const max = Math.max(1, Math.floor(limit));
+  const chunks = [];
+  let current = "";
+  let lastSpace = -1;
+
+  const push = (value) => {
+    const trimmed = value.replace(/\s+$/, "");
+    if (trimmed !== "") chunks.push(trimmed);
+  };
+
+  for (const token of htmlTokens(text)) {
+    if (current !== "" && current.length + token.text.length > max) {
+      if (lastSpace > 0) {
+        push(current.slice(0, lastSpace));
+        current = current.slice(lastSpace).replace(/^\s+/, "");
+      } else {
+        push(current);
+        current = "";
+      }
+      lastSpace = -1;
+      if (current !== "" && current.length + token.text.length > max) {
+        push(current);
+        current = "";
+      }
+    }
+    current += token.text;
+    if (token.space) lastSpace = current.length;
+  }
+  push(current);
+  return chunks;
+}
+
+/**
+ * Текст вопроса в сообщениях: заголовок жирным, тело, подробности курсивом.
+ *
+ * Части режутся по отдельности (у каждой свой бюджет на теги), а потом соседние
+ * части склеиваются переводом строки, если вместе влезают в предел.
+ */
+function renderMessages(question, limit) {
+  const parts = [];
+  const title = typeof question?.title === "string" ? question.title.trim() : "";
+  const body = typeof question?.body === "string" ? question.body : "";
+  const detail = typeof question?.detail === "string" ? question.detail.trim() : "";
+  if (title !== "") parts.push({ text: title, wrap: (chunk) => `<b>${chunk}</b>`, overhead: 7 });
+  if (body !== "") parts.push({ text: body, wrap: (chunk) => chunk, overhead: 0 });
+  if (detail !== "") parts.push({ text: detail, wrap: (chunk) => `<i>${chunk}</i>`, overhead: 7 });
+  if (parts.length === 0) return ["(пустой вопрос)"];
+
+  const messages = [];
+  let buffer = "";
+  let lastGroup = -1;
+
+  parts.forEach((part, group) => {
+    for (const chunk of splitHtml(part.text, Math.max(1, limit - part.overhead))) {
+      const html = part.wrap(chunk);
+      if (buffer === "") {
+        buffer = html;
+        lastGroup = group;
+        continue;
+      }
+      const joined = `${buffer}\n${html}`;
+      if (group !== lastGroup && joined.length <= limit) {
+        buffer = joined;
+        lastGroup = group;
+        continue;
+      }
+      messages.push(buffer);
+      buffer = html;
+      lastGroup = group;
+    }
+  });
+
+  if (buffer !== "") messages.push(buffer);
+  return messages;
 }
 
 /**
@@ -392,6 +484,36 @@ export function createTelegramTransport(options = {}) {
     running = false;
   }
 
+  /**
+   * Правка закрытого сообщения: снять кнопки и, если это ответ, написать его.
+   *
+   * Ошибка правки не ломает ответ: ответ уже уехал в сессию, а сообщение —
+   * украшение. Запись при этом снимается: переправлять больше некуда.
+   */
+  async function closeRecord(shortId, record, summary = record.closeSummary) {
+    const messageId = record.messageIds.at(-1);
+    const text = String(summary ?? "").trim();
+    // Пустая строка или служебная причина — не ответ: снимаем кнопки, но текст
+    // не переписываем, иначе человек увидит «Ответ: aborted».
+    const silent = text === "" || CLOSE_REASONS.has(text.toLowerCase());
+    const payload = silent
+      ? { chat_id: record.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }
+      : {
+        chat_id: record.chatId,
+        message_id: messageId,
+        parse_mode: "HTML",
+        text: `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
+        reply_markup: { inline_keyboard: [] },
+      };
+    try {
+      await call(silent ? "editMessageReplyMarkup" : "editMessageText", payload);
+    } catch (error) {
+      log(`telegram: правку сообщения ${shortId} сделать не удалось (${error?.message ?? error})`);
+    }
+    record.closed = true;
+    sent.delete(shortId);
+  }
+
   const transport = {
     id: "telegram",
     caps,
@@ -422,6 +544,8 @@ export function createTelegramTransport(options = {}) {
       } catch {
         /* цикл завершился отменой — это нормальный путь остановки */
       }
+      // Открытые записи без поллинга бесполезны: следующий старт начнёт с чистого листа.
+      sent.clear();
       log("telegram: поллинг остановлен");
       return transport;
     },
@@ -433,7 +557,7 @@ export function createTelegramTransport(options = {}) {
         throw new TypeError("telegram: у вопроса нет shortId — кнопки не соберутся");
       }
       const target = sendOptions?.chatId ?? chatId;
-      const chunks = splitText(renderText(question), caps.maxText);
+      const chunks = renderMessages(question, caps.maxText);
       const options = Array.isArray(question.options) ? question.options : [];
       const keyboard = caps.inlineButtons && options.length > 0
         ? {
@@ -444,20 +568,29 @@ export function createTelegramTransport(options = {}) {
         }
         : undefined;
 
-      const messageIds = [];
-      for (const [index, chunk] of chunks.entries()) {
-        const last = index === chunks.length - 1;
-        const result = await call("sendMessage", {
-          chat_id: target,
-          parse_mode: "HTML",
-          text: chunk,
-          ...(last && keyboard !== undefined ? { reply_markup: keyboard } : {}),
-        });
-        if (result?.message_id !== undefined) messageIds.push(result.message_id);
+      // Запись заводим ДО отправки: ответчик может снять вопрос (аборт), пока
+      // sendMessage ещё висит. Тогда закрытие откладывается до конца отправки.
+      const record = { chatId: target, messageIds: [], closed: false, closeSummary: "" };
+      sent.set(shortId, record);
+      try {
+        for (const [index, chunk] of chunks.entries()) {
+          const last = index === chunks.length - 1;
+          const result = await call("sendMessage", {
+            chat_id: target,
+            parse_mode: "HTML",
+            text: chunk,
+            ...(last && keyboard !== undefined ? { reply_markup: keyboard } : {}),
+          });
+          if (result?.message_id !== undefined) record.messageIds.push(result.message_id);
+        }
+      } catch (error) {
+        if (record.messageIds.length === 0) sent.delete(shortId);
+        else if (record.closed) await closeRecord(shortId, record);
+        throw error;
       }
 
-      sent.set(shortId, { chatId: target, messageIds, closed: false });
-      return { messageId: messageIds.at(-1), messageIds };
+      if (record.closed) await closeRecord(shortId, record);
+      return { messageId: record.messageIds.at(-1), messageIds: [...record.messageIds] };
     },
 
     /**
@@ -467,33 +600,20 @@ export function createTelegramTransport(options = {}) {
     async closeQuestion(question, summary = "") {
       const shortId = question?.shortId;
       const record = shortId === undefined ? undefined : sent.get(shortId);
-      if (record === undefined || record.messageIds.length === 0) {
+      if (record === undefined) {
         log(`telegram: закрывать нечего — вопрос ${shortId ?? "?"} не отправлялся`);
         return;
       }
-      const messageId = record.messageIds.at(-1);
       const text = String(summary ?? "").trim();
-      // Пустая строка или служебная причина — не ответ: снимаем кнопки, но текст
-      // не переписываем, иначе человек увидит «Ответ: aborted».
-      const silent = text === "" || CLOSE_REASONS.has(text.toLowerCase());
-      const payload = silent
-        ? { chat_id: record.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }
-        : {
-          chat_id: record.chatId,
-          message_id: messageId,
-          parse_mode: "HTML",
-          text: `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
-          reply_markup: { inline_keyboard: [] },
-        };
-      try {
-        await call(silent ? "editMessageReplyMarkup" : "editMessageText", payload);
-      } catch (error) {
-        log(`telegram: правку сообщения ${shortId} сделать не удалось (${error?.message ?? error})`);
+      if (record.messageIds.length === 0) {
+        // Сообщение ещё отправляется (аборт во время sendMessage): запомним
+        // просьбу, и sendQuestion закроет его сам, как только получит message_id.
+        record.closed = true;
+        record.closeSummary = text;
+        log(`telegram: закрытие вопроса ${shortId} отложено — сообщение ещё отправляется`);
+        return;
       }
-      record.closed = true;
-      // Закрытое сообщение переправлять больше некуда: карта помнит только
-      // открытые вопросы (иначе она росла бы с каждой задачей до перезапуска).
-      sent.delete(shortId);
+      await closeRecord(shortId, record, text);
     },
 
     /** Подписка на ответы; возвращает отписку. */

@@ -18,18 +18,21 @@ export const TRANSPORT_SERVICE = "remoteTransport";
 /**
  * Токен из хранилища секретов.
  *
- * `ctx.credentials.get(ref)` может отдать строку или объект со `value` (API
- * уточнит задача 005) — принимаем оба вида. Чего нельзя, так это токена в
- * конфиге профиля: там только `tokenRef`.
+ * Настоящий провайдер — `CredentialProvider` с **асинхронным** `resolve(ref)`:
+ * `Promise<{value, source} | undefined>` (`packages/credentials/credentials/src/index.ts:183`,
+ * `docs/research/dsh-hooks.md` §6.2). Кэшировать нельзя — резолв на каждую
+ * операцию и есть механизм ротации. Принимаем и строку, и объект со `value`:
+ * фейки в тестах и будущие провайдеры могут отличаться, а токен в конфиге
+ * профиля не лежит — там только `tokenRef`.
  */
-function resolveToken(settings, deps) {
+async function resolveToken(settings, deps) {
   if (typeof settings.tokenRef !== "string" || settings.tokenRef === "") return null;
   const credentials = deps.get("credentials");
-  if (credentials === null || typeof credentials?.get !== "function") return null;
+  if (credentials === null || typeof credentials?.resolve !== "function") return null;
   try {
-    const value = credentials.get(settings.tokenRef);
-    if (typeof value === "string" && value !== "") return value;
-    if (typeof value?.value === "string" && value.value !== "") return value.value;
+    const resolved = await credentials.resolve(settings.tokenRef);
+    if (typeof resolved === "string" && resolved !== "") return resolved;
+    if (typeof resolved?.value === "string" && resolved.value !== "") return resolved.value;
   } catch (error) {
     deps.logger.warn(`фича telegram: токен не прочитан (${error?.message ?? error})`);
   }
@@ -39,14 +42,14 @@ function resolveToken(settings, deps) {
 export const telegramFeature = {
   name: "telegram",
   needs: [],
-  apply(ctx, config, deps) {
+  async apply(ctx, config, deps) {
     const settings = config?.telegram;
     if (settings === null || typeof settings !== "object") {
       deps.logger.debug("фича telegram: привязки нет — спит (включение в задаче 005)");
       return;
     }
 
-    const token = resolveToken(settings, deps);
+    const token = await resolveToken(settings, deps);
     if (token === null) {
       deps.logger.warn("фича telegram: токена нет в ctx.credentials — спит");
       return;
