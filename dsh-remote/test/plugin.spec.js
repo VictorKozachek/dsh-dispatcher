@@ -129,7 +129,7 @@ test("каркас: имя плагина, пустой inject и фичи с к
   // panel (009) — рядом с ним.
   assert.deepEqual(
     features.map((feature) => feature.name),
-    ["commands", "telegram", "reliability", "answerer", "panel"],
+    ["commands", "max", "telegram", "reliability", "answerer", "panel"],
   );
 });
 

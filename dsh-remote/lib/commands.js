@@ -791,6 +791,26 @@ export function createRemoteCommands({
       }
     }
 
+    // 012: в мультиканальном режиме фасад пуст, а каналы живут в реестре —
+    // их тоже надо остановить, иначе после /remote disconnect они продолжат
+    // поллить и принимать ответы при уже очищенном состоянии.
+    const registry = ctx?.get?.("remoteTransports") ?? null;
+    if (registry !== null && typeof registry?.values === "function") {
+      for (const channel of [...registry.values()]) {
+        if (typeof channel?.stop !== "function") continue;
+        try {
+          await channel.stop();
+        } catch (error) {
+          log(`канал ${channel.id ?? "?"}.stop: ${humanError(error)}`);
+        }
+      }
+      try {
+        registry.clear?.();
+      } catch (error) {
+        log(`реестр каналов не очищен: ${humanError(error)}`);
+      }
+    }
+
     return success(`привязка удалена, режим выключен\n${secretNote}`);
   }
 

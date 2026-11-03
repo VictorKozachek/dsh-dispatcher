@@ -42,12 +42,12 @@ function fakeTimers() {
   };
 }
 
-function fakeTransport() {
+function fakeTransport(id = "telegram") {
   const handlers = [];
   const sent = [];
   const closed = [];
   return {
-    id: "telegram",
+    id,
     caps: { inlineButtons: true, editAfterAnswer: true, maxText: 4096, maxOptions: 8 },
     sent,
     closed,
@@ -430,4 +430,65 @@ test("метрика гибрида видна в /remote status", async (t) => 
 
   assert.match(status.text, /гибрид: вкл, ждём 20 с/);
   assert.match(status.text, /гибрид-метрика: в GUI 3, ответов из телефона после GUI 2/);
+});
+
+// --- мультиканальный гибрид (012 + 013) -------------------------------------
+
+test("гибрид на двух каналах: таймер после публикации в оба, late-ответ из одного, close всех", async () => {
+  const timers = fakeTimers();
+  const telegram = fakeTransport("telegram");
+  const max = fakeTransport("max");
+  const steers = [];
+  const logs = [];
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({
+    transports: [telegram, max],
+    registry,
+    hybrid: { enabled: true, waitMs: 20_000 },
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+    steer: async (argument) => {
+      steers.push(argument);
+    },
+    log: (message) => logs.push(message),
+    now: () => 0,
+  });
+  answerer.attach({
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+    get: () => null,
+  });
+
+  let nextCalls = 0;
+  const pending = answerer.handler(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }, { label: "Нет" }] }], agent: { id: SESSION_ID } },
+    () => {
+      nextCalls += 1;
+      return { answers: [] };
+    },
+  );
+  await tick();
+
+  assert.equal(telegram.sent.length, 1, "вопрос ушёл в telegram");
+  assert.equal(max.sent.length, 1, "вопрос ушёл в max");
+  assert.equal(timers.delays().length, 1, "гибридный таймер взведён");
+
+  timers.tick();
+  await pending;
+  assert.equal(nextCalls, 1, "next() ровно один раз");
+  assert.equal(answerer.stats.hybridHanded, 1);
+
+  // Ответ приходит из MAX уже после ухода вопроса в GUI.
+  const shortId = max.sent[0].shortId;
+  max.answer({ shortId, optionId: "o1" });
+  await tick();
+
+  assert.equal(steers.length, 1, "поздний ответ доставлен steer-ом один раз");
+  assert.match(steers[0].text, /из мессенджера/);
+  assert.equal(max.closed.at(-1).summary, "Да", "победивший канал закрыт ответом");
+  assert.equal(telegram.closed.at(-1).summary, "answered-elsewhere", "проигравший закрыт пометкой");
+  assert.equal(answerer.stats.hybridPhoneAnswers, 1);
 });

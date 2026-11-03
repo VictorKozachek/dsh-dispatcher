@@ -31,6 +31,7 @@
  * прислать один `optionId` или `custom` вместо `text`, не ломая ответчик.
  */
 
+import { ANSWERED_ELSEWHERE, createBroker } from "./broker.js";
 import { createQuestion } from "./domain/question.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, resolveContext } from "./present.js";
 
@@ -129,11 +130,13 @@ function answerSummary(question) {
  * @returns {{attach: (ctx: object) => () => void, handler: Function, dispose: (reason?: string) => void}}
  */
 export function createAnswerer({
-  transport,
+  transport = null,
+  transports = null,
   registry,
   log = noopLog,
   now = Date.now,
   deliver = null,
+  deliverFor = null,
   reliability = null,
   /** Гибридный режим (013): `{enabled, waitMs}` или функция, отдающая его. */
   hybrid = null,
@@ -143,7 +146,7 @@ export function createAnswerer({
   setTimeout: setTimeoutImpl = setTimeout,
   clearTimeout: clearTimeoutImpl = clearTimeout,
 } = {}) {
-  /** Счётчики гибрида для журнала/`/remote status`. */
+  /** Счётчики гибрида для журнала и `/remote status`. */
   const stats = { hybridHanded: 0, hybridPhoneAnswers: 0 };
 
   /** Текущая конфигурация гибрида: функция вызывается на каждый вопрос. */
@@ -188,19 +191,39 @@ export function createAnswerer({
     }, signal);
   }
   /**
+   * Каналы (012): один транспорт — прежний путь, несколько — брокер с гонкой.
+   * Ответчик не знает платформ: только список реализаций контракта.
+   */
+  const channels = (Array.isArray(transports) && transports.length > 0 ? transports : (transport === null ? [] : [transport]))
+    .filter((item) => item !== null && typeof item === "object");
+  const useBroker = channels.length > 1;
+  const broker = useBroker ? createBroker({ transports: channels, deliverFor, log }) : null;
+  const primary = channels[0] ?? null;
+  /**
    * Доставка вопроса: по умолчанию — транспорт, но 008 подставляет сюда
    * `reliability.deliver` с повторами. Сигнал `'give-up'` означает «за
    * `connectTimeoutMs` не доставили» — тогда вопрос достаётся GUI через `next()`.
    */
   const sendOne = typeof deliver === "function"
     ? async (question, signal) => deliver({ question, signal })
-    : async (question, signal) => transport.sendQuestion(question, signal);
+    : async (question, signal) => primary.sendQuestion(question, signal);
+
+  /**
+   * Доставить вопрос во все каналы (012). Возвращает `true`, если доставили
+   * хотя бы в один: ошибка одного канала не должна блокировать второй.
+   */
+  async function publishAll(question, signal) {
+    const publication = await broker.publish(question, { signal });
+    return publication;
+  }
   /** Открытые вопросы по короткому id: ждём ответа транспорта. */
   const pending = new Map();
   /** Метка «вопрос ушёл в GUI»: гонка ожиданий завершается этим значением. */
   const HYBRID_GUI = Symbol("hybrid-gui");
   /** Таймеры гибрида по shortId: ответ на один вопрос не снимает чужие. */
   const hybridTimers = new Map();
+  /** Все вопросы этой пачки: поздний ответ проигравшего канала ищем здесь. */
+  const known = new Map();
   /** Контекст плагина: из него берём cwd сессии для scope воркспейса. */
   let context = null;
   let disposed = false;
@@ -251,7 +274,13 @@ export function createAnswerer({
       if (!question.cancel(reason, now())) continue;
       if (attempted !== null && !attempted.has(question)) continue;
       try {
-        await transport?.closeQuestion?.(question, reason);
+        if (useBroker && (question.deliveries?.length ?? 0) > 0) {
+          // 012: в мультиканале одиночный `transport` — пустой фасад, поэтому
+          // закрываем через брокер, иначе сообщения остаются с кнопками.
+          await broker.closeAll(question, { winner: null, summary: reason });
+        } else {
+          await primary?.closeQuestion?.(question, reason);
+        }
       } catch (error) {
         log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
       }
@@ -261,7 +290,12 @@ export function createAnswerer({
   /** Правка сообщения после ответа: в фоне, ошибка не мешает ответу. */
   async function closeMessage(question) {
     try {
-      await transport?.closeQuestion?.(question, answerSummary(question));
+      if (useBroker && (question.deliveries?.length ?? 0) > 0) {
+        const winner = broker.transportOf(question.answeredVia ?? "");
+        await broker.closeAll(question, { winner, summary: answerSummary(question) });
+        return;
+      }
+      await primary?.closeQuestion?.(question, answerSummary(question));
     } catch (error) {
       log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
     }
@@ -290,7 +324,7 @@ export function createAnswerer({
     void closeMessage(entry.question);
   }
 
-  function onTransportAnswer(event) {
+  function onTransportAnswer(event, sourceTransport = null) {
     const normalized = normalizeAnswerEvent(event);
     if (normalized === null) {
       log("ответ транспорта: событие без shortId — игнор");
@@ -298,23 +332,33 @@ export function createAnswerer({
     }
     const entry = pending.get(normalized.shortId);
     if (entry !== undefined && entry.hybridGui === true) {
-      // Вопрос уже показан в GUI: ответ из мессенджера не результат инструмента,
-      // а уточнение к сессии. Принимаем один раз, закрываем сообщение.
+      // Вопрос уже показан в GUI: ответ из мессенджера — не результат
+      // инструмента, а уточнение к сессии. Принимаем один раз и шлём steer.
       if (entry.steerFailed === true && entry.lateAnswer !== undefined) {
-        // Прошлая доставка упала: повторяем steer, ответ уже принят.
         void settleLate(entry, entry.lateAnswer);
         return;
       }
       const lateParsed = choiceFor(entry.question, normalized);
       if (lateParsed.error !== undefined || lateParsed.awaitingText === true || lateParsed.showMore === true) return;
       if (!entry.question.accept(lateParsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
+      // Гибридный поздний ответ тоже знает свой канал: по нему closeAll
+      // определяет победителя и закрывает остальные пометкой.
+      entry.question.answeredVia = sourceTransport?.id ?? entry.question.answeredVia ?? null;
       entry.lateAnswer = normalized;
       log(`гибрид: ответ на ${normalized.shortId} пришёл из мессенджера после ухода в GUI — отправляю steer`);
       // Сначала доставляем steer, и только потом закрываем сообщение: если
       // доставка упала, вопрос не должен выглядеть отвеченным/потерянным.
       void settleLate(entry, normalized);
+      return;
     }
     if (entry === undefined) {
+      const knownQuestion = known.get(normalized.shortId);
+      if (knownQuestion !== undefined && knownQuestion.status === "answered") {
+        // Ответ из канала, который проиграл гонку: решение уже принято.
+        log(`ответ на ${normalized.shortId} из канала ${sourceTransport?.id ?? "?"} проигнорирован:`
+          + ` вопрос уже отвечен в ${knownQuestion.answeredVia ?? "другом канале"}`);
+        return;
+      }
       // Поздний ответ: вопрос уже снят (TTL/аборт/перезапуск). Это не игнор —
       // карточка требует, чтобы ответ дошёл до сессии через `steer`.
       const closedQuestion = recentlyClosed.get(normalized.shortId);
@@ -344,18 +388,19 @@ export function createAnswerer({
       return;
     }
     if (!entry.question.accept(parsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
+    entry.question.answeredVia = sourceTransport?.id ?? entry.question.answeredVia ?? null;
     pending.delete(normalized.shortId);
     reliability?.unwatch?.(normalized.shortId);
-    entry.resolve(entry.question);
     if (entry.hybridTimer !== null && entry.hybridTimer !== undefined) {
       try {
         clearTimeoutImpl(entry.hybridTimer);
       } catch {
         /* таймер уже сработал */
       }
-      hybridTimers.delete(entry.question.shortId);
+      hybridTimers.delete(normalized.shortId);
       entry.hybridTimer = null;
     }
+    entry.resolve(entry.question);
     void closeMessage(entry.question);
   }
 
@@ -371,6 +416,10 @@ export function createAnswerer({
     if (items.length === 0) return next(); // пустой запрос — ошибка ядра, не наша
     if (request?.signal?.aborted) throw abortError();
 
+    if (useBroker && channels.some((item) => typeof item.sendQuestion !== "function" && typeof deliverFor !== "function")) {
+      log("ответчик: не все каналы умеют sendQuestion — отдаю GUI");
+      return next();
+    }
     const sessionId = typeof request?.agent?.id === "string" ? request.agent.id : null;
     const workspace = workspaceOf(sessionId);
     // Маркировка (006): роль и задача, которую ведёт эта сессия. Ошибки чтения
@@ -392,7 +441,7 @@ export function createAnswerer({
       log(`вопрос ${sessionId ?? "(без агента)"}: режим выключен — отдаю GUI (next)`);
       return next();
     }
-    if (typeof deliver !== "function" && typeof transport?.sendQuestion !== "function") {
+    if (typeof deliver !== "function" && !useBroker && typeof primary?.sendQuestion !== "function") {
       log("вопрос: транспорт не умеет sendQuestion — отдаю GUI (next)");
       return next();
     }
@@ -400,14 +449,17 @@ export function createAnswerer({
     const questions = [];
     try {
       for (const item of items) {
-        questions.push(createQuestion(item, {
+        const created = createQuestion(item, {
           sessionId,
           workspace,
           role: questionContext.role,
           taskId: questionContext.taskId,
           now: now(),
           log,
-        }));
+        });
+        known.set(created.shortId, created);
+        if (known.size > 200) known.delete(known.keys().next().value);
+        questions.push(created);
       }
     } catch (error) {
       log(`вопрос: разобрать запрос не удалось (${error?.message ?? error}) — отдаю GUI`);
@@ -473,8 +525,7 @@ export function createAnswerer({
 
     /**
      * Гибрид (013): если ответа нет `waitMs`, отдаём вопрос в GUI через `next()`.
-     * Один вызов на пачку: `next()` вызывается ровно один раз и только когда ни
-     * один вопрос ещё не отвечен.
+     * Таймер на каждый вопрос: ответ на один не снимает чужие.
      */
     const hybridState = hybridConfig();
     let guiResolver = null;
@@ -491,10 +542,6 @@ export function createAnswerer({
         }
         hybridTimers.delete(shortId);
       }
-      for (const question of questions) {
-        const waitingEntry = pending.get(question.shortId);
-        if (waitingEntry !== undefined) waitingEntry.hybridTimer = null;
-      }
     };
 
     function armHybrid() {
@@ -508,19 +555,18 @@ export function createAnswerer({
           const stillOpen = questions.filter((item) => pending.has(item.shortId));
           const anyAnswered = questions.some((item) => item.status === "answered");
           if (anyAnswered) {
-            // Пачка уже частично отвечена: DSH вернёт GUI весь запрос, включая
-            // отвеченный вопрос, поэтому GUI не зовём. Вопрос остаётся обычным
-            // ожиданием (не hybridGui): ответ по нему — ещё результат, не steer.
+            // Пачка уже частично отвечена: DSH вернул бы GUI весь запрос вместе
+            // с отвеченным вопросом, поэтому GUI не зовём — вопрос остаётся
+            // обычным ожиданием, его ответ идёт в результат, не в steer.
             log(`гибрид: вопрос ${question.shortId} остался в мессенджере — пачка уже частично отвечена, GUI не зовём`);
             return;
           }
           if (guiRequested) return; // next() уже звали
           waitingEntry.hybridGui = true;
           stats.hybridHanded += 1;
-          guiRequested = true;
           for (const item of stillOpen) {
-            const entry = pending.get(item.shortId);
-            if (entry !== undefined) entry.hybridGui = true;
+            const itemEntry = pending.get(item.shortId);
+            if (itemEntry !== undefined) itemEntry.hybridGui = true;
           }
           log(`гибрид: ответа нет ${hybridState.waitMs} мс — отдаю вопросы в GUI (${stillOpen.length})`);
           guiResolver?.(HYBRID_GUI);
@@ -536,6 +582,18 @@ export function createAnswerer({
       try {
         for (const question of questions) {
           attempted.add(question);
+          if (useBroker) {
+            const publication = await Promise.race([publishAll(question, request?.signal), aborted]);
+            if (!publication.anyDelivered) {
+              // Ни один канал не принял вопрос — он достаётся GUI, как в 008.
+              log(`вопрос ${question.shortId}: ни один канал не доставил — отдаю GUI (next)`);
+              await closeQuestions(questions, "undelivered", attempted);
+              return next();
+            }
+            // 012: доставки переживают рестарт (state.questions[].deliveries).
+            reliability?.noteDeliveries?.(question);
+            continue;
+          }
           const outcome = await Promise.race([sendOne(question, request?.signal), aborted]);
           if (outcome === "give-up") {
             // Недоставка за отведённое время: вопрос достаётся GUI, сессия не висит.
@@ -581,6 +639,7 @@ export function createAnswerer({
       }
     }
 
+    cleanupHybrid();
     for (const question of questions) pending.delete(question.shortId);
     reliability?.unwatch?.(questions.map((question) => question.shortId));
     log(`вопросов ${questions.length}: ответ получен (${decision.scope})`);
@@ -599,17 +658,25 @@ export function createAnswerer({
       log("ответчик: плагин уже выгружен — подписка не нужна");
       return () => {};
     }
-    if (typeof transport?.onAnswer !== "function") {
-      log("ответчик не подписан: у транспорта нет onAnswer — вопрос уходит в GUI");
+    const subscribable = channels.filter((item) => typeof item.onAnswer === "function");
+    if (subscribable.length === 0) {
+      log("ответчик не подписан: ни у одного транспорта нет onAnswer — вопрос уходит в GUI");
       return () => {};
     }
 
-    let offAnswer = null;
+    let offAnswers = [];
     let offRequest = null;
     try {
-      offAnswer = transport.onAnswer(onTransportAnswer);
+      offAnswers = subscribable.map((channel) => channel.onAnswer((event) => onTransportAnswer(event, channel)));
     } catch (error) {
       log(`ответчик не подписан: транспорт не отдал onAnswer (${error?.message ?? error})`);
+      for (const off of offAnswers) {
+        try {
+          off?.();
+        } catch {
+          /* уже отписан */
+        }
+      }
       return () => {};
     }
     try {
@@ -625,10 +692,12 @@ export function createAnswerer({
       } catch (error) {
         log(`ответчик: отписка от вопроса не удалась (${error?.message ?? error})`);
       }
-      try {
-        if (typeof offAnswer === "function") offAnswer();
-      } catch (error) {
-        log(`ответчик: отписка от ответов не удалась (${error?.message ?? error})`);
+      for (const off of offAnswers) {
+        try {
+          off?.();
+        } catch (error) {
+          log(`ответчик: отписка от ответов не удалась (${error?.message ?? error})`);
+        }
       }
       dispose("detached");
     };
@@ -641,12 +710,17 @@ export function createAnswerer({
   function dispose(reason = "disposed") {
     disposed = true;
     for (const entry of pending.values()) {
-      entry.question.cancel(reason, now());
+      const question = entry.question;
+      question.cancel(reason, now());
       try {
-        const closing = transport?.closeQuestion?.(entry.question, reason);
+        // 012: в мультиканале закрываем все доставки через брокер (одиночный
+        // `transport` — пустой фасад, и кнопки остались бы в обоих каналах).
+        const closing = useBroker && (question.deliveries?.length ?? 0) > 0
+          ? broker.closeAll(question, { winner: null, summary: reason })
+          : primary?.closeQuestion?.(question, reason);
         if (closing !== null && typeof closing?.then === "function") closing.catch(() => {});
       } catch (error) {
-        log(`вопрос ${entry.question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
+        log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
       }
       entry.reject(abortError(reason));
     }

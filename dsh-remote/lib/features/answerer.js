@@ -42,9 +42,28 @@ export const answererFeature = {
     // фиче; здесь только передаём их ответчику.
     const reliability = deps.get("remoteReliability");
 
+    // Два канала одновременно (012): список из config.transports, транспорты
+    // берём из реестра. Один канал — прежний путь через фасад.
+    const requested = Array.isArray(config?.transports) ? config.transports.filter((id) => typeof id === "string") : null;
+    const transportRegistry = deps.get("remoteTransports");
+    let transports = null;
+    if (requested !== null && requested.length > 1 && transportRegistry !== null) {
+      const missing = requested.filter((id) => transportRegistry.get(id) === undefined);
+      if (missing.length > 0) {
+        // Не молчим: иначе два канала в конфиге тихо превратятся в один.
+        deps.logger.warn(`answerer: каналы из config.transports не найдены: ${missing.join(", ")} — работаю с тем, что есть`);
+      }
+      transports = requested.map((id) => transportRegistry.get(id) ?? null).filter((transport) => transport !== null);
+      if (transports.length <= 1) transports = null;
+    }
+
+    // 012: у каждого канала — своя доставка reliability (повторы/backoff/give-up).
+    const deliverFor = deps.get("remoteReliabilityDeliver");
     // Гибрид (013): ждём ответ в мессенджере `hybrid.waitMs`, потом отдаём в GUI.
     const answerer = createAnswerer({
       transport: deps.get(TRANSPORT_SERVICE),
+      deliverFor,
+      transports,
       hybrid: () => (store?.read?.().hybrid ?? { enabled: false }),
       registry,
       reliability,
