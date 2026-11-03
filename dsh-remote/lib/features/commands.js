@@ -243,7 +243,7 @@ export const commandsFeature = {
     // Выгрузка плагина: подписки снимаются, поллинг останавливается.
     deps.onDispose(() => {
       void facade.stop();
-    });
+    }, "commands");
 
     /** Ответчик уже применён (каркасом или нами) — второй раз не подписываем. */
     let answererReady = false;
@@ -274,7 +274,7 @@ export const commandsFeature = {
     // status/on должны видеть хотя бы один живой канал.
     const currentChannel = () => facade.current ?? [...transportRegistry.values()][0] ?? null;
     const remote = createRemoteCommands({ ctx, store, log, ensureTransport: ensure, currentChannel });
-    deps.onDispose(remote.register());
+    deps.onDispose(remote.register(), "commands");
 
     // Привязка из прошлого запуска: поднимаем канал до того, как каркас дойдёт до
     // фичи ответчика, — её `needs` уже будут выполнены.

@@ -130,7 +130,7 @@ export const telegramFeature = {
 
     deps.onDispose(() => {
       void transport.stop();
-    });
+    }, "transports");
 
     void transport.start().catch((error) => {
       deps.logger.warn(`фича telegram: поллинг не запустился (${error?.message ?? error})`);
