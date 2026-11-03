@@ -104,11 +104,27 @@ export function createCredentialAccess(ctx, { log = () => {} } = {}) {
         present: value.present === true,
       };
     },
+    /** Записать секрет. Успех — отсутствие исключения: сервис может вернуть void. */
     set(ref, value) {
-      return call("set", ref, value) !== null;
+      if (typeof service?.set !== "function") return false;
+      try {
+        service.set(ref, value);
+        return true;
+      } catch (error) {
+        log(`credentials.set: ${error?.message ?? error}`);
+        return false;
+      }
     },
+    /** Удалить секрет (не бросает: у env-источника записи нет). */
     unset(ref) {
-      return call("unset", ref) !== null;
+      if (typeof service?.unset !== "function") return false;
+      try {
+        service.unset(ref);
+        return true;
+      } catch (error) {
+        log(`credentials.unset: ${error?.message ?? error}`);
+        return false;
+      }
     },
   };
 }
@@ -146,7 +162,7 @@ export function createStore({
     }
     try {
       const parsed = JSON.parse(text);
-      return normalizeState(parsed, log);
+      return normalizeState(parsed, log, recentLimit);
     } catch (error) {
       log(`состояние: битый JSON в ${paths.file} (${error?.message ?? error}) — работаю с дефолтом`);
       return defaultState();
@@ -155,7 +171,7 @@ export function createStore({
 
   /** Записать состояние атомарно: tmp → chmod 600 → rename. */
   function write(state) {
-    const normalized = normalizeState(state, log);
+    const normalized = normalizeState(state, log, recentLimit);
     fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
     const tmp = path.join(paths.dir, `.${DEFAULT_FILE_NAME}.${process.pid}.${randomUUID()}.tmp`);
     const payload = `${JSON.stringify(normalized, null, 2)}\n`;
@@ -337,7 +353,7 @@ export function createStore({
  * Привести состояние к известной форме: чужие/старые поля не теряем, но
  * обязательные — восстанавливаем. Версия пока одна, миграций нет.
  */
-function normalizeState(value, log = () => {}) {
+function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
   const base = defaultState();
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     log("состояние: ожидался объект — работаю с дефолтом");
@@ -358,7 +374,7 @@ function normalizeState(value, log = () => {}) {
       workspaces: booleans(enabled.workspaces),
       sessions: booleans(enabled.sessions),
     },
-    recent: Array.isArray(value.recent) ? value.recent.slice(-RECENT_LIMIT) : [],
+    recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
     pending: Array.isArray(value.pending) ? value.pending : [],
   };
 }
