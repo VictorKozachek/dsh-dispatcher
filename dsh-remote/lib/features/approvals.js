@@ -14,6 +14,7 @@
 
 import { createApprovals } from "../approvals.js";
 import { createApprovalPolicy } from "../approvals/policy.js";
+import { createAudit } from "../audit.js";
 import { createRegistry } from "../domain/registry.js";
 import { resolveChannel } from "../store.js";
 
@@ -71,29 +72,24 @@ export const approvalsFeature = {
     });
     deps.logger.debug(`approvals: ${policy.describe().join("; ")}`);
 
+    // Аудит решений (026): `audit.jsonl` рядом с state.json; путь можно
+    // переопределить через DSH_REMOTE_AUDIT (тесты). Решения 025 (policy-GUI и
+    // TTL-таймаут) пишутся в тот же журнал через `audit` ниже.
+    const audit = createAudit({
+      ...(typeof store?.paths?.dir === "string" && store.paths.dir !== "" ? { dir: store.paths.dir } : {}),
+      log: (message) => deps.logger.debug(message),
+    });
+
     const approvals = createApprovals({
       transport: deps.get(TRANSPORT_SERVICE),
       transports,
       registry,
+      audit,
       // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
       channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
       policy,
       ttlMs: policy.ttlMs,
       onTimeout: () => policy.timeoutOutcome(),
-      // 026: аудит удалённых решений. Пока сервиса нет — структурированная
-      // строка в лог, чтобы факт «отдано GUI по политике» не терялся.
-      onDecision: (record) => {
-        const audit = deps.get("remoteAudit") ?? ctx?.get?.("remoteAudit") ?? null;
-        if (typeof audit?.record === "function") {
-          try {
-            audit.record(record);
-            return;
-          } catch (error) {
-            deps.logger.warn(`approvals: аудит решения не записан (${error?.message ?? error})`);
-          }
-        }
-        deps.logger.info(`approvals: ${JSON.stringify(record)}`);
-      },
       log: (message) => deps.logger.debug(message),
     });
 

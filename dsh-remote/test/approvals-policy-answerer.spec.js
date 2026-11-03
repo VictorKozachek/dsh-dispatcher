@@ -354,12 +354,9 @@ test("решение политики отдаётся аудиту (026) чер
   assert.equal(transport.sent.length, 0);
 });
 
-test("фича approvals передаёт решение политики в remoteAudit, если сервис есть", async () => {
+test("фича approvals пишет policy-GUI в реальный audit.jsonl (026)", async () => {
   const transport = fakeTransport();
   const ctx = fakeContext();
-  const records = [];
-  const provided = new Map();
-  ctx.provide = (name, service) => provided.set(name, service);
   const deps = {
     logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
     get: (name) => {
@@ -367,18 +364,29 @@ test("фича approvals передаёт решение политики в rem
       if (name === "remoteStore") {
         return { read: () => ({ enabled: { global: true, workspaces: {}, sessions: {} }, bindings: null, channels: {} }) };
       }
-      if (name === "remoteAudit") return { record: (record) => records.push(record) };
       return null;
     },
     onDispose: (fn) => ctx.onDispose(fn),
   };
+  const dir = await import("node:fs").then((fs) => fs.mkdtempSync(`${process.env.TMPDIR ?? "/tmp"}/dsh-audit-`));
+  const auditFile = `${dir}/audit.jsonl`;
+  process.env.DSH_REMOTE_AUDIT = auditFile;
+
   approvalsFeature.apply(ctx, { approvals: { tools: ["read_file"] } }, deps);
 
   const handler = ctx.subscriptions.find((item) => item.name === APPROVAL_REQUEST_EVENT)?.handler;
   assert.equal(await handler(request({ toolName: "bash" }), async () => "gui"), "gui");
-  assert.equal(records.length, 1);
-  assert.equal(records[0].reason, "deny-remote");
-  assert.equal(records[0].toolName, "bash");
+
+  const lines = (await import("node:fs")).readFileSync(auditFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const last = lines.at(-1);
+  assert.equal(last.kind, "approval");
+  assert.equal(last.toolName, "bash");
+  assert.equal(last.decision, "gui");
+  assert.equal(last.outcome, "unavailable", "policy-GUI — это unavailable для DSH");
+
+  const { rmSync } = await import("node:fs");
+  rmSync(dir, { recursive: true, force: true });
+  delete process.env.DSH_REMOTE_AUDIT;
 });
 
 test("таймаут unavailable: исход модели — unavailable, не cancelled", async () => {
@@ -403,4 +411,85 @@ test("таймаут unavailable: исход модели — unavailable, не 
 
   assert.equal(await pending, APPROVAL_OUTCOME.unavailable);
   assert.equal(transport.sent[0].outcome, APPROVAL_OUTCOME.unavailable, "модель не врёт про cancelled");
+});
+
+test("дефолтный TTL 30 минут применяется и без явного ttlMs/policy", async () => {
+  const timers = [];
+  const transport = fakeTransport();
+  const approvals = createApprovals({
+    transport,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    log: () => {},
+    setTimeout: (callback, delay) => {
+      timers.push({ callback, delay });
+      return timers.length;
+    },
+    clearTimeout: () => {},
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const next = async () => "gui";
+
+  const pending = ctx.subscriptions[0].handler(request({ toolName: "read_file" }), next);
+  await tick();
+
+  assert.equal(timers.length, 1, "таймер взведён без явного ttlMs");
+  assert.equal(timers[0].delay, 30 * 60 * 1000, "дефолт политики — 30 минут");
+
+  timers[0].callback();
+  assert.equal(await pending, APPROVAL_OUTCOME.cancelled);
+});
+
+test("TTL-таймаут пишется в аудит как decision=timeout, без дублей при ответе", async () => {
+  const timers = [];
+  const audit = { entries: [], append(entry) { this.entries.push(entry); } };
+  const transport = fakeTransport();
+  const approvals = createApprovals({
+    transport,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    policy: createApprovalPolicy(null),
+    ttlMs: 60_000,
+    audit,
+    now: () => 1_700_000_000_000,
+    log: () => {},
+    setTimeout: (callback) => {
+      timers.push(callback);
+      return timers.length;
+    },
+    clearTimeout: () => {},
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const pending = ctx.subscriptions[0].handler(request(), async () => "gui");
+  await tick();
+
+  timers[0]();
+  assert.equal(await pending, APPROVAL_OUTCOME.cancelled);
+  assert.equal(audit.entries.length, 1, "одно решение — одна запись");
+  assert.equal(audit.entries[0].decision, "timeout");
+  assert.equal(audit.entries[0].outcome, APPROVAL_OUTCOME.cancelled);
+  assert.equal(audit.entries[0].kind, "approval");
+  assert.equal(audit.entries[0].toolName, "read_file");
+  assert.equal(typeof audit.entries[0].waitedMs, "number");
+});
+
+test("policy-GUI не оставляет запись, если ответ пришёл кнопкой", async () => {
+  const audit = { entries: [], append(entry) { this.entries.push(entry); } };
+  const transport = fakeTransport();
+  const approvals = createApprovals({
+    transport,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    policy: createApprovalPolicy(null),
+    audit,
+    log: () => {},
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const pending = ctx.subscriptions[0].handler(request(), async () => "gui");
+  await tick();
+  transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"], channel: "fake" });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+
+  assert.equal(audit.entries.length, 1, "policy-GUI не писался: ответили удалённо");
+  assert.equal(audit.entries[0].decision, "remote");
 });

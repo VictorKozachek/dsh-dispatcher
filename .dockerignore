@@ -1,0 +1,19 @@
+# Контекст сборки релея — корень репозитория (deploy/relay.Dockerfile).
+# Всё, что не нужно для cargo build, в демон не отправляем.
+.git
+.kanban
+worktrees
+apps
+docs
+deploy/backups
+deploy/.env
+deploy/data
+relay/target
+relay/.cargo-home
+node_modules
+**/node_modules
+**/.build
+**/DerivedData
+*.db
+*.db-shm
+*.db-wal
