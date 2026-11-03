@@ -1,0 +1,22 @@
+# Автоматический TLS от Let's Encrypt: Caddy сам получает и продлевает
+# сертификат для {$RELAY_DOMAIN}, если 80/443 доступны снаружи и DNS указывает
+# на этот сервер. WebSocket (/v1/events) проходит через reverse_proxy как есть.
+{$RELAY_DOMAIN} {
+	encode gzip
+	reverse_proxy relay:8080 {
+		# Долгие соединения: WebSocket и long-poll `?wait=25`.
+		transport http {
+			read_timeout 60s
+			write_timeout 60s
+		}
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+	}
+	log {
+		output stdout
+		format json
+	}
+}

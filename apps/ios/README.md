@@ -1,0 +1,141 @@
+# RelayApp (iOS MVP)
+
+Минимальный клиент релея DSH: **привязка → вопросы → ответ**, закрытые вопросы,
+оффлайн-очередь ответов. Контракт — `docs/relay/PROTOCOL.md` (016 + 023), сервер —
+`relay/` (017). Экраны и логика общие с Android (`apps/android`, задача 019):
+расхождения фиксируются в протоколе, а не «по-своему» в клиенте.
+
+## Требования
+
+- Xcode 15+ (проверено на Xcode 27.2 / Swift 6.4), iOS 17+.
+- SPM-пакет, без внешних зависимостей. **Один app-target** — `RelayApp`
+  (SwiftUI-приложение); рядом стандартные для SPM `RelayKit` (логика, её
+  импортируют тесты) и `RelayKitTests` (тесты). Иначе тесты не могут
+  импортировать код приложения без дублирования; формулировка «один target» в
+  карточке означала «одно приложение, без лишних модулей» — по существу так и есть.
+
+## Сборка и запуск
+
+Xcode:
+
+```bash
+open apps/ios/Package.swift     # Xcode покажет пакет как проект
+# выберите схему RelayApp и iOS-симулятор, Run
+```
+
+Или из терминала:
+
+```bash
+cd apps/ios
+swift build                      # macOS-сборка (для быстрой проверки)
+
+# iOS-сборка тем же SwiftPM (SDK симулятора + triple) — проверена в этой задаче:
+SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+swift build --sdk "$SDK" --triple arm64-apple-ios17.0-simulator   # Build complete
+
+# Или через Xcode:
+xcodebuild -scheme RelayApp -destination 'platform=iOS Simulator,name=iPhone 15' build
+```
+
+**Результат проверки:** `swift build --sdk $(xcrun --sdk iphonesimulator --show-sdk-path)
+--triple arm64-apple-ios17.0-simulator` — **Build complete** (компилируются
+`RelayKit` и SwiftUI-приложение `RelayApp` под iOS 17-симулятор). `xcodebuild`
+в песочнице агента упирается в недоступный clang-module-cache
+(`/var/folders/.../C/clang`), поэтому он не проверялся; на машине с Xcode команда
+выше должна работать без дополнительных настроек.
+
+Запуск на macOS (SwiftUI-приложение кросс-платформенное, удобно для отладки):
+
+```bash
+cd apps/ios && swift run RelayApp
+```
+
+В песочнице агента SwiftPM не может писать в `~/Library` и не может применить
+собственный sandbox, поэтому сборка шла так (на обычной машине флаги не нужны):
+
+```bash
+TMPDIR="$PWD/.build/tmp" CLANG_MODULE_CACHE_PATH="$PWD/.build/modulecache" \
+  swift test --disable-sandbox --scratch-path .build --cache-path .build/spm-cache
+```
+
+## Тесты
+
+```bash
+cd apps/ios && swift test
+```
+
+19 юнит-тестов, сеть не нужна (фейковый `RelayAPI`, `URLProtocol` для
+`RelayClient`, временные файлы, in-memory Keychain):
+
+- загрузка показывает только открытые вопросы;
+- ответ кнопкой/текстом уходит и закрывает вопрос;
+- **оффлайн-ответ переживает перезапуск** и повторяется с тем же
+  `idempotencyKey` (сервер не создаёт второй ответ);
+- повторный ответ до отправки заменяет первый, не меняя ключ;
+- события `question.answered`/`question.expired` закрывают вопрос;
+- `RelayClient` на `URLProtocol`: query собирается через `URLComponents`
+  (`/v1/questions?limit=100`, `/v1/answers?questionId=…`, не `%3F`), заголовки
+  `Authorization`/`X-Relay-Version`, пагинация по `nextSince`+`nextId`
+  (101 вопрос = 2 страницы), `404` — это «ответа нет», `5xx` — `RelayClientError.api`;
+- `question.created` потоком обновляет список без pull-to-refresh;
+- **закрытые вопросы переживают перезапуск** (файл `closed-questions.json`);
+- **WebSocket-URL**: `http → ws`, `https → wss`, порт/базовый путь сохраняются
+  (`http://127.0.0.1:8080 → ws://127.0.0.1:8080/v1/events`); чтение событий из
+  инжектируемого сокета с заголовками `Authorization`/`X-Relay-Version`;
+- неретраибельный ответ (401/403/409) снимается с очереди с сообщением «нужны
+  действия», а не повторяется вечно;
+- привязка кладёт токен в Keychain, а не рядом с URL/deviceId; `unpair` чистит.
+
+## Что внутри
+
+| Файл | Роль |
+|---|---|
+| `Sources/RelayKit/Models.swift` | `RelayQuestion`, `RelayAnswer` (с `idempotencyKey`), `RelayPairing`, `RelayAPIError` |
+| `Sources/RelayKit/RelayClient.swift` | HTTP (`URLSession`) + WebSocket (`URLSessionWebSocketTask`) с `Authorization` и `X-Relay-Version: 1`; WS-URL собирается заменой схемы (`http→ws`, `https→wss`), переподключение с backoff 1→30 с |
+| `Sources/RelayKit/QuestionsViewModel.swift` | состояние экранов, ответ через очередь, события потока |
+| `Sources/RelayKit/OfflineQueue.swift` | файловая очередь ответов (`Application Support/pending-answers.json`), переживает перезапуск |
+| `Sources/RelayKit/ClosedStore.swift` | файл закрытых вопросов (`closed-questions.json`) — вкладка «Закрытые» не пустеет после рестарта |
+| `Sources/RelayKit/Secrets.swift` | `SecretStore`; `KeychainStore` для токена, `InMemorySecretStore` для тестов |
+| `Sources/RelayKit/Pairing.swift` | `PairingService`: `POST /v1/devices` → `POST /v1/pair` → Keychain; URL/deviceId — в `UserDefaults` |
+| `Sources/RelayApp/*` | SwiftUI: экран привязки, список вопросов, вопрос/ответ, закрытые, настройки |
+
+## Поток
+
+1. **Привязка:** человек вводит URL релея и 6-значный `pairCode`. Приложение
+   регистрирует устройство (`POST /v1/devices`, публичный ключ — задел под e2e),
+   меняет код на `deviceToken` (`POST /v1/pair`) и кладёт токен в Keychain.
+2. **Вопросы:** `GET /v1/questions` с Bearer; открытые — в списке, закрытые — во
+   вкладке «Закрытые».
+3. **Ответ:** кнопка и/или свободный текст. Ответ **всегда** кладётся в файловую
+   очередь (ключ идемпотентности создаётся один раз), затем отправляется
+   `POST /v1/answers`; при ошибке остаётся в очереди и повторяется при следующем
+   запуске/восстановлении сети. Повтор с тем же ключом сервер считает тем же
+   ответом (`200`), дубля нет.
+4. **Поток:** WebSocket `GET /v1/events` (URL с `ws://`/`wss://`: та же схема-замена, что в `RelayClient.webSocketURL`), в foreground; `question.created`
+   обновляет список, ответ из другого канала (`question.answered`) закрывает
+   вопрос, `question.expired` переносит в закрытые. При разрыве — переподключение
+   с backoff 1→30 с (счётчик сбрасывается после первого сообщения); ping/pong
+   сервера релея обрабатывает `URLSessionWebSocketTask` автоматически.
+
+## Ограничения MVP (осознанные)
+
+- **APNs опционально:** нужен аккаунт разработчика и сертификат. Без пушей
+  приложение получает ответы по WS только в foreground; при запуске/возврате в
+  foreground делает `GET /v1/questions` и `flushQueue()` (фоновая проверка).
+  Полноценный background-фетч (`BGTaskScheduler`) — следующий шаг: в MVP он не
+  включён, чтобы не обещать доставку, которой нет без APNs.
+- **e2e-шифрование** — задача 021: сейчас вопросы читаются в открытом режиме,
+  `keyId` уже есть в модели привязки, конверт `enc` подключается позже.
+- **Отвязка** очищает Keychain и локальную привязку; отзыв устройства на релее —
+  через сервер (`DELETE /v1/devices/{id}`), в MVP-экране не автоматизирован.
+- **Нет APNs-токена** — `registerDevice` отправляет только публичный ключ;
+  `pushToken` появится вместе с APNs.
+- **`GET /v1/answers` — agent-only:** релей требует токен агента, `deviceToken`
+  получает `403`. Приложение этот метод не зовёт (ответ приходит событием +
+  `POST /v1/answers`); в клиенте он оставлен для симметрии контракта и помечен.
+- **Отвязка не отзывает устройство на релее:** `unpair` чистит Keychain и
+  локальную привязку, но `DELETE /v1/devices/{id}` не вызывает; каждая повторная
+  привязка создаёт новое устройство (новый `publicKey`). Для MVP принято, отзыв —
+  через сервер/`/remote disconnect` на стороне плагина.
+- **Backoff WS сбрасывается на первом сообщении**, а не на `open`:
+  `URLSessionWebSocketTask` не даёт события открытия; для MVP это некритично.

@@ -1,0 +1,91 @@
+/**
+ * Фича «подтверждения»: `approval/request` уходит человеку в канал.
+ *
+ * Подключается одной строкой в `lib/features.js`. Режим — тот же, что у вопросов
+ * (`state.enabled` через `remoteStore`): выключен — подтверждение рисует GUI,
+ * поведение DSH не меняется. Явный выключатель `config.approvals.enabled: false`
+ * снимает фичу целиком (полезно, когда удалённо подтверждать действия запрещено
+ * политикой).
+ *
+ * Политика (таймаут=отказ, allowlist инструментов, `denyRemote`) — задача 025;
+ * аудит — 026; очередь и роутинг — 027; гибрид с GUI — 028. Здесь только ответчик:
+ * три кнопки, закрытый словарь исходов и честный `next()` при выключенном режиме.
+ */
+
+import { createApprovals } from "../approvals.js";
+import { createAudit } from "../audit.js";
+import { createRegistry } from "../domain/registry.js";
+import { resolveChannel } from "../store.js";
+
+/** Имя сервиса транспорта (объявляет фича telegram/relay). */
+export const TRANSPORT_SERVICE = "remoteTransport";
+
+/** Имя сервиса состояния (объявляет фича commands). */
+export const STATE_SERVICE = "remoteStore";
+
+/** Имя сервиса подтверждений: статистика решений для `/remote status` (026). */
+export const APPROVALS_SERVICE = "remoteApprovals";
+
+export const approvalsFeature = {
+  name: "approvals",
+  needs: [TRANSPORT_SERVICE],
+  apply(ctx, config, deps) {
+    if (config?.approvals?.enabled === false) {
+      deps.logger.debug("фича approvals: выключена конфигом — подтверждения остаются в GUI");
+      return;
+    }
+
+    const store = deps.get(STATE_SERVICE);
+    const registry = createRegistry({
+      readState: () => {
+        try {
+          const state = typeof store?.read === "function" ? store.read() : null;
+          return state?.enabled ?? {};
+        } catch (error) {
+          deps.logger.warn(`approvals: состояние не прочитано (${error?.message ?? error})`);
+          return {};
+        }
+      },
+      log: (message) => deps.logger.debug(message),
+    });
+
+    // Несколько каналов (012-подобная гонка): список из config.transports, сами
+    // транспорты — из реестра; один канал — прежний путь через фасад.
+    const requested = Array.isArray(config?.transports) ? config.transports.filter((id) => typeof id === "string") : null;
+    const transportRegistry = deps.get("remoteTransports");
+    let transports = null;
+    if (requested !== null && requested.length > 1 && transportRegistry !== null) {
+      const missing = requested.filter((id) => transportRegistry.get(id) === undefined);
+      if (missing.length > 0) {
+        deps.logger.warn(`approvals: каналы из config.transports не найдены: ${missing.join(", ")} — работаю с тем, что есть`);
+      }
+      transports = requested.map((id) => transportRegistry.get(id) ?? null).filter((item) => item !== null);
+      if (transports.length <= 1) transports = null;
+    }
+
+    // Аудит решений (026): `audit.jsonl` рядом с state.json; путь можно
+    // переопределить через DSH_REMOTE_AUDIT (тесты).
+    const audit = createAudit({
+      ...(typeof store?.paths?.dir === "string" && store.paths.dir !== "" ? { dir: store.paths.dir } : {}),
+      log: (message) => deps.logger.debug(message),
+    });
+
+    const approvals = createApprovals({
+      transport: deps.get(TRANSPORT_SERVICE),
+      transports,
+      registry,
+      audit,
+      // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
+      channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
+      log: (message) => deps.logger.debug(message),
+    });
+
+    deps.onDispose(approvals.attach(ctx));
+
+    try {
+      ctx.provide?.(APPROVALS_SERVICE, { stats: approvals.stats });
+    } catch (error) {
+      deps.logger.debug(`approvals: сервис статистики не зарегистрирован (${error?.message ?? error})`);
+    }
+  },
+};

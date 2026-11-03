@@ -9,6 +9,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { keyIdFor, createE2e, generateKeyPair } from "../lib/crypto.js";
 import { checkTransport } from "../lib/transport/base.js";
 import { RELAY_TOKEN_REF, RelayError, createRelayTransport, redact } from "../lib/transport/relay.js";
 
@@ -98,6 +99,166 @@ test("sendQuestion: POST /v1/questions с версией и Bearer; повтор
   assert.equal(body.question.id, QUESTION_ID);
   assert.deepEqual(body.question.options, [{ id: "o1", label: "Да" }, { id: "o2", label: "Нет" }]);
   assert.equal(body.question.workspace, "/p/alpha");
+});
+
+test("e2e: вопрос уходит конвертом, открытых тела/вариантов нет", async () => {
+  const device = generateKeyPair();
+  const plugin = generateKeyPair();
+  const calls = [];
+  const transport = createRelayTransport({
+    url: URL_BASE,
+    agentToken: TOKEN,
+    fetch: fakeFetch({
+      "POST /v1/questions": (parsed, init) => response(201, JSON.parse(init.body).question),
+    }, calls),
+    e2e: { privateKey: plugin.privateKey, devicePublicKey: device.publicKey },
+  });
+
+  await transport.sendQuestion(question());
+
+  const posted = calls[0].body.question;
+  assert.equal(posted.body, undefined, "тело вопроса не уходит открытым");
+  assert.equal(posted.title, undefined, "заголовок не уходит открытым");
+  assert.equal(posted.detail, undefined, "detail не уходит открытым");
+  assert.equal(posted.options, undefined, "подписи вариантов не уходят открытым");
+  assert.equal(posted.optionCount, 2, "сервер видит число вариантов для лимитов");
+  assert.equal(posted.workspace, "/p/alpha", "метаданные по контракту открыты");
+  assert.equal(posted.enc.keyId, keyIdFor(device.publicKey));
+  assert.equal(posted.enc.alg, "xchacha20poly1305");
+  assert.equal(transport.e2e.keyId, keyIdFor(device.publicKey));
+
+  const deviceSide = createE2e({
+    privateKey: device.privateKey,
+    peerPublicKey: plugin.publicKey,
+    devicePublicKey: device.publicKey,
+  });
+  const opened = deviceSide.openQuestion(posted.enc, {
+    id: posted.id,
+    shortId: posted.shortId,
+    createdAt: posted.createdAt,
+    expiresAt: posted.expiresAt,
+  });
+  assert.equal(opened.body, "Продолжать?");
+  assert.equal(opened.title, "Заголовок");
+  assert.deepEqual(opened.options, [{ id: "o1", label: "Да" }, { id: "o2", label: "Нет" }]);
+});
+
+test("e2e: ответ-конверт расшифровывается и эмитится как обычный ответ", async () => {
+  const device = generateKeyPair();
+  const plugin = generateKeyPair();
+  const deviceSide = createE2e({
+    privateKey: device.privateKey,
+    peerPublicKey: plugin.publicKey,
+    devicePublicKey: device.publicKey,
+  });
+  const answerMeta = {
+    questionId: QUESTION_ID,
+    answeredAt: "2026-11-03T18:05:00Z",
+    idempotencyKey: "3f2a1b0c-9d8e-4f70-a1b2-c3d4e5f60718",
+  };
+  const envelope = deviceSide.sealAnswer({ selected: ["o2"], custom: "только после обеда" }, answerMeta);
+
+  let answered = false;
+  const transport = createRelayTransport({
+    url: URL_BASE,
+    agentToken: TOKEN,
+    fetch: fakeFetch({
+      "POST /v1/questions": () => response(201, { id: QUESTION_ID }),
+      "GET /v1/answers": () => {
+        if (!answered) {
+          answered = true;
+          return response(200, { ...answerMeta, enc: envelope });
+        }
+        return response(404, { error: { code: "not-found", message: "ответа пока нет" } });
+      },
+    }),
+    e2e: { privateKey: plugin.privateKey, devicePublicKey: device.publicKey },
+    sleep: async () => {
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+  });
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+
+  await transport.start();
+  await transport.sendQuestion(question());
+  await tick(10);
+
+  assert.equal(answers.length, 1, "ответ доставлен один раз");
+  assert.deepEqual(answers[0], { shortId: "a1b2c3d4", optionIds: ["o2"], text: "только после обеда" });
+  assert.equal(transport.pending, 0, "битый/расшифрованный ответ снимает вопрос из очереди");
+  await transport.stop();
+});
+
+test("e2e: битый конверт ответа не эмитится и не крутит long-poll", async () => {
+  const device = generateKeyPair();
+  const plugin = generateKeyPair();
+  const logs = [];
+  let requests = 0;
+  const transport = createRelayTransport({
+    url: URL_BASE,
+    agentToken: TOKEN,
+    fetch: fakeFetch({
+      "POST /v1/questions": () => response(201, { id: QUESTION_ID }),
+      "GET /v1/answers": () => {
+        requests += 1;
+        return response(200, {
+          questionId: QUESTION_ID,
+          answeredAt: "2026-11-03T18:05:00Z",
+          idempotencyKey: "3f2a1b0c-9d8e-4f70-a1b2-c3d4e5f60718",
+          enc: {
+            enc: "AAAA",
+            nonce: Buffer.alloc(12).toString("base64"),
+            keyId: keyIdFor(device.publicKey),
+            alg: "xchacha20poly1305",
+            plainSize: 5,
+          },
+        });
+      },
+    }),
+    e2e: { privateKey: plugin.privateKey, devicePublicKey: device.publicKey },
+    log: (message) => logs.push(message),
+    sleep: async () => {
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+  });
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+
+  await transport.start();
+  await transport.sendQuestion(question());
+  await tick(10);
+
+  assert.equal(answers.length, 0, "битый конверт не превращается в пустой ответ");
+  assert.equal(transport.pending, 0, "вопрос снят из pending, иначе long-poll зациклится");
+  assert.ok(logs.some((line) => line.includes("не расшифрован")), `ожидали предупреждение, а в логах: ${logs.join(" | ")}`);
+  assert.ok(!logs.join(" | ").includes(plugin.privateKey), "приватный ключ не попал в лог");
+  await transport.stop();
+});
+
+test("e2e: require: true без ключей — ошибка конфига, а не открытый режим", () => {
+  assert.throws(
+    () => createRelayTransport({
+      url: URL_BASE,
+      agentToken: TOKEN,
+      fetch: fakeFetch({}),
+      e2e: { require: true },
+    }),
+    (error) => error instanceof TypeError && error.message.includes("e2e"),
+  );
+});
+
+test("e2e: без ключей транспорт работает открыто (обратная совместимость)", async () => {
+  const calls = [];
+  const transport = createRelayTransport({
+    url: URL_BASE,
+    agentToken: TOKEN,
+    fetch: fakeFetch({ "POST /v1/questions": () => response(201, { id: QUESTION_ID }) }, calls),
+    e2e: { require: false },
+  });
+  await transport.sendQuestion(question());
+  assert.equal(calls[0].body.question.body, "Продолжать?");
+  assert.equal(transport.e2e, null);
 });
 
 test("closeQuestion снимает вопрос локально: протокол закрытия не имеет", async () => {
