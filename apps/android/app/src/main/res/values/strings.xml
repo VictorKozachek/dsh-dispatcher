@@ -1,0 +1,57 @@
+<resources>
+    <string name="app_name">DSH Remote</string>
+
+    <!-- Привязка -->
+    <string name="pairing_title">Привязка к релею</string>
+    <string name="pairing_hint_relay">Адрес релея, например https://relay.example.com</string>
+    <string name="pairing_hint_code">Код привязки из 6 цифр</string>
+    <string name="pairing_action">Привязать</string>
+    <string name="pairing_busy">Привязываем…</string>
+    <string name="pairing_error_invalid_url">Адрес релея пуст или некорректен</string>
+    <string name="pairing_error_invalid_code">Код привязки — ровно 6 цифр</string>
+    <string name="pairing_error_network">Релей недоступен: проверьте адрес и сеть</string>
+    <string name="pairing_error_code_expired">Код недействителен или истёк — возьмите новый в плагине</string>
+    <string name="pairing_error_code_used">Код уже использован или устройство не допущено</string>
+    <string name="pairing_error_unknown">Не удалось привязаться: неизвестная ошибка</string>
+
+    <!-- Вопросы -->
+    <string name="questions_title">Открытые вопросы</string>
+    <string name="questions_empty">Открытых вопросов нет</string>
+    <string name="questions_refresh">Обновить</string>
+    <string name="questions_closed_tab">Закрытые</string>
+    <string name="questions_pending_answers">Не отправлено ответов: %1$d</string>
+    <string name="questions_connection_offline">Нет соединения с релеем — ответы уйдут позже</string>
+    <string name="questions_workspace">Воркспейс: %1$s</string>
+    <string name="questions_task">Задача: %1$s</string>
+    <string name="questions_role">Роль: %1$s</string>
+    <string name="questions_short_id">#%1$s</string>
+    <string name="questions_expires_in">Осталось: %1$s</string>
+
+    <!-- Экран вопроса -->
+    <string name="question_back">Назад</string>
+    <string name="question_free_text">Свой ответ</string>
+    <string name="question_send">Отправить</string>
+    <string name="question_expired">Вопрос истёк</string>
+    <string name="question_multiselect_hint">Можно выбрать несколько вариантов</string>
+    <string name="question_no_options">Вариантов нет — ответьте текстом</string>
+    <string name="question_encrypted">Вопрос зашифрован (e2e). Расшифровка тела — задача 021, пока ответить нельзя.</string>
+    <string name="question_answer_sent">Ответ отправлен</string>
+    <string name="question_answer_queued">Ответ сохранён и уйдёт, когда появится сеть</string>
+    <string name="question_answer_conflict">Вопрос уже отвечен</string>
+    <string name="question_answer_failed">Не удалось отправить ответ: %1$s</string>
+
+    <!-- Закрытые -->
+    <string name="closed_title">Закрытые</string>
+    <string name="closed_empty">Пока пусто</string>
+    <string name="closed_state_sent">отправлен</string>
+    <string name="closed_state_rejected">отклонён</string>
+    <string name="closed_state_pending">в очереди</string>
+    <string name="closed_answer_selected">Варианты: %1$s</string>
+    <string name="closed_answer_custom">Текст: %1$s</string>
+    <string name="closed_last_error">Ошибка: %1$s</string>
+
+    <!-- Уведомления -->
+    <string name="notification_new_questions">Новых вопросов: %1$d</string>
+    <string name="notification_channel_questions">Вопросы агента</string>
+    <string name="notification_channel_questions_description">Уведомления о новых вопросах из релея</string>
+</resources>
