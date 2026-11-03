@@ -282,6 +282,10 @@ export function createNotifier({
           for (const notice of notices) log(`уведомления: тихие часы — ${notice.key} отложено`);
           continue;
         }
+        // Запоминаем прошлое значение: если todo-low не уйдёт, откатим его,
+        // иначе переход lastTodo>=min -> <min больше никогда не повторится.
+        const todoBeforeSend = byWorkspace[workspace];
+        const failedTodoLow = [];
         byWorkspace[workspace] = todoCount;
         const queue = throttle([], intervalMs, { now });
         for (const notice of notices) {
@@ -296,11 +300,18 @@ export function createNotifier({
               sent.push(notice);
             } catch (error) {
               stats.errors += 1;
+              if (notice.kind === "todo-low") failedTodoLow.push(notice.key);
               log(`уведомление ${notice.key} не отправлено (${error?.message ?? error})`);
             }
           });
         }
         await queue.run();
+        if (failedTodoLow.length > 0) {
+          // Уведомление не ушло: не фиксируем новый todo, повторим переход
+          // на следующем проходе (ключ seen тоже не помечен).
+          if (todoBeforeSend === undefined) delete byWorkspace[workspace];
+          else byWorkspace[workspace] = todoBeforeSend;
+        }
       }
 
       writeNotifyState({ seen, byWorkspace, baselines });

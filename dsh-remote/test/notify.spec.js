@@ -395,3 +395,64 @@ test("resolveMaxText: лимит берётся в момент отправки
   assert.equal(sent.length, 1);
   assert.equal(sent[0].text.length <= 40, true, `длина ${sent[0].text.length}`);
 });
+
+test("todo-low при сбое отправки повторяется (lastTodo не съедает переход)", async (t) => {
+  const workspace = makeWorkspace(t, [
+    { id: "001", status: "todo", updated: "t1" },
+    { id: "002", status: "todo", updated: "t1" },
+    { id: "003", status: "todo", updated: "t1" },
+  ], { minTodo: 3 });
+  let fail = true;
+  const sent = [];
+  const store = createStore({ file: path.join(workspace, "state.json") });
+  const notifier = createNotifier({
+    store,
+    workspaces: [workspace],
+    send: async (message) => {
+      if (fail) throw new Error("канал не поднят");
+      sent.push(message);
+    },
+    now: () => new Date(2026, 10, 3, 12).getTime(),
+    quietHours: false,
+    intervalMs: 0,
+    log: () => {},
+  });
+
+  await notifier.scan(); // baseline: todo=3
+  writeCard(workspace, { id: "003", status: "backlog", updated: "t2" }); // todo=2
+  await notifier.scan();
+  assert.equal(notifier.stats.errors, 1, "первая отправка упала");
+
+  fail = false;
+  await notifier.scan();
+  const low = sent.filter((message) => /пора выдать/.test(message.text));
+  assert.equal(low.length, 1, "todo-low повторился после восстановления канала");
+});
+
+test("старый baseline boolean мигрирует без спама", async (t) => {
+  const workspace = makeWorkspace(t, [
+    { id: "001", status: "ready", updated: "t1" },
+    { id: "002", status: "blocked", updated: "t1", note: "старое" },
+  ]);
+  const store = createStore({ file: path.join(workspace, "state.json") });
+  // Состояние предыдущей версии: baseline — boolean, seen пуст.
+  store.update((state) => {
+    state.notify = { seen: [], lastTodo: {}, baseline: true };
+    return state;
+  });
+  const sent = [];
+  const notifier = createNotifier({
+    store,
+    workspaces: [workspace],
+    send: async (message) => sent.push(message),
+    now: () => new Date(2026, 10, 3, 12).getTime(),
+    quietHours: false,
+    intervalMs: 0,
+    log: () => {},
+  });
+
+  await notifier.scan();
+
+  assert.equal(sent.length, 0, "история не пришла после апгрейда");
+  assert.equal(typeof store.read().notify.baseline, "object", "baseline стал картой воркспейсов");
+});
