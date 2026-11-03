@@ -87,6 +87,14 @@ parameters: {
 внутреннем типе — `multiSelect`; переименование делает `execute`
 (`tool-ask-user/src/index.ts:82-88`) **[код]**.
 
+И ещё одно, важное для транспорта: в model-facing схеме **нет** полей `detail` и
+`intent` (`tool-ask-user/src/index.ts:31-54`). То есть вопрос, заданный моделью
+через `ask_user_question`, никогда не несёт длинного текста-подробности и не
+объявляет `plan-review` — `detail` приходит только от внутренних вызывающих
+(например, `exit_plan_mode` в `packages/plan/plan-mode/src/index.ts:300-318`).
+Для форматирования в мессенджере это значит: тело вопроса — это `question` +
+опции, и ничего больше **[код]**.
+
 ### 1.3. Схема результата (то, что видит модель)
 
 ```ts
@@ -176,7 +184,7 @@ return await (agent === undefined
 ```ts
 // ui-user-questions/src/client/index.ts:52
 export const inject = ['sessions', 'remote', 'uiSession', 'slots', 'locale']
-// :98-99  — панель вопроса подменяет собой композер (цепочка conversation.composer)
+// :94-102 — панель вопроса подменяет собой композер (цепочка conversation.composer)
 ctx.slots.inject('conversation.composer', () => ctx.slots.register(
   { name: 'conversation.composer',
     select: ({ pendingInteraction }) => pendingInteraction instanceof PendingQuestion ? pendingInteraction : null,
@@ -218,7 +226,7 @@ catch (error) { if (pending.isDelegation(error)) return await next(); throw erro
 
 1. `QuestionComposer` собирает `AskUserQuestionAnswer` → `PendingQuestion.result`.
 2. Значение возвращается из клиентского слушателя `ctx.remote.$on(...)` и
-   `gateway/src/index.ts:520-543` (`receiveRemoteEventResult`) превращает его в
+   `gateway/src/index.ts:527-556` (`receiveRemoteEventResult`) превращает его в
    `{kind:'result', value}` → `settleRemoteEvent`.
 3. Мост `forwardWaterfall` (`packages/api/remotes/src/index.ts:138-160`) —
    `pending.source.resolve(outcome)`, то есть промис слушателя разрешается
@@ -339,10 +347,12 @@ Gateway (`packages/api/gateway/src/index.ts:457-520`), и снять его мо
 необратимо — это уже сделанный `next()`: снять доставленный в GUI вопрос из
 плагина нельзя **[код]**.
 
-Одно следствие, которое стоит держать в голове: если вызвать `next()` после
-аборта `request.signal`, мост всё равно создаст событие, а `ask()` уже завершится
-ошибкой `ASK_ABORTED` — то есть «поздний» `next()` после отмены бесполезен, и
-вызывать его надо только при живом `signal` **[код + логика]**, **[эксперимент]**.
+Одно следствие, которое стоит держать в голове: если `request.signal` уже
+абортнут, «поздний» `next()` бесполезен — Gateway увидит абортнутый сигнал и
+сразу отменит событие (`packages/api/gateway/src/index.ts:514`:
+`if ([...signals].some(signal => signal.aborted)) abort()`), так что `next()`
+отклонится, а не покажет вопрос. Значит retry-ветку надо строить на живом
+`signal` **[код]**, **[эксперимент]**.
 
 Полезная деталь на будущее: pending-события **доигрываются** новому клиенту —
 при подключении браузера Gateway рассылает ему все незавершённые события
@@ -398,7 +408,7 @@ Gateway (`packages/api/gateway/src/index.ts:457-520`), и снять его мо
 | Что нужно | API | Что произойдёт |
 |---|---|---|
 | Вернуть ответ на вопрос | вернуть `AskUserQuestionAnswer` из слушателя `user-questions/request` | tool-result уходит модели, turn продолжается |
-| Положить сообщение в сессию | `ctx.sessionController.prompt({requestId, sessionId, mode:'queue'|'steer', content}, signal)` | durable user-сообщение; `queue` = `agent.followup()`, `steer` = `agent.steer()` (`packages/api/session-controller/src/commands.ts:303-325`) |
+| Положить сообщение в сессию | `ctx.sessionController.prompt({requestId, sessionId, mode: 'queue' / 'steer', content}, signal)` | durable user-сообщение; `queue` = `agent.followup()`, `steer` = `agent.steer()` (`packages/api/session-controller/src/commands.ts:303-325`) |
 | Сказать агенту напрямую | `agent.followup(msg)` / `agent.steer(msg)` (`packages/core/agent/src/runtime-types.ts:130,139`) | то же, но **без** проверки модели/маршрута и без `requestId`; в плагине лучше не использовать |
 
 Резюме: **ответ на вопрос нельзя «влить» в уже заданный вопрос** — можно только
@@ -607,7 +617,7 @@ tool-call** — это прямой вызов handler'а с последующ�
 > команда с таким именем зарегистрирована и глобально, и на агенте (по коду
 > побеждает агентская), и обновляется ли popup-список без перезагрузки страницы
 > после `commands/change` (событие форвардится, инвалидация в
-> `ui-commands/src/client/service.ts:159`).
+> `ui-commands/src/client/service.ts:157`).
 
 ---
 
@@ -647,7 +657,7 @@ bundle-слои (в порядке dsh.profile.bundles)  →  ~/.dsh/profiles/<n
   →  телеметрийный переключатель
 ```
 
-`allPatches()` — `apps/cli/src/profile-boot.ts:140-147`; live-пересборка
+`allPatches()` — `apps/cli/src/profile-boot.ts:136-143`; live-пересборка
 перечитывает оба пользовательских файла на каждое поколение — `:245-250`.
 
 ### 5.3. Семантика патча (точный формат)
@@ -868,9 +878,13 @@ register(route: WebRoute): () => void        // дубликат (kind,path) →
 ```
 
 Сервер монтируется рядом `webserver` с `host: !!js ctx.webStartup.host ?? '127.0.0.1'`,
-`port: 3080` (`packages/bundle/web-app/cordis.patch.yml:111-118`). То есть по
-умолчанию он слушает loopback — для webhook нужен `--host 0.0.0.0`/туннель и
-**своя** аутентификация маршрута. Для ноутбука за NAT проще long polling
+`port: 3080` (`packages/bundle/web-app/cordis.patch.yml:111-118`). И главное:
+**`--host 0.0.0.0` намеренно запрещён** — CLI падает с «intentionally not
+supported yet for safety: it would expose remote code execution to the network;
+use 127.0.0.1 instead» (`packages/bundle/web-app/src/startup.ts:73-76`).
+Значит штатного входящего webhook-пути нет: сервер слушает loopback, и
+единственный внешний канал — исходящий (long polling), либо отдельный туннель,
+поднятый человеком **вне** DSH. Для MVP это подтверждает выбор long polling
 (транспортная часть — в `docs/research/messengers.md`).
 
 ### 7.2. Таймауты
@@ -923,7 +937,7 @@ register(route: WebRoute): () => void        // дубликат (kind,path) →
 | слот | тип | смысл |
 |---|---|---|
 | `sidebar` (:52) | single/root | вся левая колонка (занята `ui-sidebar`) |
-| `conversation` (:63) | single/session-maybe | центральная колонка |
+| `conversation` (:65) | single/session-maybe | центральная колонка |
 | `details` (:75) | single/session | **правая колонка деталей**; занята `DetailsPanel` из `ui-conversation`, при отсутствии владельца пуста |
 | `shell.overlay` (:86) | list/root | плавающий слой над всем каркасом: «a badge, a toast stack or a status pill all belong here» |
 
@@ -996,6 +1010,8 @@ dsh-remote/
 
 ```js
 export const inject = ['credentials']            // + 'sessionController', 'commands' по мере надобности
+// 'userQuestions' инжектить НЕ нужно: слушателю события сервис не требуется,
+// он нужен только тому, кто сам зовёт ctx.userQuestions.ask()
 export const name = 'dsh-remote'
 
 export function apply(ctx, config) {
@@ -1121,7 +1137,7 @@ await ctx.sessionController.prompt({
 | 1. Перехват через `user-questions/request`, при выключенном — `next()` | §9.2 (`prepend: true`) |
 | 2. Изоляция ядра (только публичные сервисы) | `userQuestions`-событие, `commands`, `sessionController`, `credentials` — все публичные (§2, §3, §4, §6) |
 | 3. Подключение командой `/remote connect` | §9.5 |
-| 4. Адресация (воркспейс, задача, роль, время, дедлайн) | `request.agent` + `agent.session.header.cwd`, `agentPreset` из `agent-presets`; время/дедлайн — свои |
+| 4. Адресация (воркспейс, задача, роль, время, дедлайн) | `request.agent` + `agent.session.header.cwd` (`packages/core/agent/src/runtime-types.ts:76`; cwd в заголовке — `packages/api/session-controller/src/agent.ts:411`), роль — `ctx.agentPresets.composedPreset(agent.ctx)` (`packages/preset/agent-presets/src/index.ts:474-476`), время/дедлайн — свои |
 | 5. Ответ кнопками/текстом, ровно один раз | §9.4 п.1; идемпотентность — на стороне плагина |
 | 6. Транспорт-абстракция | вне DSH-слоя (`docs/research/messengers.md`) |
 | 7. Устойчивость (TTL, недоставленный вопрос → GUI, осиротевшие → cancelled) | §2.3 (отложенный `next()`), §7.2 (своего таймаута нет) |
@@ -1151,7 +1167,7 @@ await ctx.sessionController.prompt({
 | 5 | Порядок слоёв: bundles → профиль → home → `--patch` | код |
 | 5 | `patchReload: live` перезагружает конфиг (но не код плагина) | код + **эксперимент** |
 | 6 | `~/.dsh/.credentials.yaml`, `ctx.credentials.{resolve,describe,set,unset}` | код |
-| 7 | Сеть вне песочницы; webhook через `ctx.webServer.register` | код |
+| 7 | Сеть вне песочницы; `ctx.webServer.register` есть, но `--host 0.0.0.0` запрещён → внешний вход только туннелем | код |
 | 7 | Таймаута на вопрос нет; `timeoutMs` — опция инструмента | код |
 | 7 | Вопросы не персистятся; сессия поднимается по `prompt` | код |
 | 8 | `details` / `shell.overlay` / `conversation.view` / `Toast` | код |
