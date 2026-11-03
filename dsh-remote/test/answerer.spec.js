@@ -119,7 +119,7 @@ function request(overrides = {}) {
 
 /** Ответчик с включённым режимом и подменёнными часами. */
 function setup({ transport = fakeTransport(), enabled = true, logs = [] } = {}) {
-  const ctx = fakeContext({ services: { sessions: { get: () => ({ cwd: "/p" }) } } });
+  const ctx = fakeContext({ services: { sessions: { get: () => ({ header: { cwd: "/p" } }) } } });
   const registry = createRegistry({
     readState: () => (enabled ? { global: true } : {}),
   });
@@ -240,6 +240,49 @@ test("аборт request.signal: сообщение закрыто, вопрос
   assert.match(logs.join("\n"), /режим|ответ/);
 });
 
+test("аборт во время sendQuestion: не ждём отправку, отклоняемся, закрываем отправленное", async () => {
+  const closed = [];
+  const sent = [];
+  const transport = {
+    sendQuestion(question) {
+      sent.push(question);
+      if (question.questionId === "q2") {
+        return new Promise(() => {
+          /* отправка «зависла»: именно этот случай ломал обработчик */
+        });
+      }
+      return Promise.resolve();
+    },
+    closeQuestion(question, reason) {
+      closed.push({ question, reason });
+    },
+    onAnswer() {
+      return () => {};
+    },
+  };
+  const ctx = fakeContext();
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({ transport, registry, now: () => 1_000 });
+  answerer.attach(ctx);
+
+  const controller = new AbortController();
+  const pending = runWaterfall(ctx, EVENT, {
+    questions: [item({ id: "q1" }), item({ id: "q2" })],
+    agent: { id: "s1" },
+    signal: controller.signal,
+  }, () => assert.fail("next() не должен вызываться"));
+  await tick();
+  assert.equal(sent.length, 2, "вторая отправка висит");
+
+  controller.abort();
+
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+  assert.equal(closed.length, 2, "закрыты вопросы, по которым отправка уже началась");
+  assert.deepEqual(closed.map((item) => item.question.questionId), ["q1", "q2"]);
+  assert.equal(sent[0].status, QUESTION_STATUS.cancelled);
+  assert.equal(sent[1].status, QUESTION_STATUS.cancelled);
+});
+
 test("два вопроса в одном запросе не путаются", async () => {
   const { ctx, transport, answerer } = setup();
   answerer.attach(ctx);
@@ -333,7 +376,7 @@ test("пустой список вопросов — next(): это ошибка
 });
 
 test("режим выбирается по воркспейсу сессии из ctx.sessions", async () => {
-  const ctx = fakeContext({ services: { sessions: { get: () => ({ cwd: "/p" }) } } });
+  const ctx = fakeContext({ services: { sessions: { get: () => ({ header: { cwd: "/p" } }) } } });
   const transport = fakeTransport();
   const registry = createRegistry({ readState: () => ({ workspaces: { "/p": true } }) });
   const answerer = createAnswerer({ transport, registry, now: () => 1_000 });

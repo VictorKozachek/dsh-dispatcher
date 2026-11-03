@@ -120,26 +120,39 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
   let context = null;
   let disposed = false;
 
-  /** cwd сессии — для выбора scope «воркспейс». Маркировка шапки — задача 006. */
+  /**
+   * cwd сессии — для выбора scope «воркспейс». Маркировка шапки — задача 006.
+   *
+   * `ctx.sessions.get(id)` отдаёт `Session`, и рабочий каталог лежит в
+   * `session.header.cwd` (так же его читает agent-instructions): поля `cwd` или
+   * `workspace` сверху нет, поэтому читать их — молча получить null.
+   */
   function workspaceOf(sessionId) {
     if (typeof sessionId !== "string" || sessionId === "") return null;
     try {
       const sessions = context?.get?.("sessions");
       const session = sessions?.get?.(sessionId);
-      const cwd = session?.cwd ?? session?.workspace;
+      const cwd = session?.header?.cwd;
       return typeof cwd === "string" && cwd !== "" ? cwd : null;
     } catch {
       return null;
     }
   }
 
-  /** Снять вопросы: статус `cancelled` и закрытие сообщений (best effort). */
-  async function closeQuestions(questions, reason) {
+  /**
+   * Снять вопросы: статус `cancelled` и закрытие сообщений (best effort).
+   *
+   * `attempted` — для каких вопросов отправка уже началась: у неотправленных
+   * закрывать нечего, им достаточно статуса (аборт во время отправки, ошибка
+   * доставки). Начатая отправка могла дойти до сервера, поэтому её закрываем.
+   */
+  async function closeQuestions(questions, reason, attempted = null) {
     for (const question of questions) {
       pending.delete(question.shortId);
       // Уже отвеченный или закрытый вопрос второй раз не закрываем: сообщение в
       // мессенджере и так снято, а лишний closeQuestion — ложный сигнал транспорту.
       if (!question.cancel(reason, now())) continue;
+      if (attempted !== null && !attempted.has(question)) continue;
       try {
         await transport?.closeQuestion?.(question, reason);
       } catch (error) {
@@ -223,15 +236,9 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       waiting.push(waited);
     }
 
-    try {
-      for (const question of questions) await transport.sendQuestion(question);
-    } catch (error) {
-      log(`вопрос: доставить не удалось (${error?.message ?? error}) — снимаю и отдаю GUI`);
-      await closeQuestions(questions, "send-failed");
-      return next();
-    }
-
-    // Аборт запроса: сообщение закрываем, промис отклоняем (дальше — ASK_ABORTED).
+    // Аборт слушаем ДО отправки: иначе аборт во время sendQuestion оставил бы
+    // handler ждать зависший send (а если send после аборта бросит — мы бы ушли в
+    // send-failed и позвали next(), вместо ASK_ABORTED).
     let onAbort = null;
     const aborted = new Promise((_, reject) => {
       const fail = () => reject(abortError());
@@ -244,17 +251,39 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       onAbort = fail;
       request.signal.addEventListener("abort", fail, { once: true });
     });
+    /** Гонка с отменой не должна оставлять необработанный отказ. */
+    aborted.catch(() => {});
+
+    /** Для каких вопросов отправка началась: у неотправленного закрывать нечего. */
+    const attempted = new Set();
 
     try {
-      await Promise.race([Promise.all(waiting), aborted]);
-    } catch (error) {
-      if (error?.name === "AbortError") {
-        await closeQuestions(questions, "aborted");
-        throw error;
+      try {
+        for (const question of questions) {
+          attempted.add(question);
+          await Promise.race([transport.sendQuestion(question), aborted]);
+        }
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          await closeQuestions(questions, "aborted", attempted);
+          throw error;
+        }
+        log(`вопрос: доставить не удалось (${error?.message ?? error}) — снимаю и отдаю GUI`);
+        await closeQuestions(questions, "send-failed", attempted);
+        return next();
       }
-      log(`вопрос: ожидание ответа сорвалось (${error?.message ?? error}) — отдаю GUI`);
-      await closeQuestions(questions, "failed");
-      return next();
+
+      try {
+        await Promise.race([Promise.all(waiting), aborted]);
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          await closeQuestions(questions, "aborted", attempted);
+          throw error;
+        }
+        log(`вопрос: ожидание ответа сорвалось (${error?.message ?? error}) — отдаю GUI`);
+        await closeQuestions(questions, "failed", attempted);
+        return next();
+      }
     } finally {
       if (onAbort !== null) {
         try {
