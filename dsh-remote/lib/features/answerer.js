@@ -53,6 +53,12 @@ export const answererFeature = {
     });
 
     deps.onDispose(answerer.attach(ctx));
+    // Метрика гибрида доступна командам (`/remote status`) как сервис.
+    try {
+      ctx.provide?.("remoteAnswerer", { stats: answerer.stats });
+    } catch (error) {
+      deps.logger.debug(`answerer: сервис статистики не зарегистрирован (${error?.message ?? error})`);
+    }
     // Метрика режима видна в логе при выгрузке: сколько ушло в GUI и сколько
     // потом ответили из телефона.
     deps.onDispose(() => {

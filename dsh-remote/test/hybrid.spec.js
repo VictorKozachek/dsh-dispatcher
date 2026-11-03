@@ -252,3 +252,182 @@ test("/remote on --hybrid: состояние и status", async (t) => {
   assert.equal(store.read().hybrid.enabled, false);
   assert.match((await remote.handler(invoke("status"))).text, /гибрид: выкл/);
 });
+
+// --- регрессии по ревью 013 -------------------------------------------------
+
+test("два вопроса: ответ на первый не снимает таймер второго", async () => {
+  const { answerer, transport, timers, steers, logs } = setup();
+  let nextCalls = 0;
+  const questions = [
+    { id: "q1", question: "Первый?", options: [{ label: "Да" }] },
+    { id: "q2", question: "Второй?", options: [{ label: "Да" }] },
+  ];
+
+  const pending = answerer.handler({ questions, agent: { id: SESSION_ID } }, () => {
+    nextCalls += 1;
+    return { answers: [] };
+  });
+  await tick();
+  assert.equal(timers.delays().length, 2, "по таймеру на каждый вопрос");
+
+  const first = transport.sent[0];
+  transport.answer({ shortId: first.shortId, optionId: "o1" });
+  await tick();
+
+  timers.tick(); // «время вышло» по второму вопросу
+  await tick();
+  assert.equal(nextCalls, 0, "пачка уже частично отвечена — GUI не зовём");
+  assert.match(logs.join("\n"), /пачка уже частично отвечена/);
+
+  // Второй вопрос остался обычным ожиданием: его ответ — результат, не steer.
+  const second = transport.sent[1];
+  transport.answer({ shortId: second.shortId, optionId: "o1" });
+  const result = await pending;
+  assert.equal(result.answers.length, 2);
+  assert.equal(steers.length, 0, "steer не нужен: GUI не забирал пачку");
+});
+
+test("late-steer вызывает prompt(request, signal) по контракту DSH", async () => {
+  const timers = fakeTimers();
+  const transport = fakeTransport();
+  const prompts = [];
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const controller = new AbortController();
+  const answerer = createAnswerer({
+    transport,
+    registry,
+    hybrid: { enabled: true, waitMs: 20_000 },
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+    log: () => {},
+    now: () => 0,
+  });
+  const ctx = {
+    get: (name) => (name === "sessionController"
+      ? {
+        async prompt(request, signal) {
+          prompts.push({ request, signal });
+        },
+      }
+      : null),
+    on: (event, handler) => {
+      return () => {};
+    },
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+  };
+  answerer.attach(ctx);
+
+  const pending = answerer.handler(
+    { questions: [ITEM], agent: { id: SESSION_ID }, signal: controller.signal },
+    () => ({ answers: [] }),
+  );
+  await tick();
+  timers.tick();
+  await pending;
+
+  const { shortId } = transport.sent[0];
+  transport.answer({ shortId, optionId: "o1" });
+  await tick();
+
+  assert.equal(prompts.length, 1);
+  const { request, signal } = prompts[0];
+  assert.equal(request.mode, "steer");
+  assert.ok(typeof request.requestId === "string" && request.requestId !== "", "requestId обязателен");
+  assert.equal(request.sessionId, SESSION_ID);
+  assert.equal(signal, controller.signal, "сигнал запроса прокинут вторым аргументом");
+  assert.match(request.content[0].text, /из мессенджера/);
+});
+
+test("сбой steer: ответ не теряется молча и сообщение не закрывается", async () => {
+  const { answerer, transport, timers, logs } = setup({
+    hybrid: { enabled: true, waitMs: 20_000 },
+  });
+  let failSteer = true;
+  const steers = [];
+  // подменяем steer через повторную сборку ответчика с падающим steer
+  const timers2 = fakeTimers();
+  const transport2 = fakeTransport();
+  const answerer2 = createAnswerer({
+    transport: transport2,
+    registry: createRegistry({ readState: () => ({ global: true }) }),
+    hybrid: { enabled: true, waitMs: 20_000 },
+    setTimeout: timers2.setTimeout,
+    clearTimeout: timers2.clearTimeout,
+    steer: async (argument) => {
+      steers.push(argument);
+      if (failSteer) throw new Error("sessionController недоступен");
+    },
+    log: (message) => logs.push(message),
+    now: () => 0,
+  });
+  void answerer;
+  void transport;
+  void timers;
+  answerer2.attach({
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+    get: () => null,
+  });
+
+  const pending = answerer2.handler({ questions: [ITEM], agent: { id: SESSION_ID } }, () => ({ answers: [] }));
+  await tick();
+  const { shortId } = transport2.sent[0];
+  timers2.tick();
+  await pending;
+
+  transport2.answer({ shortId, optionId: "o1" });
+  await tick();
+  await tick();
+
+  assert.equal(steers.length, 1, "попытка была");
+  assert.equal(transport2.closed.length, 0, "сообщение не закрыто: ответ не доставлен");
+  assert.match(logs.join("\n"), /не доставлен в сессию/);
+
+  // Повтор (после починки) закрывает сообщение и засчитывает метрику.
+  failSteer = false;
+  transport2.answer({ shortId, optionId: "o1" });
+  await tick();
+  await tick();
+  assert.equal(transport2.closed.length, 1, "успешный steer закрыл сообщение");
+  assert.equal(answerer2.stats.hybridPhoneAnswers, 1);
+});
+
+test("метрика гибрида видна в /remote status", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-hybrid-status-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json") });
+  store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  store.setHybrid({ enabled: true, waitMs: 20_000 });
+
+  const ctx = {
+    get: (name) => {
+      if (name === "sessions") return { get: () => ({ header: { cwd: "/p" } }) };
+      if (name === "remoteAnswerer") return { stats: { hybridHanded: 3, hybridPhoneAnswers: 2 } };
+      return null;
+    },
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+  };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => 0, currentChannel: () => ({ id: "telegram" }) });
+  const status = await remote.handler({
+    commandId: "c1",
+    agent: { id: SESSION_ID, session: { id: SESSION_ID } },
+    rawInput: "status",
+    signal: new AbortController().signal,
+  });
+
+  assert.match(status.text, /гибрид: вкл, ждём 20 с/);
+  assert.match(status.text, /гибрид-метрика: в GUI 3, ответов из телефона после GUI 2/);
+});

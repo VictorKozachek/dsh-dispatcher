@@ -655,6 +655,10 @@ export function createRemoteCommands({
     }
 
     lines.push(`гибрид: ${state.hybrid.enabled ? `вкл, ждём ${Math.round(state.hybrid.waitMs / 1000)} с` : "выкл"}`);
+    const hybridStats = ctx?.get?.("remoteAnswerer")?.stats ?? null;
+    if (hybridStats !== null && (hybridStats.hybridHanded > 0 || hybridStats.hybridPhoneAnswers > 0)) {
+      lines.push(`гибрид-метрика: в GUI ${hybridStats.hybridHanded}, ответов из телефона после GUI ${hybridStats.hybridPhoneAnswers}`);
+    }
     lines.push(`режим: глобально ${state.enabled.global ? "вкл" : "выкл"}; проект ${cwd === null ? "?" : cwd} ${cwd !== null && state.enabled.workspaces[cwd] === true ? "вкл" : "выкл"}; сессия ${sessionId === null ? "?" : sessionId} ${sessionId !== null && state.enabled.sessions[sessionId] === true ? "вкл" : "выкл"}`);
     lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
 

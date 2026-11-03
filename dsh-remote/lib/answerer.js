@@ -165,25 +165,27 @@ export function createAnswerer({
   }
 
   /** Отправить поздний ответ в сессию как уточнение (`steer`). */
-  async function steerLateAnswer(question, normalized) {
+  async function steerLateAnswer(question, normalized, signal) {
     const text = normalized.text !== undefined && normalized.text !== ""
       ? normalized.text
       : (question.answer?.selected ?? []).join(", ");
     const body = `ответ человека на вопрос ${question.questionId ?? question.shortId} из мессенджера: ${text}`;
     if (typeof steer === "function") {
-      await steer({ question, text: body, sessionId: question.sessionId });
+      await steer({ question, text: body, sessionId: question.sessionId, signal });
       return;
     }
     const controller = context?.get?.("sessionController");
     if (controller === null || controller === undefined || typeof controller.prompt !== "function") {
-      log(`гибрид: sessionController недоступен — поздний ответ ${question.shortId} не доставлен`);
-      return;
+      throw new Error("sessionController недоступен");
     }
+    // Контракт DSH: prompt(request, signal); requestId обязателен, иначе ответ
+    // не привяжется к запросу (см. 008 applyLateAnswer).
     await controller.prompt({
+      requestId: question.questionId ?? question.shortId,
       sessionId: question.sessionId,
       mode: "steer",
       content: [{ type: "text", text: body }],
-    });
+    }, signal);
   }
   /**
    * Доставка вопроса: по умолчанию — транспорт, но 008 подставляет сюда
@@ -197,6 +199,8 @@ export function createAnswerer({
   const pending = new Map();
   /** Метка «вопрос ушёл в GUI»: гонка ожиданий завершается этим значением. */
   const HYBRID_GUI = Symbol("hybrid-gui");
+  /** Таймеры гибрида по shortId: ответ на один вопрос не снимает чужие. */
+  const hybridTimers = new Map();
   /** Контекст плагина: из него берём cwd сессии для scope воркспейса. */
   let context = null;
   let disposed = false;
@@ -270,6 +274,22 @@ export function createAnswerer({
    * Слушатель будим **до** правки: медленный (или зависший) editMessageText не
    * должен задерживать ответ сессии. Правка — украшение, ответ — смысл.
    */
+  /** Доставить поздний (гибридный) ответ; при сбое — пометить и не закрывать. */
+  async function settleLate(entry, normalized) {
+    try {
+      await steerLateAnswer(entry.question, normalized, entry.signal);
+    } catch (error) {
+      entry.steerFailed = true;
+      log(`гибрид: поздний ответ ${entry.question.shortId} не доставлен в сессию (${error?.message ?? error}) — сообщение не закрываю`);
+      return;
+    }
+    pending.delete(entry.question.shortId);
+    reliability?.unwatch?.(entry.question.shortId);
+    stats.hybridPhoneAnswers += 1;
+    log(`гибрид: ответ на ${entry.question.shortId} из мессенджера доставлен steer-ом`);
+    void closeMessage(entry.question);
+  }
+
   function onTransportAnswer(event) {
     const normalized = normalizeAnswerEvent(event);
     if (normalized === null) {
@@ -280,18 +300,19 @@ export function createAnswerer({
     if (entry !== undefined && entry.hybridGui === true) {
       // Вопрос уже показан в GUI: ответ из мессенджера не результат инструмента,
       // а уточнение к сессии. Принимаем один раз, закрываем сообщение.
+      if (entry.steerFailed === true && entry.lateAnswer !== undefined) {
+        // Прошлая доставка упала: повторяем steer, ответ уже принят.
+        void settleLate(entry, entry.lateAnswer);
+        return;
+      }
       const lateParsed = choiceFor(entry.question, normalized);
       if (lateParsed.error !== undefined || lateParsed.awaitingText === true || lateParsed.showMore === true) return;
       if (!entry.question.accept(lateParsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
-      pending.delete(normalized.shortId);
-      reliability?.unwatch?.(normalized.shortId);
-      stats.hybridPhoneAnswers += 1;
+      entry.lateAnswer = normalized;
       log(`гибрид: ответ на ${normalized.shortId} пришёл из мессенджера после ухода в GUI — отправляю steer`);
-      void closeMessage(entry.question);
-      void steerLateAnswer(entry.question, normalized).catch((error) => {
-        log(`гибрид: steer не доставлен (${error?.message ?? error})`);
-      });
-      return;
+      // Сначала доставляем steer, и только потом закрываем сообщение: если
+      // доставка упала, вопрос не должен выглядеть отвеченным/потерянным.
+      void settleLate(entry, normalized);
     }
     if (entry === undefined) {
       // Поздний ответ: вопрос уже снят (TTL/аборт/перезапуск). Это не игнор —
@@ -332,6 +353,7 @@ export function createAnswerer({
       } catch {
         /* таймер уже сработал */
       }
+      hybridTimers.delete(entry.question.shortId);
       entry.hybridTimer = null;
     }
     void closeMessage(entry.question);
@@ -403,7 +425,7 @@ export function createAnswerer({
     for (const question of questions) {
       question.markOpen(now());
       const waited = new Promise((resolve, reject) => {
-        pending.set(question.shortId, { question, resolve, reject });
+        pending.set(question.shortId, { question, resolve, reject, signal: request?.signal ?? null });
       });
       waited.catch(() => {});
       waiting.push(waited);
@@ -455,46 +477,58 @@ export function createAnswerer({
      * один вопрос ещё не отвечен.
      */
     const hybridState = hybridConfig();
-    let hybridTimer = null;
     let guiResolver = null;
     let guiRequested = false;
     const guiRace = new Promise((resolve) => {
       guiResolver = resolve;
     });
     const cleanupHybrid = () => {
-      if (hybridTimer !== null) {
+      for (const [shortId, timer] of hybridTimers.entries()) {
         try {
-          clearTimeoutImpl(hybridTimer);
+          clearTimeoutImpl(timer);
         } catch {
           /* таймер уже сработал */
         }
-        hybridTimer = null;
+        hybridTimers.delete(shortId);
+      }
+      for (const question of questions) {
+        const waitingEntry = pending.get(question.shortId);
+        if (waitingEntry !== undefined) waitingEntry.hybridTimer = null;
       }
     };
 
     function armHybrid() {
       if (hybridState.enabled !== true) return;
-      hybridTimer = setTimeoutImpl(() => {
-        hybridTimer = null;
-        const stillOpen = questions.filter((question) => pending.has(question.shortId));
-        if (stillOpen.length === 0) return; // уже ответили — GUI не нужен
-        guiRequested = true;
-        stats.hybridHanded += stillOpen.length;
-        for (const question of stillOpen) {
-          const waitingEntry = pending.get(question.shortId);
-          if (waitingEntry !== undefined) {
-            waitingEntry.hybridGui = true;
-            waitingEntry.hybridTimer = null;
-          }
-        }
-        log(`гибрид: ответа нет ${hybridState.waitMs} мс — отдаю вопросы в GUI (${stillOpen.length})`);
-        guiResolver?.(HYBRID_GUI);
-      }, hybridState.waitMs);
-      hybridTimer?.unref?.();
-      // Таймер помним и на ожиданиях: обычный ответ должен его снять.
       for (const question of questions) {
+        const timer = setTimeoutImpl(() => {
+          hybridTimers.delete(question.shortId);
+          const waitingEntry = pending.get(question.shortId);
+          if (waitingEntry === undefined) return; // уже ответили
+          waitingEntry.hybridTimer = null;
+          const stillOpen = questions.filter((item) => pending.has(item.shortId));
+          const anyAnswered = questions.some((item) => item.status === "answered");
+          if (anyAnswered) {
+            // Пачка уже частично отвечена: DSH вернёт GUI весь запрос, включая
+            // отвеченный вопрос, поэтому GUI не зовём. Вопрос остаётся обычным
+            // ожиданием (не hybridGui): ответ по нему — ещё результат, не steer.
+            log(`гибрид: вопрос ${question.shortId} остался в мессенджере — пачка уже частично отвечена, GUI не зовём`);
+            return;
+          }
+          if (guiRequested) return; // next() уже звали
+          waitingEntry.hybridGui = true;
+          stats.hybridHanded += 1;
+          guiRequested = true;
+          for (const item of stillOpen) {
+            const entry = pending.get(item.shortId);
+            if (entry !== undefined) entry.hybridGui = true;
+          }
+          log(`гибрид: ответа нет ${hybridState.waitMs} мс — отдаю вопросы в GUI (${stillOpen.length})`);
+          guiResolver?.(HYBRID_GUI);
+        }, hybridState.waitMs);
+        timer?.unref?.();
+        hybridTimers.set(question.shortId, timer);
         const waitingEntry = pending.get(question.shortId);
-        if (waitingEntry !== undefined) waitingEntry.hybridTimer = hybridTimer;
+        if (waitingEntry !== undefined) waitingEntry.hybridTimer = timer;
       }
     }
 
