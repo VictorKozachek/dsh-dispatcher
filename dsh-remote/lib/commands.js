@@ -756,8 +756,11 @@ export function createRemoteCommands({
     // set: `/remote channel <проект> <chatId> [threadId]`
     const name = action;
     const numericChat = Number(target);
-    if (!Number.isInteger(numericChat) || numericChat <= 0) {
-      return failure("chatId должен быть целым положительным числом: /remote channel <проект> <chatId>");
+    // У групп и супергрупп Telegram chat_id отрицательный (форумы с топиками тоже),
+    // поэтому требуем лишь целое ненулевое число.
+    if (!Number.isInteger(numericChat) || numericChat === 0) {
+      return failure("chatId должен быть целым ненулевым числом (у групп и супергрупп он отрицательный): "
+        + "/remote channel <проект> <chatId>");
     }
     const bindingChat = store.read().bindings?.chatId;
     // Чужой чат: бот может быть в нём не участником, и тогда ответы не придут.

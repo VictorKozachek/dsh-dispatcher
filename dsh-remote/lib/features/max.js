@@ -121,7 +121,7 @@ export const maxFeature = {
         chatId: settings.chatId,
         userId: settings.userId,
         allowedUserIds: Array.isArray(settings.allowedUserIds) ? settings.allowedUserIds : [],
-        allowedChatIds: projectChatIds(deps),
+        allowedChatIds: () => projectChatIds(deps),
         pollTimeoutSec: settings.pollTimeoutSec,
         marker: savedMarker ?? settings.marker,
         persistMarker: (marker) => writeMarker(markerPath, marker, log),

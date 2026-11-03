@@ -268,5 +268,94 @@ test("/remote channel: нечисловой chatId отвергается", asyn
   const { remote, invoke } = makeCommands(t);
   const result = await remote.handler(invoke("channel alpha abc"));
   assert.equal(result.kind, "error");
-  assert.match(result.text, /chatId должен быть целым положительным числом/);
+  assert.match(result.text, /chatId должен быть целым ненулевым числом/);
+});
+
+// --- регрессии по ревью 015 -------------------------------------------------
+
+test("/remote channel: отрицательный chatId группы/супергруппы принимается", async (t) => {
+  const { store, remote, invoke } = makeCommands(t);
+
+  const result = await remote.handler(invoke("channel forum -1001234567890 7 --force"));
+
+  assert.equal(result.kind, "success", result.text);
+  assert.deepEqual(store.read().channels.forum, { chatId: -1001234567890, threadId: 7 });
+});
+
+test("/remote channel: полный путь проекта нормализуется до basename", async (t) => {
+  const { store, remote, invoke } = makeCommands(t);
+
+  const result = await remote.handler(invoke("channel /home/vic/projects/alpha 42"));
+
+  assert.equal(result.kind, "success", result.text);
+  assert.deepEqual(Object.keys(store.read().channels), ["alpha"], "ключ — basename");
+  assert.deepEqual(resolveChannel(store.read(), "/p/alpha"), { chatId: 42, threadId: null, source: "workspace" });
+});
+
+test("allowlist проектных чатов обновляется без рестарта транспорта", async (t) => {
+  const store = tempStore(t);
+  store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+
+  const updates = [];
+  const fetchImpl = async (url, init = {}) => {
+    const parsed = new URL(url);
+    if (parsed.pathname.endsWith("/getUpdates")) {
+      return new Promise((resolve, reject) => {
+        updates.push({ resolve, reject, init });
+        init.signal?.addEventListener?.("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    }
+    return { ok: true, status: 200, async json() { return { ok: true, result: true }; } };
+  };
+  const transport = createTelegramTransport({
+    token: "123:TEST",
+    chatId: 42,
+    allowedUserIds: [7],
+    allowedChatIds: () => Object.values(store.read().channels).map((channel) => channel.chatId),
+    fetch: fetchImpl,
+    jitter: () => 0,
+    now: () => 0,
+    sleep: async () => {},
+    log: () => {},
+    persistOffset: () => {},
+  });
+  t.after(() => {
+    void transport.stop?.();
+  });
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+
+  store.setChannel("alpha", { chatId: 100 }); // канал добавили ПОСЛЕ старта
+  await transport.start();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const pushUpdate = (update) => {
+    const waiter = updates.shift();
+    waiter.resolve({
+      ok: true,
+      status: 200,
+      async json() {
+        return { ok: true, result: [update] };
+      },
+    });
+  };
+
+  pushUpdate({
+    update_id: 1,
+    callback_query: { id: "c1", from: { id: 7 }, data: "q:a1b2c3d4:o1", message: { message_id: 1, chat: { id: 100 } } },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(answers.length, 1, "новый чат проекта принят");
+
+  store.removeChannel("alpha"); // удалили канал
+  pushUpdate({
+    update_id: 2,
+    callback_query: { id: "c2", from: { id: 7 }, data: "q:a1b2c3d4:o2", message: { message_id: 2, chat: { id: 100 } } },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(answers.length, 1, "старый чат больше не принимается");
 });

@@ -277,7 +277,10 @@ export function createStore({
    * транспорта всё равно отклонит чат, куда бота не добавляли.
    */
   function setChannel(name, channel) {
-    const key = typeof name === "string" ? name.trim() : "";
+    // Имя проекта — basename: `/remote channel /full/path/alpha 100` должен
+    // совпадать с resolveChannel, который ищет именно basename(cwd).
+    const raw = typeof name === "string" ? name.trim() : "";
+    const key = raw === "" ? "" : raw.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
     if (key === "") throw new TypeError("setChannel: нужно имя проекта");
     if (channel === null || typeof channel !== "object" || channel.chatId === undefined || channel.chatId === null || channel.chatId === "") {
       throw new TypeError("setChannel: нужен chatId");

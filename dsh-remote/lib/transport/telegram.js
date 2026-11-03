@@ -253,18 +253,25 @@ export function createTelegramTransport(options = {}) {
   }
 
   /** Человек и чат из allowlist? Пустой allowlist — никого (безопасный дефолт). */
-  /** Чаты, из которых принимаем ответы: привязка + каналы проектов (015). */
-  const allowedChats = new Set(
-    [chatId, ...(Array.isArray(options.allowedChatIds) ? options.allowedChatIds : [])]
-      .filter((item) => item !== undefined && item !== null && item !== "")
-      .map((item) => String(item)),
-  );
+  /**
+   * Чаты, из которых принимаем ответы: привязка + каналы проектов (015).
+   * `allowedChatIds` может быть функцией: `/remote channel` меняет набор без
+   * перезапуска транспорта.
+   */
+  function allowedChatSet() {
+    const extra = typeof options.allowedChatIds === "function" ? options.allowedChatIds() : options.allowedChatIds;
+    return new Set(
+      [chatId, ...(Array.isArray(extra) ? extra : [])]
+        .filter((item) => item !== undefined && item !== null && item !== "")
+        .map((item) => String(item)),
+    );
+  }
 
   function allowed(fromId, chatIdOfUpdate) {
     const from = fromId === undefined || fromId === null ? null : String(fromId);
     const chat = chatIdOfUpdate === undefined || chatIdOfUpdate === null ? null : String(chatIdOfUpdate);
     const known = from !== null && allowedUserIds.has(from);
-    const ownChat = chat !== null && allowedChats.has(chat);
+    const ownChat = chat !== null && allowedChatSet().has(chat);
     if (!known || !ownChat) {
       log(`telegram: чужой апдейт (from=${from ?? "?"}, chat=${chat ?? "?"}) — игнор`);
       return false;

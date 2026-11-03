@@ -83,7 +83,7 @@ export const telegramFeature = {
         token,
         chatId: settings.chatId,
         allowedUserIds: Array.isArray(settings.allowedUserIds) ? settings.allowedUserIds : [],
-        allowedChatIds: projectChatIds(deps),
+        allowedChatIds: () => projectChatIds(deps),
         pollTimeoutSec: settings.pollTimeoutSec,
         log: (message) => deps.logger.debug(message),
       });
