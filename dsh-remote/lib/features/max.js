@@ -170,7 +170,7 @@ export const maxFeature = {
 
     deps.onDispose(() => {
       void transport.stop();
-    });
+    }, "transports");
 
     void transport.start().catch((error) => {
       deps.logger.warn(`фича max: поллинг не запустился (${describeError(error)})`);

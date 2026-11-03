@@ -154,7 +154,7 @@ export const relayFeature = {
 
     deps.onDispose(() => {
       void transport.stop();
-    });
+    }, "transports");
     void transport.start().catch((error) => {
       deps.logger.warn(`фича relay: старт не удался (${error?.message ?? error})`);
     });

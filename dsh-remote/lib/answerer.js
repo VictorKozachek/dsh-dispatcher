@@ -791,22 +791,32 @@ export function createAnswerer({
    */
   function dispose(reason = "disposed") {
     disposed = true;
+    // 034: снять вопросы с TTL-сторожа и из состояния восстановления: иначе
+    // после выгрузки плагина recoverOrphans закрывал бы уже закрытые сообщения
+    // второй раз. Идемпотентно: pending очищается, повторный вызов — no-op.
+    const stats = { cancelled: 0, closed: 0 };
+    for (const shortId of pending.keys()) reliability?.unwatch?.(shortId);
     for (const entry of pending.values()) {
       const question = entry.question;
       question.cancel(reason, now());
+      stats.cancelled += 1;
       try {
         // 012: в мультиканале закрываем все доставки через брокер (одиночный
         // `transport` — пустой фасад, и кнопки остались бы в обоих каналах).
         const closing = useBroker && (question.deliveries?.length ?? 0) > 0
           ? broker.closeAll(question, { winner: null, summary: reason })
           : primary?.closeQuestion?.(question, reason);
-        if (closing !== null && typeof closing?.then === "function") closing.catch(() => {});
+        if (closing !== null && typeof closing?.then === "function") {
+          closing.catch(() => {});
+        }
+        stats.closed += 1;
       } catch (error) {
         log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
       }
       entry.reject(abortError(reason));
     }
     pending.clear();
+    return stats;
   }
 
   return { attach, handler, dispose, stats };
