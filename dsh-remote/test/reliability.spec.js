@@ -875,7 +875,8 @@ test("in-flight аборт отменяет саму отправку, а не �
   controller.abort();
   assert.equal(await pending, "aborted");
   assert.equal(observed.length, 1);
-  assert.equal(observed[0], controller.signal, "сигнал доехал до транспорта");
+  assert.equal(observed[0]?.aborted, true, "транспорт увидел отмену");
+  assert.equal(typeof observed[0]?.addEventListener, "function", "в транспорт ушёл AbortSignal");
 });
 
 test("фасад без канала: deliver не врёт, recover не правит", async (t) => {
@@ -957,4 +958,112 @@ test("redact: base64 со слэшем маскируется целиком, п
   assert.match(redact(secret), /^<redacted-base64>$/);
   assert.equal(redact("/Users/Victor/Projects/DSHDispatcher/Worktree008"), "/Users/Victor/Projects/DSHDispatcher/Worktree008");
   assert.match(redact("base64: QWxhZGRpbjpvcGVuIHNlc2FtZQ1aGVsbG8gd29ybGQ"), /<redacted-base64>/);
+});
+
+test("timeout отменяет саму отправку: транспорт видит aborted", async (t) => {
+  let seen = null;
+  const transport = {
+    id: "fake",
+    caps: {},
+    sendQuestion: (question, options) => {
+      seen = options?.signal;
+      return new Promise(() => {}); // висит, пока не отменят
+    },
+    closeQuestion: async () => {},
+  };
+  const { reliability } = makeReliability(t, { transport, setTimeout: (callback) => setTimeout(callback, 0) });
+
+  assert.equal(await reliability.deliver({ question: openQuestion() }), "give-up");
+  assert.equal(seen?.aborted, true, "дедлайн отменил отправку, а не только гонку");
+});
+
+test("поздний ответ кнопкой: в steer уходят выбранные метки", async (t) => {
+  const clock = fakeClock();
+  const promptCalls = [];
+  const sessionController = {
+    prompt: async (request) => {
+      promptCalls.push(request);
+    },
+  };
+  const { reliability } = makeReliability(t, { cluster: clock, sessionController, clock });
+  const question = openQuestion({ options: [{ id: "o1", label: "Да" }] });
+  question.cancel("aborted");
+
+  assert.equal(
+    await reliability.applyLateAnswer({ question, sessionId: "s1", answer: { selected: ["Да"], custom: "" }, text: "" }),
+    "steered",
+  );
+  assert.equal(promptCalls.length, 1);
+  assert.match(promptCalls[0].content[0].text, /Да/, "метка варианта попала в steer");
+});
+
+test("redact: путь с датами не маскируется, base64 со слэшем — маскируется", () => {
+  assert.equal(
+    redact("/Users/Victor/Projects/2026/11/03/DSH/Worktree008"),
+    "/Users/Victor/Projects/2026/11/03/DSH/Worktree008",
+    "путь с большим числом цифр остаётся целым",
+  );
+  assert.match(redact("QWxh/ZGRpbjpvcGVu/c2FtZQ1hZWxsbw/QWxh/ZGRpbjpvcG"), /<redacted-base64>/);
+});
+
+test("tick: закрытый не нами вопрос снимается и из состояния", async (t) => {
+  const clock = fakeClock();
+  const { reliability } = makeReliability(t, { clock });
+  const question = openQuestion();
+  reliability.watch(question);
+  assert.equal(reliability.store.read().questions.length, 1);
+
+  question.cancel("aborted"); // закрыли в обход answerer
+  clock.advance(1000);
+  await reliability.tick();
+
+  assert.deepEqual(reliability.store.read().questions, []);
+});
+
+test("answerer -> watch/deliver -> state с chatId -> recover после рестарта", async (t) => {
+  const clock = fakeClock();
+  const chatId = 42;
+  const transport = {
+    id: "telegram",
+    chatId,
+    caps: {},
+    async sendQuestion() {
+      return { messageId: 500 };
+    },
+    async closeQuestion() {},
+    onAnswer: () => () => {},
+  };
+  const { reliability } = makeReliability(t, { clock, transport });
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({
+    transport,
+    registry,
+    reliability,
+    deliver: (argument) => reliability.deliver(argument),
+    log: () => {},
+    now: () => 0,
+  });
+
+  const pending = answerer.handler(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: SESSION_ID } },
+    () => assert.fail("next() звать нельзя"),
+  );
+  await tickMs(2);
+
+  const [saved] = reliability.store.read().questions;
+  assert.equal(saved.chatId, chatId, "chatId живого транспорта сохранён");
+  assert.equal(saved.messageId, 500);
+  void pending;
+
+  // Рестарт: новый процесс правит сообщение по сохранённым id.
+  const edited = [];
+  const restarted = {
+    id: "telegram",
+    caps: {},
+    async editMessage(target, text) { edited.push({ target, text }); },
+    async clearButtons() {},
+  };
+  const { reliability: afterRestart } = makeReliability(t, { transport: restarted, clock, state: reliability.store });
+  await afterRestart.recoverOrphans();
+  assert.deepEqual(edited[0].target, { chatId, messageId: 500 }, "recover не падает на chatId null");
 });

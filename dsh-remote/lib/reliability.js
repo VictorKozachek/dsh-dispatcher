@@ -109,14 +109,17 @@ export function findSecrets(text) {
   value = value.replace(PRIVATE_KEY, () => mask("<private key скрыт>"));
   value = value.replace(BOT_TOKEN, (_match, id) => mask(`${id}:<redacted>`));
   value = value.replace(API_KEY, () => mask("sk-<redacted>"));
-  value = value.replace(BASE64_RUN, (candidate) => {
+  value = value.replace(BASE64_RUN, (candidate, offset) => {
     const digits = (candidate.match(/\d/g) ?? []).length;
-    // Путь в CamelCase — тоже «венгерская» строка с '/' и цифрами, но у него нет
-    // '+' и '=' и очень мало цифр. Настоящий base64 '/' не исключает.
-    const looksLikePath = candidate.includes("/")
-      && !candidate.includes("+")
-      && !candidate.endsWith("=")
-      && digits / candidate.length < 0.15;
+    const before = value[offset - 1] ?? "";
+    const segments = candidate.split("/");
+    // Путь узнаём по структуре: абсолютный (перед ним или в начале слэш) либо
+    // относительный из CamelCase-сегментов. Доля цифр ничего не решает: в
+    // /Projects/2026/11/03 их много, а base64 без '+'/'=' их может не иметь.
+    const absolute = before === "/" || candidate.startsWith("/");
+    const camel = segments.length >= 2
+      && segments.every((part) => /^[A-Z][a-z0-9][A-Za-z0-9._-]*$/.test(part));
+    const looksLikePath = absolute || camel;
     if (!(/[A-Z]/.test(candidate) && /[a-z]/.test(candidate) && digits > 0) || looksLikePath) return candidate;
     return mask("<redacted-base64>");
   });
@@ -340,6 +343,9 @@ export function createReliability({
   /** Гонка отправки с дедлайном и сигналом: зависший send не держит handler. */
   function raceSend(question, target, { deadline, signal }) {
     return new Promise((resolve, reject) => {
+      // Свой контроллер: дедлайн тоже должен отменять саму отправку, а не только
+      // гонку — иначе зависший send доедет после того, как вопрос отдан в GUI.
+      const controller = new AbortController();
       let settled = false;
       const finish = (fn, value) => {
         if (settled) return;
@@ -349,10 +355,17 @@ export function createReliability({
         fn(value);
       };
       const remaining = Math.max(0, deadline - now());
-      const timer = setTimeoutImpl(() => finish(reject, Object.assign(new Error("доставка не уложилась в timeout"), { name: "DeliveryTimeout" })), remaining);
-      const onAbort = () => finish(reject, abortError("доставка отменена"));
+      const timer = setTimeoutImpl(() => {
+        controller.abort();
+        finish(reject, Object.assign(new Error("доставка не уложилась в timeout"), { name: "DeliveryTimeout" }));
+      }, remaining);
+      const onAbort = () => {
+        controller.abort();
+        finish(reject, abortError("доставка отменена"));
+      };
+      if (signal?.aborted === true) onAbort();
       signal?.addEventListener?.("abort", onAbort, { once: true });
-      const opts = target === undefined ? { signal } : { ...target, signal };
+      const opts = target === undefined ? { signal: controller.signal } : { ...target, signal: controller.signal };
       Promise.resolve(channel().sendQuestion(question, opts)).then(
         (value) => finish(resolve, value),
         (error) => finish(reject, error),
@@ -421,7 +434,9 @@ export function createReliability({
       return "give-up";
     }
     const deadline = now() + connectTimeoutMs;
-    const target = chatId === undefined || chatId === null ? undefined : { chatId };
+    // Фактический чат: явный аргумент или свойство транспорта (004 его отдаёт).
+    const resolvedChatId = chatId ?? channel()?.chatId ?? null;
+    const target = resolvedChatId === null ? undefined : { chatId: resolvedChatId };
 
     const outgoing = prepareQuestion(question);
 
@@ -431,7 +446,7 @@ export function createReliability({
         // Отправка может зависнуть: гоним её с дедлайном и сигналом, иначе
         // handler ждал бы вечно, а вопрос после аборта всё равно уехал бы.
         const sentValue = await raceSend(outgoing, target, { deadline, signal });
-        rememberOpen(question, { messageId: sentValue?.messageId, chatId: target?.chatId });
+        rememberOpen(question, { messageId: sentValue?.messageId, chatId: resolvedChatId });
         journal.append({ event: "delivered", shortId: question.shortId, attempt });
         return "delivered";
       } catch (error) {
@@ -477,9 +492,12 @@ export function createReliability({
             messageId: messageId ?? null,
             createdAt: now(),
           });
-        } else if (messageId !== undefined) {
+        } else {
           const entry = current.questions.find((item) => item.shortId === question.shortId);
-          if (entry !== undefined && entry.messageId === null) entry.messageId = messageId;
+          if (entry !== undefined) {
+            if (messageId !== undefined && entry.messageId === null) entry.messageId = messageId;
+            if (chatId !== undefined && chatId !== null && entry.chatId === null) entry.chatId = chatId;
+          }
         }
         return current;
       });
@@ -644,6 +662,7 @@ export function createReliability({
       const question = item.question;
       if (question?.isOpen !== true) {
         watched.delete(shortId);
+        forgetOpen(shortId);
         continue;
       }
 
@@ -770,7 +789,7 @@ export function createReliability({
       journal.append({ event: "late-answer", shortId: question?.shortId, outcome: "dropped" });
       return "dropped";
     }
-    const rawBody = text ?? [
+    const rawBody = (typeof text === "string" && text !== "" ? text : null) ?? [
       `Ответ человека на вопрос ${question?.shortId ?? "?"}`,
       ...(Array.isArray(answer?.selected) ? answer.selected : []),
       ...(answer?.custom === undefined ? [] : [answer.custom]),
