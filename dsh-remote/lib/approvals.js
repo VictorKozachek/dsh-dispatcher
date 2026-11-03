@@ -53,6 +53,7 @@ export const APPROVAL_REQUEST_EVENT = "approval/request";
  * @param {Function|null} [options.deliver] — доставка через reliability (008).
  * @param {Function|null} [options.deliverFor] — доставка на конкретный канал.
  * @param {Function|null} [options.channelOf] — канал проекта (015).
+ * @param {object|null} [options.audit] — журнал решений (`lib/audit.js`, задача 026).
  */
 export function createApprovals({
   transport = null,
@@ -64,6 +65,7 @@ export function createApprovals({
   deliver = null,
   deliverFor = null,
   channelOf = null,
+  audit = null,
 } = {}) {
   /** Счётчики решений — для `/remote status` (026). */
   const stats = { claimed: 0, allowed: 0, rejected: 0, unavailable: 0, cancelled: 0 };
@@ -180,7 +182,7 @@ export function createApprovals({
    * Свободный текст у подтверждений не принимается: решение — только кнопка.
    * Неизвестная кнопка не роняет ожидание: сообщение остаётся с кнопками.
    */
-  function onTransportAnswer(event) {
+  function onTransportAnswer(event, channel = null) {
     if (event === null || typeof event !== "object") return;
     const shortId = typeof event.shortId === "string" ? event.shortId : "";
     const entry = pending.get(shortId);
@@ -202,8 +204,42 @@ export function createApprovals({
     }
     if (!entry.approval.decide(outcome, now())) return;
     statsFor(outcome);
+    record(entry.approval, {
+      outcome,
+      decision: "remote",
+      channel: channel?.id ?? null,
+      chatId: typeof event.chatId === "string" || typeof event.chatId === "number" ? String(event.chatId) : entry.approval.chatId,
+      answeredBy: typeof event.answeredBy === "string" && event.answeredBy !== "" ? event.answeredBy : null,
+    });
     void closeMessage(entry.approval, outcomeSummary(outcome));
     settle(entry, outcome);
+  }
+
+  /**
+   * Записать решение в журнал (026).
+   *
+   * Пишем только метаданные: id подтверждения, инструмент, исход, канал, кто/где
+   * и сколько ждали. `reason`/`displayReason` не пишем — это может быть текст
+   * команды, а журналу тела не нужны. `decision`: `remote` — человек ответил
+   * кнопкой, `gui` — отдали GUI (доставка не удалась), `timeout` — снято без
+   * ответа (аборт запроса; TTL-политика — задача 025).
+   */
+  function record(approval, { outcome, decision, channel = null, chatId = null, answeredBy = null }) {
+    if (audit === null) return;
+    audit.append({
+      kind: "approval",
+      questionId: approval.id,
+      toolName: approval.toolName,
+      callId: approval.callId ?? undefined,
+      outcome,
+      channel: channel ?? undefined,
+      chatId: chatId ?? undefined,
+      answeredBy: answeredBy ?? undefined,
+      sessionId: approval.sessionId ?? undefined,
+      workspace: approval.workspace ?? undefined,
+      waitedMs: Math.max(0, now() - approval.createdAt),
+      decision,
+    });
   }
 
   function statsFor(outcome) {
@@ -276,6 +312,11 @@ export function createApprovals({
         if (entry.settled) return;
         approval.cancel("aborted", now());
         stats.cancelled += 1;
+        record(approval, {
+          outcome: APPROVAL_OUTCOME.cancelled,
+          decision: "timeout",
+          channel: entry.channelId ?? null,
+        });
         // Сообщение могло ещё не уйти: закрывать нечего, но если доставка уже
         // началась — снимем кнопки, как только она завершится (ниже, в then).
         if (entry.delivered) {
@@ -298,6 +339,11 @@ export function createApprovals({
       const failToGui = () => {
         if (entry.settled) return;
         approval.cancel("delivery-failed", now());
+        record(approval, {
+          outcome: APPROVAL_OUTCOME.unavailable,
+          decision: "gui",
+          channel: entry.channelId ?? null,
+        });
         settle(entry, "next");
       };
 
@@ -316,6 +362,7 @@ export function createApprovals({
           return;
         }
         entry.delivered = true;
+        entry.channelId = result?.winner?.id ?? primary?.id ?? null;
         approval.markOpen();
         stats.claimed += 1;
         // Аборт мог выиграть гонку, пока сообщение доставлялось: снимаем его сразу,
@@ -344,7 +391,7 @@ export function createApprovals({
       return () => {};
     }
     try {
-      offAnswers = subscribable.map((channel) => channel.onAnswer(onTransportAnswer));
+      offAnswers = subscribable.map((channel) => channel.onAnswer((event) => onTransportAnswer(event, channel)));
     } catch (error) {
       log(`ответчик подтверждений не подписан: транспорт не отдал onAnswer (${error?.message ?? error})`);
       for (const off of offAnswers) {
@@ -387,6 +434,11 @@ export function createApprovals({
     for (const entry of [...pending.values()]) {
       if (!entry.approval.cancel(reason, now())) continue;
       stats.cancelled += 1;
+      record(entry.approval, {
+        outcome: APPROVAL_OUTCOME.cancelled,
+        decision: "timeout",
+        channel: entry.channelId ?? null,
+      });
       void closeMessage(entry.approval, outcomeSummary(APPROVAL_OUTCOME.cancelled));
       settle(entry, APPROVAL_OUTCOME.cancelled);
     }
