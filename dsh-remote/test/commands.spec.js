@@ -17,6 +17,7 @@ import { createStore } from "../lib/store.js";
 import { commandsFeature } from "../lib/features/commands.js";
 import { telegramFeature } from "../lib/features/telegram.js";
 import { answererFeature } from "../lib/features/answerer.js";
+import { RELAY_TOKEN_REF } from "../lib/transport/relay.js";
 import {
   PAIRING_TTL_MS,
   TELEGRAM_TOKEN_REF,
@@ -1306,4 +1307,64 @@ test("connect: start() -> false не выдаётся за поднятый ка
   assert.equal(result.kind, "success", result.text);
   assert.match(result.text, /канал не поднят/);
   assert.doesNotMatch(result.text, /канал поднят:/);
+});
+
+test("connect relay работает без Telegram-токена и не пишет секрет в состояние", async (t) => {
+  const RELAY_URL = "https://relay.test";
+  const RELAY_TOKEN = "relay-agent-secret";
+  const creds = fakeCredentials({ value: null });
+  const stand = harness(t, {
+    credentials: creds,
+    answers: {
+      "remote-connect-transport": { selected: ["Relay (свой сервер)"] },
+      "remote-connect-relay-url": { custom: RELAY_URL },
+      "remote-connect-relay-token": { custom: RELAY_TOKEN },
+      "remote-connect-scope": { selected: ["Пока не включать"] },
+    },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/healthz")) return jsonResponse({ ok: true, version: "0.1.0" });
+      // Авторизованный пробник: 404 значит «ответа ещё нет», токен принят.
+      return jsonResponse({ error: { code: "not-found", message: "ответа пока нет" } }, 404);
+    },
+  });
+  // Telegram-секрета нет вовсе: провайдер секретов «пуст», как в сценарии ревью.
+  stand.ctx.get = ((original) => (name) => (name === "credentials" ? null : original(name)))(stand.ctx.get);
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "success", result.text);
+  assert.match(result.text, /релей привязан: https:\/\/relay\.test/);
+  assert.match(result.text, /relay 0\.1\.0/);
+  const state = stand.store.read();
+  assert.equal(state.bindings.transport, "relay");
+  assert.equal(state.bindings.url, RELAY_URL);
+  assert.equal(JSON.stringify(state).includes(RELAY_TOKEN), false, "токен не попал в состояние");
+  assert.equal(result.text.includes(RELAY_TOKEN), false, "токен не напечатан");
+  assert.equal(RELAY_TOKEN_REF, "DSH_REMOTE_RELAY_TOKEN");
+});
+
+test("connect relay: неверный токен отвергается авторизованным пробником, ничего не сохраняется", async (t) => {
+  const RELAY_TOKEN = "definitely-wrong-token-XXX";
+  const stand = harness(t, {
+    credentials: fakeCredentials({ value: null }),
+    answers: {
+      "remote-connect-transport": { selected: ["Relay (свой сервер)"] },
+      "remote-connect-relay-url": { custom: "https://relay.test" },
+      "remote-connect-relay-token": { custom: RELAY_TOKEN },
+      "remote-connect-scope": { selected: ["Только этот проект"] },
+    },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/healthz")) return jsonResponse({ ok: true, version: "0.1.0" });
+      return jsonResponse({ error: { code: "unauthorized", message: "нужен Bearer-токен" } }, 401);
+    },
+  });
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "error");
+  assert.match(result.text, /не принял токен агента/);
+  assert.match(result.text, /unauthorized/);
+  assert.equal(stand.store.read().bindings, null, "binding не сохранён");
+  assert.equal(stand.credentials.calls.some(([method, ref]) => method === "set" && ref === RELAY_TOKEN_REF), false, "неверный токен не записан");
+  assert.equal(result.text.includes(RELAY_TOKEN), false, "токен не напечатан");
 });
