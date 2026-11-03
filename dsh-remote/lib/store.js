@@ -23,11 +23,34 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-/** Версия формата состояния: по ней состояние можно будет мигрировать. */
-export const STATE_VERSION = 1;
+/**
+ * Текущая версия схемы `state.json` (задача 032). Растёт только вперёд, ровно
+ * на одну ступень за миграцию; каждая ступень — в {@link STATE_MIGRATIONS}.
+ */
+export const STATE_VERSION = 2;
+
+/**
+ * Версия исторических файлов без поля версии (формат 005–031). Такой файл
+ * считается v1 и мигрирует вперёд, как любой другой.
+ */
+export const LEGACY_STATE_VERSION = 1;
 
 /** Сколько последних вопросов держим в `recent`. */
 export const RECENT_LIMIT = 20;
+
+/**
+ * Отказ из-за схемы состояния: файл новее плагина или миграция невозможна.
+ * Сообщение самодостаточно (что случилось + что делать), потому что его
+ * показывает и лог, и `/remote doctor`, и текст ошибки команды.
+ */
+export class StateSchemaError extends Error {
+  constructor({ code, message, instruction }) {
+    super(instruction === undefined || instruction === "" ? message : `${message} — ${instruction}`);
+    this.name = "StateSchemaError";
+    this.code = code;
+    this.instruction = instruction ?? null;
+  }
+}
 
 const DEFAULT_FILE_NAME = "state.json";
 const LOCK_FILE_NAME = "lock";
@@ -92,6 +115,163 @@ function channelOfEntry(channel) {
 }
 
 /**
+ * Каноническая форма `channels` в v2: `{ project: { transport: {chatId, threadId?} } }`.
+ * Плоская запись `{chatId, threadId?}` исторического формата превращается в
+ * канал `default` — так же её читал `normalizeChannels` (015), но теперь это
+ * ещё и записано на диск миграцией 1 → 2.
+ */
+function channelsV2(value) {
+  const channels = {};
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return channels;
+  for (const [name, entry] of Object.entries(value)) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const isFlat = Object.prototype.hasOwnProperty.call(entry, "chatId");
+    if (isFlat) {
+      const channel = channelOfEntry(entry);
+      if (channel !== null) channels[name] = { default: channel };
+      continue;
+    }
+    const byTransport = {};
+    for (const [transportId, channel] of Object.entries(entry)) {
+      if (typeof transportId !== "string" || transportId === "") continue;
+      const normalized = channelOfEntry(channel);
+      if (normalized !== null) byTransport[transportId] = normalized;
+    }
+    if (Object.keys(byTransport).length > 0) channels[name] = byTransport;
+  }
+  return channels;
+}
+
+/**
+ * Миграция 1 → 2 (задача 032).
+ *
+ * Меняется только представление `channels`: плоский канал проекта
+ * `{chatId, threadId?}` становится `{default: {chatId, threadId?}}`, вложенная
+ * форма чистится от лишних полей. Остальные поля сохраняются как есть (включая
+ * незнакомые: `...state`), поэтому старый файл не теряет данных.
+ */
+export function migrateV1ToV2(state) {
+  const next = { ...state };
+  delete next.version; // историческое поле версии: единственный источник — schemaVersion
+  next.schemaVersion = 2;
+  next.channels = channelsV2(state?.channels);
+  return next;
+}
+
+/**
+ * Строгий реестр миграций: ключ — исходная версия, значение — функция,
+ * возвращающая состояние **следующей** версии. Реестр обязан быть без дырок:
+ * `validateMigrationRegistry` проверяет это на каждом чтении.
+ */
+export const STATE_MIGRATIONS = Object.freeze({
+  1: migrateV1ToV2,
+});
+
+/** Проверить реестр миграций: каждая ступень 1..STATE_VERSION-1 существует, лишних нет. */
+export function validateMigrationRegistry() {
+  const problems = [];
+  for (let version = LEGACY_STATE_VERSION; version < STATE_VERSION; version += 1) {
+    if (typeof STATE_MIGRATIONS[version] !== "function") {
+      problems.push(`нет миграции ${version} → ${version + 1}`);
+    }
+  }
+  for (const key of Object.keys(STATE_MIGRATIONS)) {
+    const version = Number(key);
+    if (!Number.isInteger(version) || version < LEGACY_STATE_VERSION || version > STATE_VERSION) {
+      problems.push(`лишняя миграция ${key}`);
+    }
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+/**
+ * Версия схемы файла: `schemaVersion`, у исторических файлов — `version`,
+ * совсем без поля — {@link LEGACY_STATE_VERSION}. Некорректное значение — null.
+ */
+export function schemaVersionOf(state) {
+  if (state === null || typeof state !== "object" || Array.isArray(state)) return null;
+  const explicit = state.schemaVersion !== undefined ? state.schemaVersion : state.version;
+  if (explicit === undefined || explicit === null) return LEGACY_STATE_VERSION;
+  const value = Number(explicit);
+  return Number.isInteger(value) && value >= 1 ? value : null;
+}
+
+/**
+ * Прогнать состояние по реестру миграций до текущей версии.
+ *
+ * Чистая функция: файл не трогает, бэкап делает store. Возвращает либо
+ * `{state, from, to, applied}`, либо `{error}` — и тогда состояние **нельзя**
+ * записывать: файл из будущего/с неполным реестром не перезаписывается.
+ */
+export function migrateState(raw, { log = () => {} } = {}) {
+  const empty = { state: raw, from: null, to: null, applied: [], error: null };
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return empty;
+
+  const registry = validateMigrationRegistry();
+  if (!registry.ok) {
+    const error = {
+      code: "missing-migration",
+      message: `реестр миграций состояния неполон (${registry.problems.join("; ")})`,
+      instruction: "исправьте плагин (STATE_MIGRATIONS в lib/store.js); файл не изменён",
+    };
+    log(`состояние: ${error.message}`);
+    return { ...empty, error };
+  }
+
+  const from = schemaVersionOf(raw);
+  if (from === null) {
+    const error = {
+      code: "invalid-version",
+      message: "в state.json некорректная версия схемы",
+      instruction: "исправьте schemaVersion вручную или восстановите state.json из state.json.bak-*; файл не изменён",
+    };
+    log(`состояние: ${error.message}`);
+    return { ...empty, error };
+  }
+
+  if (from > STATE_VERSION) {
+    const error = {
+      code: "future-version",
+      message: `state.json версии ${from} новее плагина (поддерживается ${STATE_VERSION})`,
+      instruction: "обновите плагин dsh-remote или восстановите state.json из state.json.bak-*; файл не изменён",
+    };
+    log(`состояние: ${error.message} — удалённый режим выключен, файл не трогаю`);
+    return { ...empty, from, to: from, error };
+  }
+
+  let state = raw;
+  let version = from;
+  const applied = [];
+  while (version < STATE_VERSION) {
+    const step = STATE_MIGRATIONS[version];
+    if (typeof step !== "function") {
+      const error = {
+        code: "missing-migration",
+        message: `нет миграции состояния ${version} → ${version + 1}`,
+        instruction: "исправьте плагин (STATE_MIGRATIONS в lib/store.js); файл не изменён",
+      };
+      log(`состояние: ${error.message}`);
+      return { ...empty, from, error };
+    }
+    try {
+      state = step(state);
+    } catch (cause) {
+      const error = {
+        code: "migration-failed",
+        message: `миграция состояния ${version} → ${version + 1} не удалась (${cause?.message ?? cause})`,
+        instruction: "файл не изменён; восстановите state.json из state.json.bak-* и сообщите об ошибке",
+      };
+      log(`состояние: ${error.message}`);
+      return { ...empty, from, error };
+    }
+    version += 1;
+    state = { ...state, schemaVersion: version };
+    applied.push(version);
+  }
+  return { state, from, to: version, applied, error: null };
+}
+
+/**
  * Канал вопроса по воркспейсу и транспорту (015).
  *
  * Порядок: канал проекта для этого транспорта → общий канал проекта
@@ -151,7 +331,7 @@ export const DEFAULT_HYBRID_WAIT_MS = 20_000;
 
 export function defaultState() {
   return {
-    version: STATE_VERSION,
+    schemaVersion: STATE_VERSION,
     bindings: null,
     enabled: { global: false, workspaces: {}, sessions: {} },
     /** Гибридный режим: мессенджер → GUI через `waitMs` (задача 013). */
@@ -288,28 +468,28 @@ export function createStore({
 } = {}) {
   const paths = file === undefined ? statePaths({ env, home }) : statePaths({ env: { ...env, DSH_REMOTE_STATE: file }, home });
   let lockOwner = null;
+  /**
+   * Отказ схемы (032): файл из будущего/с битой версией или миграция не удалась.
+   * Пока он стоит, `read()` отдаёт безопасный дефолт, а `write()` бросает
+   * {@link StateSchemaError} — исходный файл не перезаписывается.
+   */
+  let schemaError = null;
+  /** Путь последнего бэкапа перед миграцией (для статуса и тестов). */
+  let lastBackup = null;
 
-  /** Прочитать состояние: нет файла или битый JSON — дефолт (файл не трогаем). */
-  function read() {
-    let text;
-    try {
-      text = fs.readFileSync(paths.file, "utf8");
-    } catch (error) {
-      if (error?.code !== "ENOENT") log(`состояние: прочитать ${paths.file} не удалось (${error?.message ?? error})`);
-      return defaultState();
-    }
-    try {
-      const parsed = JSON.parse(text);
-      return normalizeState(parsed, log, recentLimit);
-    } catch (error) {
-      log(`состояние: битый JSON в ${paths.file} (${error?.message ?? error}) — работаю с дефолтом`);
-      return defaultState();
-    }
+  /** Что известно про схему: для `/remote doctor` и тестов. */
+  function schemaStatus() {
+    return {
+      ok: schemaError === null,
+      version: schemaError === null ? STATE_VERSION : null,
+      supported: STATE_VERSION,
+      error: schemaError,
+      backup: lastBackup,
+    };
   }
 
-  /** Записать состояние атомарно: tmp → chmod 600 → rename. */
-  function write(state) {
-    const normalized = normalizeState(state, log, recentLimit);
+  /** Записать нормализованное состояние атомарно: tmp → chmod 600 → rename. */
+  function writeStateFile(normalized) {
     fs.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
     const tmp = path.join(paths.dir, `.${DEFAULT_FILE_NAME}.${process.pid}.${randomUUID()}.tmp`);
     const payload = `${JSON.stringify(normalized, null, 2)}\n`;
@@ -327,6 +507,81 @@ export function createStore({
       throw error;
     }
     return normalized;
+  }
+
+  /**
+   * Бэкап исходного файла перед миграцией: `state.json.bak-<from>-<ts>`.
+   * Копия делается ДО записи мигрированного состояния и содержит байт-в-байт
+   * исходный файл, поэтому откат — обычное `cp`.
+   */
+  function backupBeforeMigration(fromVersion) {
+    const stamp = new Date(now()).toISOString().replace(/[:.]/g, "-");
+    let target = path.join(paths.dir, `${DEFAULT_FILE_NAME}.bak-${fromVersion}-${stamp}`);
+    let suffix = 1;
+    while (fs.existsSync(target)) {
+      target = path.join(paths.dir, `${DEFAULT_FILE_NAME}.bak-${fromVersion}-${stamp}-${suffix}`);
+      suffix += 1;
+    }
+    fs.copyFileSync(paths.file, target);
+    fs.chmodSync(target, 0o600);
+    return target;
+  }
+
+  /**
+   * Прочитать состояние: нет файла или битый JSON — дефолт (файл не трогаем);
+   * известная старая версия — миграция вперёд с бэкапом; будущая/битая версия —
+   * безопасный дефолт и `schemaError` (запись запрещена).
+   */
+  function read() {
+    let text;
+    try {
+      text = fs.readFileSync(paths.file, "utf8");
+    } catch (error) {
+      if (error?.code !== "ENOENT") log(`состояние: прочитать ${paths.file} не удалось (${error?.message ?? error})`);
+      schemaError = null;
+      return defaultState();
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      log(`состояние: битый JSON в ${paths.file} (${error?.message ?? error}) — работаю с дефолтом`);
+      schemaError = null;
+      return defaultState();
+    }
+
+    const migration = migrateState(parsed, { log });
+    if (migration.error !== null) {
+      schemaError = migration.error;
+      return defaultState();
+    }
+
+    if (migration.applied.length > 0) {
+      try {
+        lastBackup = backupBeforeMigration(migration.from);
+        writeStateFile(normalizeState(migration.state, log, recentLimit));
+        log(`состояние: миграция схемы ${migration.from} → ${migration.to}, бэкап ${lastBackup}`);
+      } catch (error) {
+        schemaError = {
+          code: "migration-persist-failed",
+          message: `не удалось сохранить мигрированное состояние (${error?.message ?? error})`,
+          instruction: "проверьте права на каталог состояния и повторите; исходный state.json не тронут",
+        };
+        log(`состояние: ${schemaError.message} — удалённый режим выключен`);
+        return defaultState();
+      }
+    }
+
+    schemaError = null;
+    return normalizeState(migration.state, log, recentLimit);
+  }
+
+  /** Записать состояние атомарно. При отказе схемы файл не трогаем. */
+  function write(state) {
+    if (schemaError !== null) throw new StateSchemaError(schemaError);
+    const normalized = normalizeState(state, log, recentLimit);
+    return writeStateFile(normalized);
   }
 
   /** Прочитать → изменить → записать: все мутации идут через это. */
@@ -558,6 +813,8 @@ export function createStore({
     acquireLock,
     releaseLock,
     lockState,
+    /** Статус схемы состояния (032): `{ok, version, supported, error, backup}`. */
+    schemaStatus,
     get recentLimit() {
       return recentLimit;
     },
@@ -570,7 +827,8 @@ export function createStore({
 
 /**
  * Привести состояние к известной форме: чужие/старые поля не теряем, но
- * обязательные — восстанавливаем. Версия пока одна, миграций нет.
+ * обязательные — восстанавливаем. Версию схемы ставит миграция (032); здесь она
+ * только фиксируется в текущей, а историческое поле `version` не сохраняется.
  */
 function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
   const base = defaultState();
@@ -578,15 +836,12 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
     log("состояние: ожидался объект — работаю с дефолтом");
     return base;
   }
-  const version = Number(value.version);
-  if (Number.isFinite(version) && version > STATE_VERSION) {
-    log(`состояние: версия ${version} новее ${STATE_VERSION} — читаю как есть, незнакомые поля сохраняю`);
-  }
+  const { version: legacyVersion, ...rest } = value;
   const enabled = value.enabled !== null && typeof value.enabled === "object" ? value.enabled : {};
   return {
     ...base,
-    ...value,
-    version: STATE_VERSION,
+    ...rest,
+    schemaVersion: STATE_VERSION,
     bindings: value.bindings !== null && typeof value.bindings === "object" ? value.bindings : null,
     enabled: {
       global: enabled.global === true,
