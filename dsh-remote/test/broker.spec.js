@@ -350,3 +350,113 @@ test("answererFeature: config.transports берёт каналы из реест
   telegram.answer({ shortId: telegram.sent[0].shortId, optionId: "o1" });
   await pending;
 });
+
+// --- регрессии по второму ревью 012 -----------------------------------------
+
+test("мультиканал использует reliability: ретрай канала и изоляция сбоя", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { createJsonState, createReliability } = await import("../lib/reliability.js");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-012-rel-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const state = createJsonState({ file: path.join(dir, "state.json") });
+  const clock = { value: 0 };
+  const reliability = createReliability({
+    transport: fakeTransport("telegram"),
+    state,
+    logFile: path.join(dir, "log.jsonl"),
+    now: () => clock.value,
+    sleep: async (ms) => {
+      clock.value += ms;
+    },
+    connectTimeoutMs: 5_000,
+    backoffBaseMs: 100,
+    log: () => {},
+  });
+
+  const flaky = fakeTransport("telegram");
+  let attempts = 0;
+  flaky.sendQuestion = async (question) => {
+    attempts += 1;
+    if (attempts === 1) throw new Error("сеть мигнула");
+    flaky.sent.push(question);
+    return { messageId: "flaky-mid" };
+  };
+  const broken = fakeTransport("max", { failSend: true });
+
+  const deliverFor = (target) => (argument) => reliability.deliver({ ...argument, transport: target });
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({ transports: [flaky, broken], registry, deliverFor, log: () => {}, now: () => 0 });
+  answerer.attach({
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+    get: () => null,
+  });
+
+  let nextCalls = 0;
+  const pending = answerer.handler(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: "s1" } },
+    () => {
+      nextCalls += 1;
+      return { answers: [] };
+    },
+  );
+  await tick();
+
+  assert.equal(attempts >= 2, true, "флапающий канал повторили через reliability");
+  assert.equal(flaky.sent.length, 1, "вопрос доставлен после ретрая");
+  assert.equal(nextCalls, 0, "один канал доставил — GUI не нужен");
+
+  flaky.answer({ shortId: flaky.sent[0].shortId, optionId: "o1" });
+  const result = await pending;
+  assert.deepEqual(result.answers, [{ id: "q1", selected: ["Да"] }]);
+});
+
+test("answererFeature передаёт deliverFor из сервиса reliability", async () => {
+  const { answererFeature } = await import("../lib/features/answerer.js");
+  const a = fakeTransport("telegram");
+  const b = fakeTransport("max");
+  const delivered = [];
+  const services = new Map([
+    ["remoteTransport", a],
+    ["remoteTransports", new Map([["telegram", a], ["max", b]])],
+    ["remoteStore", { read: () => ({ enabled: { global: true }, hybrid: { enabled: false } }) }],
+    ["remoteReliabilityDeliver", (target) => async (argument) => {
+      delivered.push(target.id);
+      return target.sendQuestion(argument.question);
+    }],
+  ]);
+  const hooks = new Map();
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => services.get(name) ?? null,
+    onDispose: () => {},
+  };
+  const ctx = {
+    get: (name) => services.get(name) ?? null,
+    on: (event, handler) => {
+      hooks.set(event, { handler });
+      return () => {};
+    },
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+  };
+
+  answererFeature.apply(ctx, { transports: ["telegram", "max"] }, deps);
+  const pending = hooks.get("user-questions/request").handler(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: "s1" } },
+    () => assert.fail("next() нельзя"),
+  );
+  await tick();
+
+  assert.deepEqual(delivered.sort(), ["max", "telegram"], "каждый канал доставлен через reliability");
+  a.answer({ shortId: a.sent[0].shortId, optionId: "o1" });
+  await pending;
+});

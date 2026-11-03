@@ -347,7 +347,7 @@ export function createReliability({
   }
 
   /** Гонка отправки с дедлайном и сигналом: зависший send не держит handler. */
-  function raceSend(question, target, { deadline, signal }) {
+  function raceSend(question, target, { deadline, signal, send }) {
     return new Promise((resolve, reject) => {
       // Свой контроллер: дедлайн тоже должен отменять саму отправку, а не только
       // гонку — иначе зависший send доедет после того, как вопрос отдан в GUI.
@@ -372,7 +372,8 @@ export function createReliability({
       if (signal?.aborted === true) onAbort();
       signal?.addEventListener?.("abort", onAbort, { once: true });
       const opts = target === undefined ? { signal: controller.signal } : { ...target, signal: controller.signal };
-      Promise.resolve(channel().sendQuestion(question, opts)).then(
+      const sendFn = typeof send === "function" ? send : channel().sendQuestion.bind(channel());
+      Promise.resolve(sendFn(question, opts)).then(
         (value) => finish(resolve, value),
         (error) => finish(reject, error),
       );
@@ -432,16 +433,19 @@ export function createReliability({
     return transport;
   }
 
-  async function deliver({ question, chatId, signal } = {}) {
+  async function deliver({ question, chatId, signal, transport: overrideTransport = null } = {}) {
     if (question === null || typeof question !== "object") return "give-up";
-    if (typeof channel()?.sendQuestion !== "function") {
+    // 012: доставка в конкретный канал (брокер), а не только в «свой» транспорт.
+    const source = overrideTransport ?? transport;
+    const active = source?.__isTransportFacade === true ? source.current ?? null : source;
+    if (typeof active?.sendQuestion !== "function") {
       // Отправлять некуда: не врём «delivered», сразу отдаём вопрос GUI.
       journal.append({ event: "give-up", shortId: question.shortId, reason: "no-transport" });
       return "give-up";
     }
     const deadline = now() + connectTimeoutMs;
     // Фактический чат: явный аргумент или свойство транспорта (004 его отдаёт).
-    const resolvedChatId = chatId ?? channel()?.chatId ?? null;
+    const resolvedChatId = chatId ?? active?.chatId ?? null;
     const target = resolvedChatId === null ? undefined : { chatId: resolvedChatId };
 
     const outgoing = prepareQuestion(question);
@@ -451,7 +455,11 @@ export function createReliability({
       try {
         // Отправка может зависнуть: гоним её с дедлайном и сигналом, иначе
         // handler ждал бы вечно, а вопрос после аборта всё равно уехал бы.
-        const sentValue = await raceSend(outgoing, target, { deadline, signal });
+        const sentValue = await raceSend(outgoing, target, {
+          deadline,
+          signal,
+          send: (outgoingQuestion, options) => active.sendQuestion(outgoingQuestion, options),
+        });
         rememberOpen(question, { messageId: sentValue?.messageId, chatId: resolvedChatId });
         journal.append({ event: "delivered", shortId: question.shortId, attempt });
         return "delivered";

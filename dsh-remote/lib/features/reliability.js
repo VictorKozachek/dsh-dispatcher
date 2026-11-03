@@ -37,6 +37,11 @@ export const reliabilityFeature = {
 
     try {
       ctx.provide?.(RELIABILITY_SERVICE, reliability);
+      // 012: доставка в конкретный канал с повторами/таймаутом/сигналом 008.
+      ctx.provide?.("remoteReliabilityDeliver", (targetTransport) => (argument) => reliability.deliver({
+        ...argument,
+        transport: targetTransport,
+      }));
     } catch (error) {
       deps.logger.warn(`фича reliability: сервис ${RELIABILITY_SERVICE} не зарегистрирован (${error?.message ?? error})`);
     }

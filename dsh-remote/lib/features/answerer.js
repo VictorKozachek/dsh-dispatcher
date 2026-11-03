@@ -57,8 +57,11 @@ export const answererFeature = {
       if (transports.length <= 1) transports = null;
     }
 
+    // 012: у каждого канала — своя доставка reliability (повторы/backoff/give-up).
+    const deliverFor = deps.get("remoteReliabilityDeliver");
     const answerer = createAnswerer({
       transport: deps.get(TRANSPORT_SERVICE),
+      deliverFor,
       transports,
       registry,
       reliability,
