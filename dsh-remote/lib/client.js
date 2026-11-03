@@ -328,8 +328,15 @@ window.__ModuleLoader__.load({
       return h("span", null, props.t("title"));
     }
 
-    /** Сервисы Cordis, без которых `apply` не запускается. */
-    const inject = ["slots", "locale", "connection"];
+    /**
+     * Сервисы Cordis, без которых `apply` не запускается.
+     *
+     * `sidebarRightTabs` обязателен: без внедрённого сервиса `apply` не увидит
+     * `ctx.sidebarRightTabs` и панель тихо уйдёт в «недоступна». Проверка на
+     * отсутствие сервиса в `apply` остаётся — но это уже защита от сборки, где
+     * сервис объявлен, но не смонтирован.
+     */
+    const inject = ["slots", "locale", "sidebarRightTabs", "connection"];
 
     /** Тело плагина: тип таба, словари, тело и заголовок. */
     function apply(ctx) {

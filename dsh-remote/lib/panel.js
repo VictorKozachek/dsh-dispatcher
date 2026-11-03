@@ -156,6 +156,9 @@ export function normalizeState(state) {
         role: typeof question.role === "string" ? question.role : null,
         workspace: typeof question.workspace === "string" ? basenameOf(question.workspace) : null,
         createdAt: Number.isFinite(question.createdAt) ? question.createdAt : null,
+        // Кастомный TTL приходит из вопроса: без expiresAt deadline всегда
+        // считался бы как createdAt + 30 минут.
+        expiresAt: Number.isFinite(question.expiresAt) ? question.expiresAt : undefined,
       })),
   };
 }

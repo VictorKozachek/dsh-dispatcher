@@ -104,9 +104,16 @@ export function markRemoteMethod(prototype, method) {
  * SRC-режим Gateway.
  */
 export class PanelService {
-  /** @param options - `{stateFile, logFile, settings, channelPresent, now, logger}`. */
+  /**
+   * @param options - `{stateFile, logFile, settings, channelPresent, now, logger,
+   *   transport, reliability, testAnswerTimeoutMs, setTimeoutImpl}`.
+   */
   constructor(options) {
     this.options = options;
+    this.testAnswerTimeoutMs = Number.isFinite(options.testAnswerTimeoutMs)
+      ? options.testAnswerTimeoutMs
+      : 30 * 60 * 1000;
+    this.setTimeoutImpl = typeof options.setTimeoutImpl === "function" ? options.setTimeoutImpl : setTimeout;
   }
 
   /** Снимок статуса, открытых вопросов и хвоста журнала. */
@@ -114,11 +121,16 @@ export class PanelService {
     const checked = validateRequest(request, []);
     if (!checked.ok) return checked;
     try {
+      // Статус канала вычисляется в момент снимка: после /remote connect он
+      // появляется, после остановки — исчезает. boolean на регистрации «замерзал».
+      const channelPresent = typeof this.options.channelPresent === "function"
+        ? this.options.channelPresent() === true
+        : this.options.channelPresent === true;
       return panelSnapshot({
         stateFile: this.options.stateFile,
         logFile: this.options.logFile,
         settings: this.options.settings,
-        channelPresent: this.options.channelPresent === true,
+        channelPresent,
         now: this.options.now,
         logger: this.options.logger,
       });
@@ -167,15 +179,42 @@ export class PanelService {
         message: shortText("канал не поднят: привяжите бота командой /remote connect"),
       };
     }
+    // shortId — 8 шестнадцатеричных символов, как у настоящего вопроса (002).
+    const shortId = (this.options.now() % 0xffffffff).toString(16).padStart(8, "0").slice(-8);
+    const question = {
+      shortId,
+      title: "Тест из панели",
+      body: "Проверка канала dsh-remote. Нажмите любую кнопку.",
+      options: [{ id: "ok", label: "Ок" }],
+    };
+
+    // Без подписки на ответ сообщение осталось бы с кнопками навсегда: ответчик
+    // (002) этот вопрос не ждёт. Поэтому подписываемся и на клик закрываем; если
+    // человек так и не нажал — снимаем подписку по таймауту.
+    let off = null;
+    let timer = null;
+    const cleanup = () => {
+      off?.();
+      off = null;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
     try {
-      await transport.sendQuestion({
-        shortId: String(Date.now()).slice(-8),
-        title: "Тест из панели",
-        body: "Проверка канала dsh-remote. Нажмите любую кнопку.",
-        options: [{ id: "ok", label: "Ок" }],
-      });
-      return { ok: true, message: "тестовый вопрос отправлен" };
+      if (typeof transport.onAnswer === "function") {
+        off = transport.onAnswer((event) => {
+          if (event?.shortId !== shortId) return;
+          cleanup();
+          void transport.closeQuestion?.(question, "тест пройден");
+        });
+        timer = this.setTimeoutImpl(cleanup, this.testAnswerTimeoutMs);
+        timer?.unref?.();
+      }
+      await transport.sendQuestion(question);
+      return { ok: true, message: "тестовый вопрос отправлен — нажмите кнопку в чате" };
     } catch (error) {
+      cleanup();
       return { ok: false, message: shortText(`отправить не удалось: ${error?.message ?? error}`) };
     }
   }
@@ -200,7 +239,8 @@ export function registerPanelService(ctx, options = {}) {
     settings: options.settings ?? {},
     now: options.now ?? (() => Date.now()),
     logger: options.logger ?? (() => {}),
-    channelPresent: typeof options.channelPresent === "function" ? options.channelPresent() : options.channelPresent === true,
+    // Функцию храним как есть: снимок спросит её каждый раз заново.
+    channelPresent: options.channelPresent,
     transport: typeof options.transport === "function" ? options.transport : () => null,
     reliability: typeof options.reliability === "function" ? options.reliability : () => null,
   });

@@ -374,3 +374,123 @@ test("client: RPC идёт в remotePanel и не отправляет лишн�
   const offline = client.__internals.createClient(null);
   assert.deepEqual(await offline.snapshot(), { ok: false, offline: true, message: "" });
 });
+
+test("client: inject содержит sidebarRightTabs (иначе таб не зарегистрируется)", () => {
+  const client = loadClientInternals();
+  assert.deepEqual(client.inject, ["slots", "locale", "sidebarRightTabs", "connection"]);
+});
+
+test("channelPresent вычисляется в момент снимка: канал появился и исчез", async (t) => {
+  const dir = tempDir(t);
+  const stateFile = path.join(dir, "state.json");
+  const logFile = path.join(dir, "log.jsonl");
+  fs.writeFileSync(stateFile, JSON.stringify({ bindings: null }));
+  fs.writeFileSync(logFile, "");
+
+  let up = false;
+  const service = new PanelService({
+    stateFile,
+    logFile,
+    settings: {},
+    channelPresent: () => up,
+    now: () => 1,
+    logger: () => {},
+  });
+
+  assert.equal((await service.snapshot({})).status.channel, false, "канала ещё нет");
+  up = true;
+  assert.equal((await service.snapshot({})).status.channel, true, "канал появился после connect");
+  up = false;
+  assert.equal((await service.snapshot({})).status.channel, false, "канал остановлен");
+});
+
+test("normalizeState сохраняет expiresAt, дедлайн и сортировка его учитывают", () => {
+  const now = 1_000_000;
+  const normalized = normalizeState({
+    questions: [
+      { shortId: "aaaaaaaa", createdAt: now, expiresAt: now + 60_000 },
+      { shortId: "bbbbbbbb", createdAt: now - 10 * 60_000 },
+    ],
+  });
+
+  assert.equal(normalized.questions[0].expiresAt, now + 60_000, "кастомный TTL не теряется");
+  assert.equal(deadlineOf(normalized.questions[0]), now + 60_000);
+  assert.deepEqual(sortQuestionsByDeadline(normalized.questions).map((q) => q.shortId), ["aaaaaaaa", "bbbbbbbb"]);
+});
+
+test("PanelService.test: клик по кнопке закрывает тестовое сообщение", async () => {
+  const sent = [];
+  const closed = [];
+  let handler = null;
+  let offCalls = 0;
+  const transport = {
+    async sendQuestion(question) {
+      sent.push(question);
+      return { messageId: 1 };
+    },
+    async closeQuestion(question, summary) {
+      closed.push({ question, summary });
+    },
+    onAnswer(callback) {
+      handler = callback;
+      return () => {
+        offCalls += 1;
+      };
+    },
+  };
+  const service = new PanelService({
+    stateFile: "/nonexistent/state.json",
+    logFile: "/nonexistent/log.jsonl",
+    settings: {},
+    channelPresent: true,
+    now: () => 1_000,
+    logger: () => {},
+    transport: () => transport,
+  });
+
+  const tested = await service.test({});
+  assert.equal(tested.ok, true);
+  assert.equal(sent.length, 1);
+
+  handler({ shortId: sent[0].shortId, optionIds: ["ok"] });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(closed.length, 1, "ответ закрывает сообщение");
+  assert.equal(closed[0].summary, "тест пройден");
+  assert.equal(offCalls, 1, "подписка снята");
+});
+
+test("PanelService.test: без клика подписка снимается по таймауту", async () => {
+  let offCalls = 0;
+  let timerCallback = null;
+  const transport = {
+    async sendQuestion() {
+      return { messageId: 1 };
+    },
+    async closeQuestion() {},
+    onAnswer() {
+      return () => {
+        offCalls += 1;
+      };
+    },
+  };
+  const service = new PanelService({
+    stateFile: "/nonexistent/state.json",
+    logFile: "/nonexistent/log.jsonl",
+    settings: {},
+    channelPresent: true,
+    now: () => 1,
+    logger: () => {},
+    transport: () => transport,
+    testAnswerTimeoutMs: 1000,
+    setTimeoutImpl: (callback) => {
+      timerCallback = callback;
+      return { unref: () => {} };
+    },
+  });
+
+  await service.test({});
+  assert.equal(offCalls, 0, "до таймаута подписка жива");
+  timerCallback();
+  assert.equal(offCalls, 1, "таймаут снял подписку");
+});
