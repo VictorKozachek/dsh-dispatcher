@@ -65,6 +65,8 @@ const QUIET_REASONS = new Set([
   "closed",
   "undelivered",
   "restarted",
+  // 012: проигравший канал закрывается с пометкой, а не «✅ Отвечено».
+  "answered-elsewhere",
   "",
 ]);
 
@@ -591,13 +593,21 @@ export function createMaxTransport(options = {}) {
         const messageId = question?.messageId;
         if (messageId !== undefined && messageId !== null) {
           // clearButtons сам экранирует текст — здесь не экранируем, иначе двойное.
-          const text = QUIET_REASONS.has(summary) ? "⌛ ждёт ответа" : `✅ Отвечено: ${summary}`;
+          const text = summary === "answered-elsewhere"
+            ? "Отвечено в другом канале"
+            : QUIET_REASONS.has(summary)
+              ? "⌛ ждёт ответа"
+              : `✅ Отвечено: ${summary}`;
           await transport.clearButtons({ messageId }, text);
         }
         return;
       }
       const quiet = QUIET_REASONS.has(summary);
-      const text = quiet ? "⌛ ждёт ответа" : `✅ Отвечено: ${escapeHtml(summary)}`;
+      const text = summary === "answered-elsewhere"
+        ? "Отвечено в другом канале"
+        : quiet
+          ? "⌛ ждёт ответа"
+          : `✅ Отвечено: ${escapeHtml(summary)}`;
       try {
         await editQueue.push(() => request("PUT", "/messages", {
           query: { message_id: record.mid },

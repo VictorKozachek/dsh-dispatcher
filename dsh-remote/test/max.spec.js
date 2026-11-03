@@ -725,3 +725,23 @@ test("checkTransport делегирует в base: контракт провер
   delete broken.sendQuestion;
   assert.equal(checkTransport(broken).ok, false);
 });
+
+test("answered-elsewhere: проигравший канал получает пометку, а не «✅ Отвечено»", async (t) => {
+  const { transport, calls } = setup(t);
+  await transport.sendQuestion(question());
+
+  await transport.closeQuestion(question(), "answered-elsewhere");
+
+  const put = calls.filter((item) => item.key === "PUT /messages").at(-1);
+  assert.equal(put.body.text, "Отвечено в другом канале");
+  assert.deepEqual(put.body.attachments, []);
+});
+
+test("answered-elsewhere после рестарта (без записи) — тоже пометка", async (t) => {
+  const { transport, calls } = setup(t);
+
+  await transport.closeQuestion({ shortId: "abababab", messageId: "mid.77" }, "answered-elsewhere");
+
+  const put = calls.filter((item) => item.key === "PUT /messages").at(-1);
+  assert.equal(put.body.text, "Отвечено в другом канале");
+});
