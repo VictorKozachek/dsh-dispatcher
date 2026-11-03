@@ -17,6 +17,7 @@ import { APPROVAL_REQUEST_EVENT, createApprovals } from "../lib/approvals.js";
 import { createAudit } from "../lib/audit.js";
 import { APPROVAL_OUTCOME, RemoteApproval } from "../lib/domain/approval.js";
 import { features } from "../lib/features.js";
+import { hybridConfigFrom } from "../lib/features/approvals.js";
 
 /**
  * Тесты 024 проверяют транспорт и исходы кнопок, а не политику: чтобы они не
@@ -101,12 +102,14 @@ function request(overrides = {}) {
   };
 }
 
-function setup({ enabled = true, transport = fakeTransport(), requestOverride = {}, audit = null } = {}) {
+function setup({ enabled = true, transport = fakeTransport(), requestOverride = {}, audit = null, hybrid = null, timers = null } = {}) {
   const registry = { resolve: () => ({ enabled, scope: enabled ? "global" : null }) };
   const approvals = createApprovals({ policy: testPolicy,
     transport,
     registry,
     audit,
+    hybrid,
+    ...(timers === null ? {} : { setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout }),
     now: () => 1_700_000_000_000,
     log: () => {},
   });
@@ -551,4 +554,157 @@ test("аудит: аборт на входе — decision=timeout, outcome=cance
   assert.equal(record.decision, "timeout");
   assert.equal(record.outcome, "cancelled");
   assert.equal(record.toolName, "Bash");
+});
+
+/** Таймеры-двойники: тесты не ждут реальные секунды. */
+function fakeTimers() {
+  const timers = [];
+  const cleared = [];
+  let seq = 0;
+  return {
+    timers,
+    cleared,
+    setTimeout(fn, ms) {
+      const id = ++seq;
+      timers.push({ id, fn, ms });
+      return id;
+    },
+    clearTimeout(id) {
+      cleared.push(id);
+    },
+    fire(index = 0) {
+      const [timer] = timers.splice(index, 1);
+      timer.fn();
+    },
+  };
+}
+
+test("гибрид (028): таймер → next() один раз, gui в аудите, сообщение «устарело»", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const timers = fakeTimers();
+  const { approvals, transport, next, nextCalls } = setup({
+    audit,
+    timers,
+    hybrid: { enabled: true, waitMs: 5_000 },
+  });
+
+  const pendingOutcome = approvals.handler(request(), next);
+  await tick();
+  assert.equal(timers.timers.length, 1, "гибридный таймер взведён");
+  assert.equal(timers.timers[0].ms, 5_000);
+
+  timers.fire(0);
+  const outcome = await pendingOutcome;
+
+  assert.equal(outcome, "gui");
+  assert.equal(nextCalls.length, 1, "next() вызван ровно один раз");
+  assert.equal(transport.closed[0].summary, "Устарело: запрос ушёл в GUI");
+  const [record] = read();
+  assert.equal(record.decision, "gui", "таймаут ушёл в GUI и попал в аудит");
+  assert.equal(record.outcome, "unavailable");
+  assert.equal(approvals.late.size, 1, "ждём поздний ответ для аудита");
+});
+
+test("гибрид: ответ до таймера — GUI не зовётся, таймер снят", async (t) => {
+  const timers = fakeTimers();
+  const { approvals, transport, next, nextCalls } = setup({
+    timers,
+    hybrid: { enabled: true, waitMs: 5_000 },
+  });
+
+  const pendingOutcome = approvals.handler(request(), next);
+  await tick();
+  const timerId = timers.timers[0].id;
+  transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
+
+  assert.equal(await pendingOutcome, "allowed-once");
+  assert.equal(nextCalls.length, 0, "GUI не зовём");
+  assert.deepEqual(timers.cleared, [timerId], "таймер снят");
+  assert.equal(approvals.late.size, 0);
+});
+
+test("гибрид: поздний ответ после таймаута — аудит late, решение не меняется", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const timers = fakeTimers();
+  const { approvals, transport, next, nextCalls } = setup({
+    audit,
+    timers,
+    hybrid: { enabled: true, waitMs: 5_000 },
+  });
+
+  const pendingOutcome = approvals.handler(request(), next);
+  await tick();
+  const shortId = transport.sent[0].shortId;
+  timers.fire(0);
+  assert.equal(await pendingOutcome, "gui");
+
+  transport.answer({ shortId, optionIds: ["o2"], answeredBy: "user-9" });
+  await tick();
+
+  const records = read();
+  assert.equal(records.length, 2);
+  assert.equal(records[0].decision, "gui");
+  assert.equal(records[1].decision, "late", "поздний ответ виден в аудите");
+  assert.equal(records[1].outcome, "rejected", "исход нажатия сохранён как факт");
+  assert.equal(records[1].answeredBy, "user-9");
+  assert.equal(nextCalls.length, 1, "next() по-прежнему один");
+  assert.equal(approvals.late.size, 0, "поздний ответ разобран");
+});
+
+test("гибрид выключен: таймеры не взводятся, поведение как в 024", async () => {
+  const timers = fakeTimers();
+  const { approvals, transport, next } = setup({ timers, hybrid: { enabled: false, waitMs: 5_000 } });
+
+  const pendingOutcome = approvals.handler(request(), next);
+  await tick();
+  assert.equal(timers.timers.length, 0, "без hybrid таймера нет");
+  transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
+  assert.equal(await pendingOutcome, "allowed-once");
+});
+
+test("гибрид + недоступный транспорт: сразу GUI, таймер не нужен", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const timers = fakeTimers();
+  const transport = fakeTransport({ failSend: true });
+  const { approvals, next, nextCalls } = setup({
+    transport,
+    audit,
+    timers,
+    hybrid: { enabled: true, waitMs: 5_000 },
+  });
+
+  const outcome = await approvals.handler(request(), next);
+
+  assert.equal(outcome, "gui");
+  assert.equal(nextCalls.length, 1);
+  assert.equal(timers.timers.length, 0, "доставлять нечего — таймер не взводим");
+  assert.equal(read()[0].decision, "gui");
+});
+
+test("гибрид: выгрузка плагина снимает таймер", async () => {
+  const timers = fakeTimers();
+  const { approvals, next } = setup({ timers, hybrid: { enabled: true, waitMs: 5_000 } });
+
+  const pendingOutcome = approvals.handler(request(), next);
+  await tick();
+  const timerId = timers.timers[0].id;
+  approvals.dispose("detached");
+
+  assert.equal(await pendingOutcome, "cancelled");
+  assert.deepEqual(timers.cleared, [timerId]);
+  assert.equal(approvals.pending.size, 0);
+  assert.equal(approvals.late.size, 0);
+});
+
+test("конфиг гибрида: по умолчанию выключен, значения из строки плагина", () => {
+  assert.deepEqual(hybridConfigFrom({}), { enabled: false, waitMs: 20_000 });
+  assert.deepEqual(hybridConfigFrom({ approvals: {} }), { enabled: false, waitMs: 20_000 });
+  assert.deepEqual(hybridConfigFrom({ approvals: { hybrid: true, hybridWaitMs: 1_234.9 } }), {
+    enabled: true,
+    waitMs: 1_234,
+  });
+  assert.deepEqual(hybridConfigFrom({ approvals: { hybrid: false, hybridWaitMs: -5 } }), {
+    enabled: false,
+    waitMs: 20_000,
+  });
 });

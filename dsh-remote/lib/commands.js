@@ -847,7 +847,9 @@ export function createRemoteCommands({
         .join(":");
     const decision = entry.decision === "remote"
       ? "удалённо"
-      : entry.decision === "gui" ? "GUI" : "таймаут";
+      : entry.decision === "gui"
+        ? "GUI"
+        : entry.decision === "late" ? "поздний" : "таймаут";
     const parts = [time, entry.toolName ?? "?", entry.outcome ?? "?", decision];
     if (typeof entry.channel === "string" && entry.channel !== "") parts.push(entry.channel);
     if (typeof entry.answeredBy === "string" && entry.answeredBy !== "") parts.push(`ответил ${entry.answeredBy}`);

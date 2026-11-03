@@ -41,6 +41,15 @@ const noopLog = () => {};
 /** Имя waterfall'а DSH для подтверждений. */
 export const APPROVAL_REQUEST_EVENT = "approval/request";
 
+/** Гибрид (028): сколько ждём ответ в канале, прежде чем отдать запрос GUI. */
+export const DEFAULT_HYBRID_WAIT_MS = 20_000;
+
+/** Пометка в канале, когда подтверждение ушло в GUI по таймауту. */
+export const STALE_GUI_SUMMARY = "Устарело: запрос ушёл в GUI";
+
+/** Пометка для позднего ответа (решение уже принято в GUI). */
+export const LATE_ANSWER_SUMMARY = "Поздний ответ";
+
 /**
  * Создать ответчик подтверждений.
  *
@@ -55,6 +64,11 @@ export const APPROVAL_REQUEST_EVENT = "approval/request";
  * @param {Function|null} [options.deliverFor] — доставка на конкретный канал.
  * @param {Function|null} [options.channelOf] — канал проекта (015).
  * @param {object|null} [options.audit] — журнал решений (`lib/audit.js`, задача 026).
+ * @param {{enabled: boolean, waitMs?: number}|(() => {enabled: boolean, waitMs?: number})|null} [options.hybrid]
+ *   гибрид (028): не ответили `waitMs` — запрос уходит в GUI, поздний ответ
+ *   только пишется в аудит и не переигрывает решение.
+ * @param {Function} [options.setTimeout] — таймеры инжектируются: тесты не ждут 20 секунд.
+ * @param {Function} [options.clearTimeout]
  */
 export function createApprovals({
   transport = null,
@@ -76,6 +90,8 @@ export function createApprovals({
   clearTimeout: clearTimeoutImpl = clearTimeout,
   /** Журнал решений 026. */
   audit = null,
+  /** Гибрид 028: `{enabled, waitMs}` или функция. */
+  hybrid = null,
 } = {}) {
   // 025: «по умолчанию безопасно» живёт в самом ответчике, а не только в фиче —
   // иначе прямой вызов createApprovals (тесты, будущие вызывающие) спрашивал бы
@@ -113,7 +129,7 @@ export function createApprovals({
   }
 
   /** Счётчики решений — для `/remote status` (026). */
-  const stats = { claimed: 0, allowed: 0, rejected: 0, unavailable: 0, cancelled: 0 };
+  const stats = { claimed: 0, allowed: 0, rejected: 0, unavailable: 0, cancelled: 0, hybridHanded: 0, hybridLate: 0 };
 
   const channels = (Array.isArray(transports) && transports.length > 0 ? transports : (transport === null ? [] : [transport]))
     .filter((item) => item !== null && typeof item === "object");
@@ -125,8 +141,31 @@ export function createApprovals({
 
   /** Открытые подтверждения: `shortId → {approval, resolve, settled}`. */
   const pending = new Map();
+  /**
+   * Подтверждения, отданные GUI по гибридному таймауту (028): ждём поздний
+   * ответ только чтобы записать его в аудит — исход уже не переигрывается.
+   */
+  const late = new Map();
   /** Сообщения, уже закрытые: повторное закрытие — ложный сигнал транспорту. */
   const closed = new Set();
+  /** Текущая конфигурация гибрида (028): функция читается на каждое подтверждение. */
+  function hybridConfig() {
+    let value = hybrid;
+    if (typeof value === "function") {
+      try {
+        value = value();
+      } catch (error) {
+        log(`гибрид подтверждений: конфиг не прочитан (${error?.message ?? error})`);
+        value = null;
+      }
+    }
+    if (value === null || typeof value !== "object") return { enabled: false, waitMs: DEFAULT_HYBRID_WAIT_MS };
+    return {
+      enabled: value.enabled === true,
+      waitMs: Number.isFinite(value.waitMs) && value.waitMs > 0 ? Math.floor(value.waitMs) : DEFAULT_HYBRID_WAIT_MS,
+    };
+  }
+
   /** Контекст плагина: из него берём cwd сессии для scope и шапки. */
   let context = null;
   let disposed = false;
@@ -216,6 +255,9 @@ export function createApprovals({
   /** Выдать исход ожидающему слушателю: ровно один раз. */
   function settle(entry, outcome) {
     if (entry.settled) return;
+    // 025 + 028: снимаем ОБА таймера — TTL политики и гибридный waitMs.
+    // Сработавший первым решает исход, второй уже не должен ни аудитить, ни
+    // вызывать next(), ни отменять запись.
     if (entry.timer !== undefined && entry.timer !== null) {
       try {
         clearTimeoutImpl(entry.timer);
@@ -224,9 +266,85 @@ export function createApprovals({
       }
       entry.timer = null;
     }
+    clearHybridTimer(entry);
     entry.settled = true;
     pending.delete(entry.approval.shortId);
     entry.resolve(outcome);
+  }
+
+  /** Короткий id нажатой кнопки из события транспорта (терпимо к форме). */
+  function optionIdsOf(event) {
+    if (Array.isArray(event?.optionIds)) return event.optionIds;
+    if (Array.isArray(event?.optionId)) return event.optionId;
+    if (typeof event?.optionId === "string") return [event.optionId];
+    return [];
+  }
+
+  /** Снять гибридный таймер подтверждения (ответ, аборт, выгрузка). */
+  function clearHybridTimer(entry) {
+    if (entry?.hybridTimer === null || entry?.hybridTimer === undefined) return;
+    try {
+      clearTimeoutImpl(entry.hybridTimer);
+    } catch {
+      /* таймер уже сработал */
+    }
+    entry.hybridTimer = null;
+  }
+
+  /**
+   * Гибрид (028): ответа нет `waitMs` — подтверждение уходит в GUI.
+   *
+   * `next()` вызовется ровно один раз (handler вернёт `next()`), сообщение в
+   * канале помечается «устарело», а сам запрос запоминается в `late`: если
+   * человек всё-таки нажмёт кнопку, это попадёт в аудит как поздний ответ, но
+   * решение уже не изменит (в GUI человек увидит и ответит сам).
+   */
+  function armHybrid(entry) {
+    const state = hybridConfig();
+    if (state.enabled !== true || entry.settled) return;
+    const timer = setTimeoutImpl(() => {
+      entry.hybridTimer = null;
+      if (entry.settled) return;
+      entry.approval.cancel("hybrid-timeout", now());
+      stats.hybridHanded += 1;
+      record(entry.approval, {
+        outcome: APPROVAL_OUTCOME.unavailable,
+        decision: "gui",
+        channel: entry.channelId ?? null,
+      });
+      void closeMessage(entry.approval, STALE_GUI_SUMMARY);
+      // Ответа может не быть никогда: держим не больше 50 «поздних» записей.
+      if (late.size >= 50) late.delete(late.keys().next().value);
+      late.set(entry.approval.shortId, entry);
+      log(`гибрид: ответа нет ${state.waitMs} мс — подтверждение ${entry.approval.shortId} уходит в GUI`);
+      settle(entry, "next");
+    }, state.waitMs);
+    timer?.unref?.();
+    entry.hybridTimer = timer;
+  }
+
+  /**
+   * Поздний ответ после гибридного таймаута (028).
+   *
+   * Решение не переигрывается: в GUI человек уже получил запрос. Нажатие видно
+   * в аудите (`decision: "late"`) — иначе человек думал бы, что кнопка пропала.
+   */
+  function handleLateAnswer(entry, event, channel) {
+    const outcome = outcomeOfOption(optionIdsOf(event)[0]);
+    if (outcome === null) {
+      log(`подтверждение ${entry.approval.shortId}: поздний ответ с неизвестной кнопкой — игнорирую`);
+      return;
+    }
+    late.delete(entry.approval.shortId);
+    stats.hybridLate += 1;
+    record(entry.approval, {
+      outcome,
+      decision: "late",
+      channel: channel?.id ?? null,
+      chatId: typeof event.chatId === "string" || typeof event.chatId === "number" ? String(event.chatId) : entry.approval.chatId,
+      answeredBy: typeof event.answeredBy === "string" && event.answeredBy !== "" ? event.answeredBy : null,
+    });
+    log(`подтверждение ${entry.approval.shortId}: поздний ответ (${outcome}) после ухода в GUI — решение не меняю`);
   }
 
   /**
@@ -240,22 +358,22 @@ export function createApprovals({
     const shortId = typeof event.shortId === "string" ? event.shortId : "";
     const entry = pending.get(shortId);
     if (entry === undefined) {
-      log(`подтверждение ${shortId || "(без shortId)"}: ответа никто не ждёт — игнорирую`);
+      const lateEntry = late.get(shortId);
+      if (lateEntry === undefined) {
+        log(`подтверждение ${shortId || "(без shortId)"}: ответа никто не ждёт — игнорирую`);
+        return;
+      }
+      handleLateAnswer(lateEntry, event, channel);
       return;
     }
-    const optionIds = Array.isArray(event.optionIds)
-      ? event.optionIds
-      : Array.isArray(event.optionId)
-        ? event.optionId
-        : typeof event.optionId === "string"
-          ? [event.optionId]
-          : [];
+    const optionIds = optionIdsOf(event);
     const outcome = outcomeOfOption(optionIds[0]);
     if (outcome === null) {
       log(`подтверждение ${shortId}: неизвестная кнопка ${String(optionIds[0])} — игнорирую`);
       return;
     }
     if (!entry.approval.decide(outcome, now())) return;
+    clearHybridTimer(entry);
     statsFor(outcome);
     record(entry.approval, {
       outcome,
@@ -409,6 +527,7 @@ export function createApprovals({
 
       const onAbort = () => {
         if (entry.settled) return;
+        clearHybridTimer(entry);
         approval.cancel("aborted", now());
         stats.cancelled += 1;
         record(approval, {
@@ -468,7 +587,9 @@ export function createApprovals({
         // чтобы у человека не осталась живая кнопка на уже снятый запрос.
         if (entry.settled) {
           void closeMessage(approval, outcomeSummary(APPROVAL_OUTCOME.cancelled));
+          return;
         }
+        armHybrid(entry);
       }).catch((error) => {
         log(`подтверждение ${approval.shortId}: доставка упала (${error?.message ?? error})`);
         failToGui();
@@ -531,6 +652,7 @@ export function createApprovals({
   function dispose(reason = "disposed") {
     disposed = true;
     for (const entry of [...pending.values()]) {
+      clearHybridTimer(entry);
       if (!entry.approval.cancel(reason, now())) continue;
       stats.cancelled += 1;
       record(entry.approval, {
@@ -542,7 +664,8 @@ export function createApprovals({
       settle(entry, APPROVAL_OUTCOME.cancelled);
     }
     pending.clear();
+    late.clear();
   }
 
-  return { attach, handler, dispose, stats, pending };
+  return { attach, handler, dispose, stats, pending, late };
 }
