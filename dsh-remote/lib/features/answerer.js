@@ -38,9 +38,15 @@ export const answererFeature = {
       log: (message) => deps.logger.debug(message),
     });
 
+    // Устойчивость (008): доставка с повторами и TTL-сторож живут в отдельной
+    // фиче; здесь только передаём их ответчику.
+    const reliability = deps.get("remoteReliability");
+
     const answerer = createAnswerer({
       transport: deps.get(TRANSPORT_SERVICE),
       registry,
+      reliability,
+      deliver: reliability === null ? null : (argument) => reliability.deliver(argument),
       log: (message) => deps.logger.debug(message),
     });
 
