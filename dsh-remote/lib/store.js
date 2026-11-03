@@ -38,6 +38,9 @@ export const LEGACY_STATE_VERSION = 1;
 /** Сколько последних вопросов держим в `recent`. */
 export const RECENT_LIMIT = 20;
 
+/** Сколько недоставленных вопросов держим в `pending` (033). */
+export const PENDING_LIMIT = 200;
+
 /**
  * Отказ из-за схемы состояния: файл новее плагина или миграция невозможна.
  * Сообщение самодостаточно (что случилось + что делать), потому что его
@@ -457,6 +460,7 @@ export function createCredentialAccess(ctx, { log = () => {}, env = process.env 
  * @param {() => number} [options.now] — часы.
  * @param {(message: string) => void} [options.log]
  * @param {number} [options.recentLimit]
+ * @param {number} [options.pendingLimit] — предел очереди pending (033).
  */
 export function createStore({
   file,
@@ -465,6 +469,7 @@ export function createStore({
   now = () => Date.now(),
   log = () => {},
   recentLimit = RECENT_LIMIT,
+  pendingLimit = PENDING_LIMIT,
 } = {}) {
   const paths = file === undefined ? statePaths({ env, home }) : statePaths({ env: { ...env, DSH_REMOTE_STATE: file }, home });
   let lockOwner = null;
@@ -560,7 +565,7 @@ export function createStore({
     if (migration.applied.length > 0) {
       try {
         lastBackup = backupBeforeMigration(migration.from);
-        writeStateFile(normalizeState(migration.state, log, recentLimit));
+        writeStateFile(normalizeState(migration.state, log, recentLimit, pendingLimit));
         log(`состояние: миграция схемы ${migration.from} → ${migration.to}, бэкап ${lastBackup}`);
       } catch (error) {
         schemaError = {
@@ -574,13 +579,13 @@ export function createStore({
     }
 
     schemaError = null;
-    return normalizeState(migration.state, log, recentLimit);
+    return normalizeState(migration.state, log, recentLimit, pendingLimit);
   }
 
   /** Записать состояние атомарно. При отказе схемы файл не трогаем. */
   function write(state) {
     if (schemaError !== null) throw new StateSchemaError(schemaError);
-    const normalized = normalizeState(state, log, recentLimit);
+    const normalized = normalizeState(state, log, recentLimit, pendingLimit);
     return writeStateFile(normalized);
   }
 
@@ -818,6 +823,9 @@ export function createStore({
     get recentLimit() {
       return recentLimit;
     },
+    get pendingLimit() {
+      return pendingLimit;
+    },
     /** Что мы держим сами (для тестов и `status`). */
     get lockOwner() {
       return lockOwner;
@@ -830,7 +838,7 @@ export function createStore({
  * обязательные — восстанавливаем. Версию схемы ставит миграция (032); здесь она
  * только фиксируется в текущей, а историческое поле `version` не сохраняется.
  */
-function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
+function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT, pendingLimit = PENDING_LIMIT) {
   const base = defaultState();
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     log("состояние: ожидался объект — работаю с дефолтом");
@@ -855,7 +863,7 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
         : DEFAULT_HYBRID_WAIT_MS,
     },
     recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
-    pending: Array.isArray(value.pending) ? value.pending : [],
+    pending: Array.isArray(value.pending) ? value.pending.slice(-Math.max(0, pendingLimit)) : [],
     notify: {
       seen: Array.isArray(value.notify?.seen) ? value.notify.seen.filter((key) => typeof key === "string").slice(-500) : [],
       lastTodo: value.notify?.lastTodo !== null && typeof value.notify?.lastTodo === "object"

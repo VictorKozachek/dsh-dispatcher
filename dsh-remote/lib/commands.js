@@ -23,6 +23,7 @@
  */
 
 import fs from "node:fs";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createRegistry } from "./domain/registry.js";
@@ -35,6 +36,7 @@ import {
 } from "./doctor.js";
 import { RELAY_TOKEN_REF } from "./transport/relay.js";
 import { createAudit } from "./audit.js";
+import { DEFAULT_KEEP, vacuum } from "./rotate.js";
 import { formatStats } from "./metrics.js";
 import { randomUUID } from "node:crypto";
 
@@ -64,6 +66,7 @@ const HELP_TEXT = [
   "  /remote who        — сессия, воркспейс и эффективный режим",
   "  /remote doctor [--json] — проверка привязки, канала и состояния (ok/warn/fail; JSON для скриптов)",
   "  /remote stats [--json] — метрики: вопросы, подтверждения, доставки, латентность, очереди",
+  "  /remote vacuum [--dry-run] — очистить старые ротированные журналы (хранить 5)",
   "  /remote channel <проект> <chatId> [threadId] — канал проекта (топик форума)",
   "    --force          — если бот действительно в другом чате (чужой чат иначе отвергается)",
   "    --transport=<id> — канал для конкретного канала (telegram, max); по умолчанию — транспорт привязки",
@@ -1022,6 +1025,32 @@ export function createRemoteCommands({
   }
 
   /**
+   * `/remote vacuum [--dry-run]` — принудительная очистка старых журналов (033).
+   *
+   * Оставляем последние `keep` (5) ротированных файлов на каждый журнал;
+   * `--dry-run` только показывает, что было бы удалено.
+   */
+  async function vacuumCommand(invocation, flags) {
+    const dir = typeof store?.paths?.dir === "string" ? store.paths.dir : null;
+    if (dir === null) return failure("хранилище не найдено: сначала /remote connect");
+    const dryRun = flags?.has?.("dry-run") === true;
+    const result = vacuum(fs, { dir, keep: DEFAULT_KEEP, dryRun, log: (message) => log(message) });
+    const size = (bytes) => `${(bytes / 1024).toFixed(1)} КБ`;
+    const lines = [];
+    if (result.removed.length === 0) {
+      lines.push(dryRun ? "удалять нечего: старых журналов нет" : "очистка не требуется: старых журналов нет");
+    } else if (dryRun) {
+      lines.push(`--dry-run: будет удалено ${result.removed.length} файлов (${size(result.freedBytes)}):`);
+      lines.push(...result.removed.map((item) => `  ${path.basename(item.path)} — ${size(item.size)}`));
+    } else {
+      lines.push(`удалено ${result.removed.length} файлов, освобождено ${size(result.freedBytes)}:`);
+      lines.push(...result.removed.map((item) => `  ${path.basename(item.path)} — ${size(item.size)}`));
+    }
+    lines.push(`оставлено ротированных файлов: ${result.kept.length} (keep=${DEFAULT_KEEP})`);
+    return success(lines.join("\n"));
+  }
+
+  /**
    * `/remote stats [--json]` — метрики за время работы плагина (031).
    *
    * Только числа: счётчики вопросов/подтверждений, доставки, латентность,
@@ -1191,6 +1220,8 @@ export function createRemoteCommands({
           return await doctor(invocation, flags);
         case "stats":
           return await stats(invocation, flags);
+        case "vacuum":
+          return await vacuumCommand(invocation, flags);
         case "channel":
           return channelCommand(invocation, flags, rest, flagValues);
         case "disconnect":
