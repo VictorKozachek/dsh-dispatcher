@@ -460,3 +460,180 @@ test("answererFeature передаёт deliverFor из сервиса reliabilit
   a.answer({ shortId: a.sent[0].shortId, optionId: "o1" });
   await pending;
 });
+
+// --- интеграция двух настоящих каналов (012, после слияния 011) -------------
+
+/** Ответ API. */
+function apiResponse(payload, status = 200) {
+  return {
+    ok: status < 400,
+    status,
+    async json() {
+      return payload;
+    },
+  };
+}
+
+/**
+ * Fetch для двух настоящих транспортов: Telegram и MAX.
+ *
+ * `getUpdates`/`updates` не отвечают, пока тест не подложит пачку — так поллинг
+ * не крутится вхолостую, а ответ приходит «как из мессенджера».
+ */
+function dualFetch() {
+  const state = { tg: [], max: [], tgSent: [], maxSent: [], maxPuts: [], tgEdits: [] };
+  const waiter = (list, init) => new Promise((resolve, reject) => {
+    list.push({ resolve, reject });
+    init?.signal?.addEventListener?.("abort", () => {
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      reject(error);
+    }, { once: true });
+  });
+  const fetch = async (url, init = {}) => {
+    const parsed = new URL(url);
+    const method = (init.method ?? "GET").toUpperCase();
+    const body = init.body === undefined ? null : JSON.parse(init.body);
+    if (parsed.hostname === "platform-api2.max.ru") {
+      if (parsed.pathname === "/updates") return waiter(state.max, init);
+      if (parsed.pathname === "/messages" && method === "POST") {
+        state.maxSent.push(body);
+        return apiResponse({ message: { body: { mid: "max-mid-1" } } });
+      }
+      if (parsed.pathname === "/messages" && method === "PUT") {
+        state.maxPuts.push(body);
+        return apiResponse({ ok: true });
+      }
+      return apiResponse({ ok: true });
+    }
+    if (parsed.pathname.endsWith("/getUpdates")) return waiter(state.tg, init);
+    if (parsed.pathname.endsWith("/sendMessage")) {
+      state.tgSent.push(body);
+      return apiResponse({ ok: true, result: { message_id: 501 } });
+    }
+    if (parsed.pathname.endsWith("/editMessageText")) {
+      state.tgEdits.push(body);
+      return apiResponse({ ok: true, result: true });
+    }
+    if (parsed.pathname.endsWith("/editMessageReplyMarkup")) return apiResponse({ ok: true, result: true });
+    if (parsed.pathname.endsWith("/answerCallbackQuery")) return apiResponse({ ok: true, result: true });
+    if (parsed.pathname.endsWith("/getMe")) return apiResponse({ ok: true, result: { username: "tg_bot" } });
+    return apiResponse({ ok: true, result: true });
+  };
+  return { fetch, state };
+}
+
+test("два настоящих канала: ответ из Telegram закрывает MAX пометкой, поздний MAX игнорируется", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { createJsonState, createReliability } = await import("../lib/reliability.js");
+  const { createTelegramTransport } = await import("../lib/transport/telegram.js");
+  const { createMaxTransport } = await import("../lib/transport/max.js");
+  const { answererFeature } = await import("../lib/features/answerer.js");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-012-real-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const api = dualFetch();
+  const logs = [];
+  // Логи транспортов и ответчика — в один список: поздний клик должен быть виден.
+  const options = {
+    fetch: api.fetch,
+    jitter: () => 0,
+    now: () => 0,
+    sleep: async () => {},
+    log: (message) => logs.push(message),
+  };
+  const telegram = createTelegramTransport({ token: "123456:TEST", chatId: 42, allowedUserIds: [7], persistOffset: () => {}, ...options });
+  const max = createMaxTransport({ token: "max-token", chatId: 42, allowedUserIds: [7], ...options });
+  t.after(() => {
+    void telegram.stop?.();
+    void max.stop?.();
+  });
+
+  const reliability = createReliability({
+    transport: telegram,
+    state: createJsonState({ file: path.join(dir, "state.json") }),
+    logFile: path.join(dir, "log.jsonl"),
+    now: () => 0,
+    sleep: async () => {},
+    log: () => {},
+  });
+  const deliverFor = (target) => (argument) => reliability.deliver({ ...argument, transport: target });
+
+  const services = new Map([
+    ["remoteTransport", telegram],
+    ["remoteTransports", new Map([["telegram", telegram], ["max", max]])],
+    ["remoteStore", { read: () => ({ enabled: { global: true }, hybrid: { enabled: false } }) }],
+    ["remoteReliabilityDeliver", deliverFor],
+  ]);
+  const hooks = new Map();
+  const deps = {
+    logger: { debug: (m) => logs.push(m), info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m) },
+    get: (name) => services.get(name) ?? null,
+    onDispose: () => {},
+  };
+  const ctx = {
+    get: (name) => services.get(name) ?? null,
+    on: (event, handler) => {
+      hooks.set(event, { handler });
+      return () => {};
+    },
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+  };
+
+  answererFeature.apply(ctx, { transports: ["telegram", "max"] }, deps);
+  const listener = hooks.get("user-questions/request").handler;
+
+  await telegram.start();
+  await max.start();
+
+  const pending = listener(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }, { label: "Нет" }] }], agent: { id: "s1" } },
+    () => assert.fail("next() нельзя"),
+  );
+  await tick();
+
+  assert.equal(api.state.tgSent.length, 1, "вопрос ушёл в Telegram");
+  assert.equal(api.state.maxSent.length, 1, "вопрос ушёл в MAX");
+  const shortId = api.state.maxSent[0].attachments[0].payload.buttons[0][0].payload.split(":")[1];
+
+  // Ответ из Telegram: человек нажал «Да».
+  const tgWaiter = api.state.tg.pop();
+  tgWaiter.resolve(apiResponse({
+    ok: true,
+    result: [{
+      update_id: 1,
+      callback_query: { id: "cb1", from: { id: 7 }, data: `q:${shortId}:o1`, message: { message_id: 501, chat: { id: 42 } } },
+    }],
+  }));
+  const result = await pending;
+
+  assert.deepEqual(result.answers, [{ id: "q1", selected: ["Да"] }]);
+  await tick(); // closeAll идёт в фоне после ответа сессии
+  const maxPut = api.state.maxPuts.at(-1);
+  assert.equal(maxPut.text, "Отвечено в другом канале", "проигравший канал помечен");
+  assert.deepEqual(maxPut.attachments, [], "кнопки в MAX сняты");
+
+  // Поздний ответ из MAX: решение уже принято — игнорируем, но видно в логе.
+  const maxWaiter = api.state.max.pop();
+  maxWaiter.resolve(apiResponse({
+    updates: [{
+      type: "message_callback",
+      timestamp: 2,
+      callback: { callback_id: "cb2", payload: `q:${shortId}:o2`, user: { user_id: 7 }, chat: { chat_id: 42 } },
+    }],
+    marker: 2,
+  }));
+  await tick();
+
+  // MAX-транспорт уже удалил запись после закрытия: поздний клик отбрасывается
+  // на его уровне (и это видно в логе), решение сессии не меняется.
+  assert.match(logs.join("\n"), /вопроса уже нет|проигнорирован/);
+  // Первый PUT — пометка (кнопки ещё на месте), второй — закрытие (attachments []).
+  const maxCloses = api.state.maxPuts.filter((put) => Array.isArray(put.attachments) && put.attachments.length === 0);
+  assert.equal(maxCloses.length, 1, "закрытие ровно одно");
+});
