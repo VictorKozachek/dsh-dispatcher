@@ -1,0 +1,17 @@
+# Патч-слой пакета dsh-remote.
+#
+# `dsh plugin --profile <профиль> add <путь>/dsh-remote` видит `dsh.bundle.patch`
+# в package.json, дописывает имя пакета в `dsh.profile.bundles` профиля и
+# применяет этот файл отдельным слоем после dsh-base и dsh-web-app. Поэтому
+# руками править ~/.dsh/profiles/<профиль>/cordis.patch.yml не нужно: ряд ниже и
+# есть включение плагина.
+#
+# Ряд — обычный Loader-энтри host-половины (браузерной половины у пакета нет).
+# Включение и выключение удалённого режима живёт не здесь, а в состоянии
+# ~/.dsh/remote-control/state.json — его меняют команды `/remote on|off`, поэтому
+# `config` пустой: в профиль не попадают ни токены, ни chat id. Токены вообще не
+# хранятся в конфиге — только через `ctx.credentials`.
+- insert:
+    - id: ui-remote
+      name: 'dsh-remote'
+      config: {}
