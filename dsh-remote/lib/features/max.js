@@ -16,7 +16,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { createCredentialAccess } from "../store.js";
-import { createMaxTransport } from "../transport/max.js";
+import { createMaxTransport, describeError } from "../transport/max.js";
 
 /** Имя сервиса транспорта в контексте плагина. */
 export const TRANSPORT_SERVICE = "remoteTransport";
@@ -114,7 +114,8 @@ export const maxFeature = {
         log: (message) => deps.logger.debug(message),
       });
     } catch (error) {
-      deps.logger.warn(`фича max: транспорт не создан (${error?.message ?? error})`);
+      // describeError вырезает токен: даже сообщение исключения не должно утечь.
+      deps.logger.warn(`фича max: транспорт не создан (${describeError(error)})`);
       return;
     }
 
@@ -136,7 +137,7 @@ export const maxFeature = {
     });
 
     void transport.start().catch((error) => {
-      deps.logger.warn(`фича max: поллинг не запустился (${error?.message ?? error})`);
+      deps.logger.warn(`фича max: поллинг не запустился (${describeError(error)})`);
     });
   },
 };

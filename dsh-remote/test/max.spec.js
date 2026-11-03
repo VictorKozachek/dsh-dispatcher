@@ -638,3 +638,90 @@ test("marker пишется атомарно: битый файл не лома�
   assert.equal(first.parsed.searchParams.has("marker"), false, "битый marker не используется");
   assert.equal(JSON.parse(fs.readFileSync(markerPath, "utf8")).marker, 99, "файл заменён валидным");
 });
+
+// --- регрессии по ревью тестировщика 011 ------------------------------------
+
+test("allowlist пуст: fail-closed — ни один ответ не принимается", async (t) => {
+  const updates = [
+    { type: "bot_started", timestamp: 1, user: { user_id: 7 }, chat: { chat_id: 42 } },
+    {
+      type: "message_callback",
+      timestamp: 2,
+      callback: { callback_id: "cb1", payload: "q:a1b2c3d4:o1", user: { user_id: 7 }, chat: { chat_id: 42 } },
+    },
+  ];
+  const { transport, calls } = setup(t, { routes: { updates }, options: { allowedUserIds: [] } });
+  await transport.sendQuestion(question());
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.equal(answers.length, 0, "без allowlist отвечать нельзя");
+  assert.equal(calls.filter((item) => item.key === "POST /answers").length, 0);
+  assert.deepEqual(transport.detected, { chatId: 42, userId: 7 }, "служебное событие привязки всё равно видно");
+});
+
+test("allowlist пуст: свободный текст тоже игнорируется", async (t) => {
+  const updates = [{
+    type: "message_created",
+    timestamp: 1,
+    message: { sender: { user_id: 7 }, chat: { chat_id: 42 }, body: { mid: "m2", text: "ответ" }, link: { type: "reply", mid: "mid.1" } },
+  }];
+  const { transport } = setup(t, { routes: { updates }, options: { allowedUserIds: [] } });
+  await transport.sendQuestion(question());
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.equal(answers.length, 0);
+});
+
+test("чужой чат игнорируется, даже если отправитель в allowlist", async (t) => {
+  const updates = [{
+    type: "message_callback",
+    timestamp: 1,
+    callback: { callback_id: "cb1", payload: "q:a1b2c3d4:o1", user: { user_id: 7 }, chat: { chat_id: 999 } },
+  }];
+  const { transport, calls } = setup(t, { routes: { updates } }); // allowlist [7], chatId 42
+  await transport.sendQuestion(question());
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.deepEqual(answers, []);
+  assert.equal(calls.filter((item) => item.key === "POST /answers").length, 0);
+});
+
+test("401 с токеном в теле ответа: токен не попадает в текст ошибки", async (t) => {
+  const { transport } = setup(t, {
+    routes: {
+      "POST /messages": () => response({ message: `bad token ${TOKEN}` }, 401),
+    },
+  });
+
+  await assert.rejects(
+    () => transport.sendQuestion(question()),
+    (error) => {
+      assert.equal(error.message.includes(TOKEN), false, `утечка токена: ${error.message}`);
+      assert.match(error.message, /<token>/);
+      return true;
+    },
+  );
+});
+
+test("checkTransport делегирует в base: контракт проверяется, а не штампуется", (t) => {
+  const { transport } = setup(t);
+  assert.deepEqual(transport.checkTransport(), checkTransport(transport));
+  const broken = { ...transport };
+  delete broken.sendQuestion;
+  assert.equal(checkTransport(broken).ok, false);
+});

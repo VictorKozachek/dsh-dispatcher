@@ -30,6 +30,7 @@ import { createHash } from "node:crypto";
 import {
   DEFAULT_CAPS,
   callbackData,
+  checkTransport,
   chrome,
   parseCallbackData,
   splitText,
@@ -77,7 +78,7 @@ const NO_RETRY = new Set([400, 401, 404, 405]);
 const RETRY = new Set([429, 503]);
 
 /** Текст ошибки для человека: без токена и без stacktrace. */
-function describeError(error, token) {
+export function describeError(error, token) {
   let message = error instanceof Error ? error.message : String(error ?? "неизвестная ошибка");
   if (typeof token === "string" && token !== "") message = message.split(token).join("<token>");
   return message;
@@ -96,6 +97,12 @@ function clipEscaped(text, limit) {
   const amp = cut.lastIndexOf("&");
   if (amp >= 0 && !/^&(amp|lt|gt);$/.test(cut.slice(amp))) cut = cut.slice(0, amp);
   return `${cut}…`;
+}
+
+/** Вырезать токен из произвольного текста (сервер может его отразить). */
+function maskToken(text, secret) {
+  if (typeof secret !== "string" || secret === "") return String(text ?? "");
+  return String(text ?? "").split(secret).join("<token>");
 }
 
 /** Экранирование простого текста под `format: "html"`. */
@@ -194,7 +201,7 @@ export function createMaxTransport(options = {}) {
       }
       const status = response.status;
       if (status === 200) return response.json();
-      const text = await safeText(response);
+      const text = maskToken(await safeText(response), token);
       const error = new Error(`MAX ${method} ${path}: ${status}${text === "" ? "" : ` ${text}`}`);
       error.status = status;
       lastError = error;
@@ -244,10 +251,22 @@ export function createMaxTransport(options = {}) {
       ?? null;
   }
 
+  /**
+   * Пропускать ответ только от привязанного человека и только из привязанного
+   * чата. Пустой allowlist — **fail-closed**: MAX-бот публичен по нику, и без
+   * списка любой мог бы ответить за человека (канал удалённого управления).
+   */
   function allowedSender(update) {
-    if (allowed.size === 0) return true;
+    if (allowed.size === 0) return false;
     const sender = senderOf(update);
-    return sender !== null && allowed.has(String(sender));
+    if (sender === null || !allowed.has(String(sender))) return false;
+    const updateChat = update?.chat?.chat_id
+      ?? update?.callback?.chat?.chat_id
+      ?? update?.message?.chat?.chat_id
+      ?? null;
+    if (chatId !== null) return updateChat !== null && String(updateChat) === String(chatId);
+    if (userId !== null) return String(sender) === String(userId);
+    return false;
   }
 
   // Очереди объявляем до обработчиков: ответ на колбэк и правки тоже проходят
@@ -288,6 +307,16 @@ export function createMaxTransport(options = {}) {
   async function handleUpdate(update) {
     if (isDuplicate(update)) {
       log(`max: дубль обновления ${update?.type ?? "?"} — игнор`);
+      return;
+    }
+    // Служебные события привязки не являются ответами: allowlist к ним не
+    // применяем, иначе пустой список (fail-closed) скрыл бы сам факт привязки.
+    if (update?.type === "bot_started" || update?.type === "bot_added") {
+      const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? null;
+      const user = update?.user?.user_id ?? update?.message?.sender?.user_id ?? null;
+      if (chat !== null) detected.chatId = chat;
+      if (user !== null) detected.userId = user;
+      log(`max: ${update.type} — бот подключён (chat_id ${chat ?? "?"}, user_id ${user ?? "?"})`);
       return;
     }
     if (!allowedSender(update)) {
@@ -561,7 +590,8 @@ export function createMaxTransport(options = {}) {
       if (record === undefined) {
         const messageId = question?.messageId;
         if (messageId !== undefined && messageId !== null) {
-          const text = QUIET_REASONS.has(summary) ? "⌛ ждёт ответа" : `✅ Отвечено: ${escapeHtml(summary)}`;
+          // clearButtons сам экранирует текст — здесь не экранируем, иначе двойное.
+          const text = QUIET_REASONS.has(summary) ? "⌛ ждёт ответа" : `✅ Отвечено: ${summary}`;
           await transport.clearButtons({ messageId }, text);
         }
         return;
@@ -599,7 +629,7 @@ export function createMaxTransport(options = {}) {
     },
 
     checkTransport() {
-      return { ok: true, missing: [] };
+      return checkTransport(transport);
     },
   };
 
