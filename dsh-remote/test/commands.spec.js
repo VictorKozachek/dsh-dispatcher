@@ -1434,6 +1434,31 @@ test("status: сводка по подтверждениям — удалённ�
   assert.match(result.text, /подтверждения: удалённо 1, в GUI 1, без ответа 1 \(всего 3\)/);
 });
 
+test("/remote status: показывает действующую политику подтверждений", async (t) => {
+  const { createApprovalPolicy } = await import("../lib/approvals/policy.js");
+  const policy = createApprovalPolicy({ tools: ["read_file"], denyRemote: ["bash"], onTimeout: "unavailable", ttlMs: 300_000 });
+  const stand = harness(t);
+  const originalGet = stand.ctx.get;
+  stand.ctx.get = (name) => (name === "remoteApprovalPolicy" ? policy : originalGet(name));
+
+  const result = await stand.remote.handler(invoke("status"));
+
+  assert.equal(result.kind, "success");
+  assert.match(result.text, /approvals: tools=\[read_file\]/);
+  assert.match(result.text, /approvals: denyRemote=\[bash\]/);
+  assert.match(result.text, /approvals: onTimeout=unavailable \(отказ\), ttl=5 мин/);
+});
+
+test("/remote status: без сервиса политики честно говорит «только в GUI»", async (t) => {
+  const stand = harness(t);
+  const originalGet = stand.ctx.get;
+  stand.ctx.get = (name) => (name === "remoteApprovalPolicy" ? null : originalGet(name));
+
+  const result = await stand.remote.handler(invoke("status"));
+
+  assert.match(result.text, /approvals: политика не загружена — удалённые подтверждения только в GUI/);
+});
+
 test("/remote audit: поздний ответ помечается «поздний», сводка статуса не меняется", async (t) => {
   const stand = harness(t);
   writeAudit(stand, [
