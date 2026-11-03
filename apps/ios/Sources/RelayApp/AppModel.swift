@@ -83,7 +83,8 @@ final class AppModel: ObservableObject {
         status = .ready
         let client = Self.makeClient(baseURL: stored.baseURL, secrets: secrets)
         let queue = OfflineQueue(fileURL: Self.queueURL())
-        let viewModel = QuestionsViewModel(api: client, queue: queue)
+        let closedStore = FileClosedQuestionsStore(fileURL: Self.closedURL())
+        let viewModel = QuestionsViewModel(api: client, queue: queue, closedStore: closedStore)
         questions = viewModel
         eventTask?.cancel()
         eventTask = Task { [weak self] in
@@ -98,6 +99,10 @@ final class AppModel: ObservableObject {
             await viewModel.flushQueue()
             await viewModel.load()
         }
+    }
+
+    private static func closedURL() -> URL {
+        queueURL().deletingLastPathComponent().appendingPathComponent("closed-questions.json")
     }
 
     private static func queueURL() -> URL {

@@ -245,3 +245,185 @@ final class PairingTests: XCTestCase {
         XCTAssertNil(storage.load())
     }
 }
+
+// MARK: - RelayClient на URLProtocol (реальный URLSession, сеть не нужна)
+
+final class StubURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (Int, Data))?
+    nonisolated(unsafe) static var requests: [URLRequest] = []
+    private static let lock = NSLock()
+
+    static func reset() {
+        lock.lock(); defer { lock.unlock() }
+        requests = []
+        handler = nil
+    }
+
+    static func record(_ request: URLRequest) {
+        lock.lock(); defer { lock.unlock() }
+        requests.append(request)
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.record(request)
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
+            return
+        }
+        do {
+            let (status, data) = try handler(request)
+            let response = HTTPURLResponse(
+                url: request.url!,
+                statusCode: status,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["content-type": "application/json"]
+            )!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+func makeStubSession() -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.protocolClasses = [StubURLProtocol.self]
+    return URLSession(configuration: configuration)
+}
+
+final class RelayClientTests: XCTestCase {
+    let baseURL = URL(string: "https://relay.test")!
+
+    func client(token: String = "token-1") -> RelayClient {
+        RelayClient(baseURL: baseURL, tokenProvider: { token }, session: makeStubSession())
+    }
+
+    override func setUp() {
+        super.setUp()
+        StubURLProtocol.reset()
+    }
+
+    func testFetchQuestionsBuildsQueryAndHeaders() async throws {
+        StubURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.path, "/v1/questions", "query не должен попадать в path")
+            XCTAssertEqual(request.url?.query, "limit=100")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "x-relay-version"), "1")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "authorization"), "Bearer token-1")
+            let body = #"{"questions":[{"id":"q-1","shortId":"a1b2c3d4","createdAt":"2026-11-03T18:00:00Z","expiresAt":"2026-11-03T18:30:00Z"}],"nextSince":"t1","nextId":"q-1"}"#
+            return (200, Data(body.utf8))
+        }
+
+        let questions = try await client().fetchQuestions()
+
+        XCTAssertEqual(questions.map(\.id), ["q-1"])
+        XCTAssertEqual(StubURLProtocol.requests.count, 1)
+    }
+
+    func testFetchQuestionsFollowsCursorPages() async throws {
+        let page = (0..<100).map { index in
+            #"{"id":"q-\#(index)","shortId":"a1b2c3d4","createdAt":"2026-11-03T18:00:00Z","expiresAt":"2026-11-03T18:30:00Z"}"#
+        }.joined(separator: ",")
+        StubURLProtocol.handler = { request in
+            let query = request.url?.query ?? ""
+            if query.contains("sinceId=") {
+                XCTAssertTrue(query.contains("since=t1"))
+                XCTAssertTrue(query.contains("sinceId=q-99"))
+                let body = #"{"questions":[{"id":"q-100","shortId":"deadbeef","createdAt":"2026-11-03T18:00:00Z","expiresAt":"2026-11-03T18:30:00Z"}],"nextSince":"t2"}"#
+                return (200, Data(body.utf8))
+            }
+            let body = #"{"questions":[\#(page)],"nextSince":"t1","nextId":"q-99"}"#
+            return (200, Data(body.utf8))
+        }
+
+        let questions = try await client().fetchQuestions()
+
+        XCTAssertEqual(questions.count, 101, "вторая страница не потеряна")
+        XCTAssertEqual(questions.last?.id, "q-100")
+        XCTAssertEqual(StubURLProtocol.requests.count, 2, "курсор nextSince/nextId использован")
+    }
+
+    func testAnswerGetsQuestionIdAndHandles404() async throws {
+        StubURLProtocol.handler = { request in
+            XCTAssertEqual(request.url?.path, "/v1/answers")
+            XCTAssertTrue((request.url?.query ?? "").contains("questionId=q-1"))
+            return (404, Data(#"{"error":{"code":"not-found","message":"нет ответа"}}"#.utf8))
+        }
+
+        let answer = try await client().answer(questionId: "q-1")
+
+        XCTAssertNil(answer, "404 — это «ответа ещё нет», а не ошибка")
+    }
+
+    func testServerErrorBecomesAPIError() async {
+        StubURLProtocol.handler = { _ in
+            (503, Data(#"{"error":{"code":"internal","message":"сбой","retryable":true}}"#.utf8))
+        }
+
+        do {
+            _ = try await client().fetchQuestions()
+            XCTFail("ожидалась ошибка")
+        } catch let error as RelayClientError {
+            guard case .api(let status, let code, _) = error else {
+                return XCTFail("ожидался .api, получено \(error)")
+            }
+            XCTAssertEqual(status, 503)
+            XCTAssertEqual(code, "internal")
+            XCTAssertTrue(error.isRetryable)
+        } catch {
+            XCTFail("неожиданная ошибка: \(error)")
+        }
+    }
+
+    func testParseCreatedEvent() {
+        XCTAssertEqual(
+            RelayClient.parseEvent(#"{"type":"question.created","questionId":"q-7"}"#),
+            .questionCreated(questionId: "q-7")
+        )
+    }
+}
+
+// MARK: - Закрытые и события
+
+@MainActor
+final class ClosedQuestionsTests: XCTestCase {
+    func testClosedQuestionsSurviveRestart() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("relay-closed-\(UUID().uuidString)", isDirectory: true)
+        let fileURL = dir.appendingPathComponent("closed.json")
+        let store = FileClosedQuestionsStore(fileURL: fileURL)
+        let api = FakeRelayAPI()
+        api.answerResult = .failure(RelayClientError.api(status: 503, code: "internal", message: "нет сети"))
+        api.questions = [makeQuestion()]
+        let viewModel = QuestionsViewModel(api: api, queue: tempQueue(), closedStore: store)
+        await viewModel.load()
+        await viewModel.answer(makeQuestion(), selected: ["o1"])
+        XCTAssertEqual(viewModel.closedQuestions.count, 1)
+
+        // «Перезапуск»: новый VM читает тот же файл.
+        let restarted = QuestionsViewModel(api: FakeRelayAPI(), queue: tempQueue(), closedStore: store)
+        XCTAssertEqual(restarted.closedQuestions.map(\.id), ["q-1"], "закрытые пережили перезапуск")
+        XCTAssertEqual(restarted.closedQuestions.first?.state, .answered)
+    }
+
+    func testQuestionCreatedEventRefreshesList() async throws {
+        let api = FakeRelayAPI()
+        let viewModel = QuestionsViewModel(api: api, queue: tempQueue())
+        XCTAssertEqual(api.fetchCount, 0)
+
+        viewModel.apply(event: .questionCreated(questionId: "q-9"))
+        for _ in 0..<20 {
+            await Task.yield()
+            try await Task.sleep(nanoseconds: 2_000_000)
+            if api.fetchCount > 0 { break }
+        }
+
+        XCTAssertGreaterThan(api.fetchCount, 0, "question.created обновляет список")
+    }
+}

@@ -8,7 +8,10 @@
 ## Требования
 
 - Xcode 15+ (проверено на Xcode 27.2 / Swift 6.4), iOS 17+.
-- SPM-пакет, без внешних зависимостей.
+- SPM-пакет, без внешних зависимостей. Три target — стандартная раскладка SPM:
+  `RelayKit` (логика), `RelayApp` (SwiftUI-приложение), `RelayKitTests` (тесты);
+  формулировка «один target» в карточке устарела — приложение и тесты не могут
+  жить в одном target без потери тестируемости.
 
 ## Сборка и запуск
 
@@ -47,8 +50,8 @@ TMPDIR="$PWD/.build/tmp" CLANG_MODULE_CACHE_PATH="$PWD/.build/modulecache" \
 cd apps/ios && swift test
 ```
 
-8 юнит-тестов, сеть не нужна (фейковый `RelayAPI`, временный файл очереди,
-in-memory Keychain):
+15 юнит-тестов, сеть не нужна (фейковый `RelayAPI`, `URLProtocol` для
+`RelayClient`, временные файлы, in-memory Keychain):
 
 - загрузка показывает только открытые вопросы;
 - ответ кнопкой/текстом уходит и закрывает вопрос;
@@ -56,6 +59,12 @@ in-memory Keychain):
   `idempotencyKey` (сервер не создаёт второй ответ);
 - повторный ответ до отправки заменяет первый, не меняя ключ;
 - события `question.answered`/`question.expired` закрывают вопрос;
+- `RelayClient` на `URLProtocol`: query собирается через `URLComponents`
+  (`/v1/questions?limit=100`, `/v1/answers?questionId=…`, не `%3F`), заголовки
+  `Authorization`/`X-Relay-Version`, пагинация по `nextSince`+`nextId`
+  (101 вопрос = 2 страницы), `404` — это «ответа нет», `5xx` — `RelayClientError.api`;
+- `question.created` потоком обновляет список без pull-to-refresh;
+- **закрытые вопросы переживают перезапуск** (файл `closed-questions.json`);
 - парсинг WS-событий;
 - привязка кладёт токен в Keychain, а не рядом с URL/deviceId; `unpair` чистит.
 
@@ -67,6 +76,7 @@ in-memory Keychain):
 | `Sources/RelayKit/RelayClient.swift` | HTTP (`URLSession`) + WebSocket (`URLSessionWebSocketTask`) с `Authorization` и `X-Relay-Version: 1`, переподключение с backoff 1→30 с |
 | `Sources/RelayKit/QuestionsViewModel.swift` | состояние экранов, ответ через очередь, события потока |
 | `Sources/RelayKit/OfflineQueue.swift` | файловая очередь ответов (`Application Support/pending-answers.json`), переживает перезапуск |
+| `Sources/RelayKit/ClosedStore.swift` | файл закрытых вопросов (`closed-questions.json`) — вкладка «Закрытые» не пустеет после рестарта |
 | `Sources/RelayKit/Secrets.swift` | `SecretStore`; `KeychainStore` для токена, `InMemorySecretStore` для тестов |
 | `Sources/RelayKit/Pairing.swift` | `PairingService`: `POST /v1/devices` → `POST /v1/pair` → Keychain; URL/deviceId — в `UserDefaults` |
 | `Sources/RelayApp/*` | SwiftUI: экран привязки, список вопросов, вопрос/ответ, закрытые, настройки |
@@ -83,9 +93,11 @@ in-memory Keychain):
    `POST /v1/answers`; при ошибке остаётся в очереди и повторяется при следующем
    запуске/восстановлении сети. Повтор с тем же ключом сервер считает тем же
    ответом (`200`), дубля нет.
-4. **Поток:** WebSocket `GET /v1/events` в foreground; ответ из другого канала
-   (`question.answered`) закрывает вопрос, `question.expired` переносит в
-   закрытые. При разрыве — переподключение с backoff.
+4. **Поток:** WebSocket `GET /v1/events` в foreground; `question.created`
+   обновляет список, ответ из другого канала (`question.answered`) закрывает
+   вопрос, `question.expired` переносит в закрытые. При разрыве — переподключение
+   с backoff 1→30 с (счётчик сбрасывается после первого сообщения); ping/pong
+   сервера релея обрабатывает `URLSessionWebSocketTask` автоматически.
 
 ## Ограничения MVP (осознанные)
 

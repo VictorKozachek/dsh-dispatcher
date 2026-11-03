@@ -22,14 +22,22 @@ public final class QuestionsViewModel: ObservableObject {
 
     private let api: RelayAPI
     private let queue: OfflineQueue
+    private let closedStore: ClosedQuestionsStorage
     private let now: @Sendable () -> Date
     private var answered: Set<String> = []
 
-    public init(api: RelayAPI, queue: OfflineQueue, now: @escaping @Sendable () -> Date = Date.init) {
+    public init(
+        api: RelayAPI,
+        queue: OfflineQueue,
+        closedStore: ClosedQuestionsStorage = InMemoryClosedQuestionsStore(),
+        now: @escaping @Sendable () -> Date = Date.init
+    ) {
         self.api = api
         self.queue = queue
+        self.closedStore = closedStore
         self.now = now
         pendingCount = queue.count
+        closedQuestions = closedStore.load()
     }
 
     /// Загрузить открытые вопросы; уже отвеченные (локально) не показываем повторно.
@@ -92,6 +100,10 @@ public final class QuestionsViewModel: ObservableObject {
     /// истёкший — уходит в закрытые.
     public func apply(event: RelayEvent) {
         switch event {
+        case .questionCreated:
+            // Новый вопрос пришёл потоком — подтягиваем список, чтобы он появился
+            // без pull-to-refresh.
+            Task { await self.load() }
         case .questionAnswered(let questionId):
             if let question = openQuestions.first(where: { $0.id == questionId }) {
                 markAnswered(question)
@@ -101,6 +113,7 @@ public final class QuestionsViewModel: ObservableObject {
                 var question = openQuestions.remove(at: index)
                 question.state = .expired
                 closedQuestions.insert(question, at: 0)
+                try? closedStore.save(closedQuestions)
             }
         case .other:
             break
@@ -113,6 +126,7 @@ public final class QuestionsViewModel: ObservableObject {
         var closed = question
         closed.state = .answered
         closedQuestions.insert(closed, at: 0)
+        try? closedStore.save(closedQuestions)
     }
 
     private func mergeOpen(_ questions: [RelayQuestion]) {

@@ -10,6 +10,7 @@ import Foundation
 
 /// Событие потока `/v1/events`.
 public enum RelayEvent: Equatable, Sendable {
+    case questionCreated(questionId: String)
     case questionAnswered(questionId: String)
     case questionExpired(questionId: String)
     case other(type: String)
@@ -68,20 +69,42 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
 
     // MARK: - Вопросы и ответы
 
+    /// Все открытые вопросы, постранично: курсор — `nextSince` + `nextId` (023),
+    /// поэтому страницы не теряются и не дублируются даже при одинаковом `createdAt`.
     public func fetchQuestions(since: String? = nil) async throws -> [RelayQuestion] {
-        var path = "/v1/questions?limit=100"
-        if let since, !since.isEmpty {
-            path += "&since=\(since.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? since)"
-        }
-        let data = try await request("GET", path, authorized: true)
-        let list = try decoder.decode(QuestionList.self, from: data)
-        return list.questions
+        var collected: [RelayQuestion] = []
+        var cursorSince = since
+        var cursorId: String?
+        var pages = 0
+        repeat {
+            var items = [URLQueryItem(name: "limit", value: "100")]
+            if let cursorSince, !cursorSince.isEmpty {
+                items.append(URLQueryItem(name: "since", value: cursorSince))
+            }
+            if let cursorId, !cursorId.isEmpty {
+                items.append(URLQueryItem(name: "sinceId", value: cursorId))
+            }
+            let data = try await request("GET", "/v1/questions", queryItems: items, authorized: true)
+            let page = try decoder.decode(QuestionList.self, from: data)
+            collected.append(contentsOf: page.questions)
+            pages += 1
+            let nextSince = page.nextSince
+            let nextId = page.nextId
+            guard page.questions.count >= 100, let nextSince, nextSince != cursorSince, pages < 20 else { break }
+            cursorSince = nextSince
+            cursorId = nextId
+        } while true
+        return collected
     }
 
     public func answer(questionId: String) async throws -> RelayAnswer? {
-        let query = questionId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? questionId
         do {
-            let data = try await request("GET", "/v1/answers?questionId=\(query)", authorized: true)
+            let data = try await request(
+                "GET",
+                "/v1/answers",
+                queryItems: [URLQueryItem(name: "questionId", value: questionId)],
+                authorized: true
+            )
             return try decoder.decode(RelayAnswer.self, from: data)
         } catch let error as RelayClientError {
             if case .api(status: 404, code: _, message: _) = error { return nil }
@@ -100,19 +123,20 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
     /// `GET /v1/events`: переподключение с backoff, парсинг событий.
     public func events() -> AsyncStream<RelayEvent> {
         AsyncStream { continuation in
+            let attempts = AttemptCounter()
             let task = Task {
-                var attempt = 0
                 while !Task.isCancelled {
                     do {
-                        for try await event in self.socketEvents() {
+                        for try await event in self.socketEvents(onConnected: { attempts.reset() }) {
                             if Task.isCancelled { break }
                             continuation.yield(event)
                         }
                     } catch {
                         if Task.isCancelled { break }
                     }
-                    attempt += 1
-                    let delay = min(30.0, pow(2.0, Double(min(attempt, 5))))
+                    // Backoff с 1 с (2^(attempt-1)): первая пауза короткая,
+                    // после успешного сообщения счётчик сбрасывается.
+                    let delay = attempts.nextDelay()
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 }
                 continuation.finish()
@@ -121,7 +145,7 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
         }
     }
 
-    private func socketEvents() -> AsyncThrowingStream<RelayEvent, Error> {
+    private func socketEvents(onConnected: @escaping @Sendable () -> Void) -> AsyncThrowingStream<RelayEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 var request = URLRequest(url: baseURL.appendingPathComponent("v1/events"))
@@ -135,6 +159,7 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
                 while !Task.isCancelled {
                     do {
                         let message = try await socket.receive()
+                        onConnected()
                         switch message {
                         case .string(let text):
                             if let event = Self.parseEvent(text) { continuation.yield(event) }
@@ -163,6 +188,8 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
               let type = object["type"] as? String else { return nil }
         let questionId = object["questionId"] as? String
         switch type {
+        case "question.created":
+            return questionId.map(RelayEvent.questionCreated)
         case "question.answered":
             return questionId.map(RelayEvent.questionAnswered)
         case "question.expired":
@@ -177,10 +204,18 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
     private func request(
         _ method: String,
         _ path: String,
+        queryItems: [URLQueryItem] = [],
         body: (any Encodable)? = nil,
         authorized: Bool
     ) async throws -> Data {
-        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        // Query нельзя склеивать в path: `appendingPathComponent` закодирует `?`
+        // в `%3F`, и запрос уйдёт на несуществующий путь. Только URLComponents.
+        var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)
+        if !queryItems.isEmpty { components?.queryItems = queryItems }
+        guard let url = components?.url else {
+            throw RelayClientError.invalidResponse("не удалось собрать URL для \(path)")
+        }
+        var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("1", forHTTPHeaderField: "x-relay-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -211,6 +246,25 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
         let questions: [RelayQuestion]
         let nextSince: String?
         let nextId: String?
+    }
+}
+
+/// Счётчик попыток переподключения: сбрасывается на первом сообщении WS.
+final class AttemptCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempt = 0
+
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        attempt = 0
+    }
+
+    /// 1, 2, 4, 8, 16, 30 — секунды.
+    func nextDelay() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        attempt += 1
+        let exponent = Double(min(max(attempt - 1, 0), 5))
+        return min(30.0, pow(2.0, exponent))
     }
 }
 
