@@ -28,6 +28,7 @@ import { fileURLToPath } from "node:url";
 import { createRegistry } from "./domain/registry.js";
 import { credentialRef, createCredentialAccess } from "./store.js";
 import { RELAY_TOKEN_REF } from "./transport/relay.js";
+import { createAudit } from "./audit.js";
 import { randomUUID } from "node:crypto";
 
 /** Имя ссылки на токен Telegram в `ctx.credentials` (не значение!). */
@@ -51,6 +52,7 @@ const HELP_TEXT = [
   "    --hybrid         — гибрид: вопрос уходит в GUI, если в мессенджере молчат N секунд",
   "    --no-hybrid      — выключить гибридный режим",
   "  /remote status     — привязка, режим, источник токена",
+  "  /remote audit [N]  — последние N решений по подтверждениям (по умолчанию 20)",
   "  /remote test       — отправить тестовый вопрос в мессенджер",
   "  /remote who        — сессия, воркспейс и эффективный режим",
   "  /remote doctor     — проверка привязки, канала и состояния (ok/warn/fail)",
@@ -327,6 +329,12 @@ export function createRemoteCommands({
 } = {}) {
   const registry = createRegistry({ readState: () => store.read().enabled, log });
   const credentials = createCredentialAccess(ctx, { log });
+
+  /** Журнал решений (026): читаем тот же `audit.jsonl`, куда пишет ответчик. */
+  const audit = createAudit({
+    ...(typeof store?.paths?.dir === "string" && store.paths.dir !== "" ? { dir: store.paths.dir } : {}),
+    log,
+  });
 
   /**
    * Живой транспорт канала: у фасада (005) — `current`, у обычного сервиса — он
@@ -774,6 +782,10 @@ export function createRemoteCommands({
         const health = typeof relay?.healthCheck === "function" ? await relay.healthCheck() : { ok: false, detail: "канал не поднят" };
         lines.push(`релей: ${state.bindings.url ?? "?"}, ${health.ok ? "на связи" : `нет связи (${health.detail})`}`
           + `${Number.isFinite(relay?.pending) ? `, ждёт ответа: ${relay.pending}` : ""}`);
+        const e2e = relay?.e2e ?? null;
+        lines.push(e2e === null
+          ? "e2e: выключен — тело вопроса и варианты идут открытым текстом"
+          : `e2e: включён (keyId ${e2e.keyId}, alg ${e2e.alg}) — тело вопроса и варианты шифруются`);
       } else {
         lines.push(`бот: @${state.bindings.botUsername ?? "?"} (${state.bindings.transport}), чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
       }
@@ -791,6 +803,8 @@ export function createRemoteCommands({
     if (hybridStats !== null && (hybridStats.hybridHanded > 0 || hybridStats.hybridPhoneAnswers > 0)) {
       lines.push(`гибрид-метрика: в GUI ${hybridStats.hybridHanded}, ответов из телефона после GUI ${hybridStats.hybridPhoneAnswers}`);
     }
+    const approvalAudit = audit.stats();
+    lines.push(`подтверждения: удалённо ${approvalAudit.remote}, в GUI ${approvalAudit.gui}, без ответа ${approvalAudit.timeout} (всего ${approvalAudit.total})`);
     lines.push(`режим: глобально ${state.enabled.global ? "вкл" : "выкл"}; проект ${cwd === null ? "?" : cwd} ${cwd !== null && state.enabled.workspaces[cwd] === true ? "вкл" : "выкл"}; сессия ${sessionId === null ? "?" : sessionId} ${sessionId !== null && state.enabled.sessions[sessionId] === true ? "вкл" : "выкл"}`);
     lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
 
@@ -809,6 +823,55 @@ export function createRemoteCommands({
     lines.push(lock.held ? `поллер: занят (pid ${lock.holder?.pid ?? "?"})` : "поллер: свободен");
 
     return success(lines.join("\n"));
+  }
+
+  /** Один формат решения для `/remote audit`: время, инструмент, исход, откуда. */
+  function auditLine(entry) {
+    const date = new Date(typeof entry.ts === "string" ? entry.ts : "");
+    const time = Number.isNaN(date.getTime())
+      ? "??:??:??"
+      : [date.getHours(), date.getMinutes(), date.getSeconds()]
+        .map((part) => String(part).padStart(2, "0"))
+        .join(":");
+    const decision = entry.decision === "remote"
+      ? "удалённо"
+      : entry.decision === "gui"
+        ? "GUI"
+        : entry.decision === "late" ? "поздний" : "таймаут";
+    const parts = [time, entry.toolName ?? "?", entry.outcome ?? "?", decision];
+    if (typeof entry.channel === "string" && entry.channel !== "") parts.push(entry.channel);
+    if (typeof entry.answeredBy === "string" && entry.answeredBy !== "") parts.push(`ответил ${entry.answeredBy}`);
+    if (Number.isFinite(entry.waitedMs)) parts.push(`ждали ${Math.round(entry.waitedMs / 1000)} с`);
+    if (typeof entry.callId === "string" && entry.callId !== "") parts.push(`call ${entry.callId}`);
+    return `  ${parts.join(" · ")}`;
+  }
+
+  /**
+   * `/remote audit [N]` — последние N решений по подтверждениям (по умолчанию 20).
+   *
+   * Читает append-only журнал `audit.jsonl` (026) и печатает только метаданные:
+   * инструмент, исход, откуда решено. Секретов и тел команд там нет по построению
+   * (см. `lib/audit.js`), поэтому печатать можно как есть.
+   */
+  function auditCommand(rest) {
+    const raw = Array.isArray(rest) ? rest[0] : undefined;
+    let limit = 20;
+    if (raw !== undefined && raw !== "") {
+      const parsed = Number.parseInt(String(raw), 10);
+      if (!Number.isFinite(parsed) || parsed <= 0) {
+        return failure("usage: /remote audit [N], где N — целое больше нуля");
+      }
+      limit = Math.min(parsed, 200);
+    }
+    const entries = audit.tail(limit);
+    if (entries.length === 0) {
+      return success("журнал подтверждений пуст: удалённых решений ещё не было");
+    }
+    const summary = audit.stats();
+    return success([
+      `Последние ${entries.length} из ${summary.total} решений по подтверждениям:`,
+      ...entries.map(auditLine),
+    ].join("\n"));
   }
 
   /** `/remote test` — отправить тестовый вопрос через живой транспорт. */
@@ -1035,6 +1098,8 @@ export function createRemoteCommands({
           return await setMode(invocation, false, flags);
         case "status":
           return await status(invocation);
+        case "audit":
+          return auditCommand(rest);
         case "test":
           return await testChannel(invocation);
         case "who":

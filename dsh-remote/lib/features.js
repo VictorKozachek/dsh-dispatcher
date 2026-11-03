@@ -17,11 +17,10 @@
  *   deps.get(name)  — сервис из ctx или null, без исключений;
  *   deps.onDispose  — снятие ресурсов фичи при выгрузке плагина.
  *
- * Пока подключены три фичи: транспорт (`./features/telegram.js`), команды
- * (`./features/commands.js`) и ответчик (`./features/answerer.js`). **Порядок
- * важен**: ответчик объявляет `needs: [remoteTransport]`, а каркас проверяет
- * сервисы по порядку реестра, поэтому транспорт должен зарегистрироваться
- * раньше. Каркас дожидается каждой фичи (`apply` асинхронный), так что
+ * Сейчас подключены: команды, каналы (telegram/max/relay), устойчивость,
+ * ответчик вопросов, ответчик подтверждений (024) и панель. **Порядок важен**:
+ * ответчики объявляют `needs: [remoteTransport]`, а каркас проверяет сервисы по
+ * порядку реестра, поэтому транспорт должен зарегистрироваться раньше. Каркас дожидается каждой фичи (`apply` асинхронный), так что
  * асинхронная привязка бота успевает появиться до проверки `needs`.
  * Без привязки (ни config.telegram, ни сохранённого состояния) транспорт спит —
  * вопрос уходит в GUI, как и раньше; `/remote connect` заводит привязку.
@@ -31,6 +30,7 @@ import { maxFeature } from "./features/max.js";
 import { telegramFeature } from "./features/telegram.js";
 import { reliabilityFeature } from "./features/reliability.js";
 import { answererFeature } from "./features/answerer.js";
+import { approvalsFeature } from "./features/approvals.js";
 import { notifyFeature } from "./features/notify.js";
 import { relayFeature } from "./features/relay.js";
 import { panelFeature } from "./features/panel.js";
@@ -44,6 +44,7 @@ export const features = [
   telegramFeature,
   reliabilityFeature,
   answererFeature,
+  approvalsFeature,
   relayFeature,
   notifyFeature,
   panelFeature,
