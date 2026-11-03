@@ -312,7 +312,7 @@ test("TTL: транспорт без правки (caps.editAfterAnswer=false) �
   assert.deepEqual(transport.sent[0].question.options, []);
 });
 
-test("TTL: с правкой, но без метода editQuestion новое сообщение не шлётся", async (t) => {
+test("TTL: без метода правки и с caps=true новое напоминание всё равно уходит", async (t) => {
   const clock = fakeClock();
   const transport = fakeTransport({ edit: false }); // caps.editAfterAnswer остаётся true
   const { reliability } = makeReliability(t, { clock, transport });
@@ -322,7 +322,66 @@ test("TTL: с правкой, но без метода editQuestion новое �
   clock.advance(10 * 60 * 1000 - REMINDER_MS);
   await reliability.tick();
 
-  assert.equal(transport.sent.length, 0, "§7.3: никакого нового уведомления, когда правка ожидается");
+  assert.equal(transport.sent.length, 1, "карточка п.2: не умеет править — короткое новое сообщение");
+  assert.match(transport.sent[0].question.body, /⏳ осталось 5 минут/);
+});
+
+test("TTL: правка вернула false — напоминание уходит новым сообщением", async (t) => {
+  const clock = fakeClock();
+  const transport = fakeTransport();
+  let editCalls = 0;
+  transport.editQuestion = async () => {
+    editCalls += 1;
+    return false; // сообщения нет в памяти (например, после рестарта)
+  };
+  const { reliability } = makeReliability(t, { clock, transport });
+  const question = openQuestion({ ttlMs: 10 * 60 * 1000, now: 0 });
+  reliability.watch(question);
+
+  clock.advance(10 * 60 * 1000 - REMINDER_MS);
+  await reliability.tick();
+
+  assert.equal(editCalls, 1, "правку пробовали");
+  assert.equal(transport.sent.length, 1, "и упали в новое сообщение, а не потеряли напоминание");
+});
+
+test("TTL: фасад без канала (editQuestion -> undefined) — напоминание не теряется молча", async (t) => {
+  const clock = fakeClock();
+  const sent = [];
+  const facade = {
+    id: "telegram",
+    caps: { editAfterAnswer: true },
+    editQuestion: () => undefined, // фасад без current
+    sendQuestion: async (question) => {
+      sent.push(question);
+      return { messageId: 1 };
+    },
+    closeQuestion: async () => {},
+  };
+  const { reliability } = makeReliability(t, { clock, transport: facade });
+  const question = openQuestion({ ttlMs: 10 * 60 * 1000, now: 0 });
+  reliability.watch(question);
+
+  clock.advance(10 * 60 * 1000 - REMINDER_MS);
+  await reliability.tick();
+
+  assert.equal(sent.length, 1, "напоминание доставлено новым сообщением");
+});
+
+test("TTL: пометка «⌛» невозможна — закрываем и фиксируем в журнале", async (t) => {
+  const clock = fakeClock();
+  const transport = fakeTransport({ edit: false });
+  const { reliability, files } = makeReliability(t, { clock, transport });
+  const question = openQuestion({ ttlMs: 1000, now: 0 });
+  const outcomes = [];
+  reliability.watch(question, { onExpire: (info) => outcomes.push(info) });
+
+  clock.advance(1001);
+  await reliability.tick();
+
+  assert.equal(transport.closed.length, 1, "кнопки сняты, даже если пометить нельзя");
+  assert.equal(outcomes.length, 1, "исход истечения применён");
+  assert.match(fs.readFileSync(files.log, "utf8"), /expire-unmarked/);
 });
 
 test("сторож включается через setInterval с unref и выключается", () => {

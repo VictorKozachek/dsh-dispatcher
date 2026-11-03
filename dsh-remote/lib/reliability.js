@@ -618,10 +618,9 @@ export function createReliability({
         logger(`уведомление ${question.shortId}: правка не удалась (${error?.message ?? error})`);
       }
     }
-    // Новое сообщение вместо правки разрешено только там, где правка невозможна
-    // по возможностям транспорта (caps.editAfterAnswer === false).
-    const caps = transport?.caps ?? {};
-    if (caps.editAfterAnswer === false && typeof transport?.sendQuestion === "function") {
+    // Если правка не удалась (нет метода, вернул не `true`, фасад без канала) —
+    // карточка требует короткое новое сообщение. Не теряем напоминание молча.
+    if (typeof transport?.sendQuestion === "function") {
       try {
         await transport.sendQuestion({
           shortId: randomUUID().slice(0, 8),
@@ -686,10 +685,20 @@ export function createReliability({
         question.expire?.(now());
         // §7.3: по TTL сообщение помечается «⌛ ждёт ответа», и только потом
         // снимаются кнопки. Silent-close сам текст не меняет.
+        let marked = false;
         try {
-          await withTimeout(Promise.resolve(transport?.editQuestion?.(question, "⌛ ждёт ответа")), notifyTimeoutMs);
+          marked = (await withTimeout(
+            Promise.resolve(transport?.editQuestion?.(question, "⌛ ждёт ответа")),
+            notifyTimeoutMs,
+          )) === true;
         } catch (error) {
           logger(`TTL: пометка вопроса ${shortId} не удалась (${error?.message ?? error})`);
+        }
+        if (!marked) {
+          // Пометка невозможна (нет editQuestion / фасад без канала): сообщение
+          // всё равно закрываем, но фиксируем это, чтобы не выглядело как норма.
+          journal.append({ event: "expire-unmarked", shortId });
+          logger(`TTL: транспорт не умеет править сообщение ${shortId} — пометка «⌛» не поставлена`);
         }
         try {
           // Зависшая правка не должна блокировать сторож: ограничиваем время.
