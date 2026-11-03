@@ -110,7 +110,9 @@ function truncateText(text, limit) {
   const max = Math.floor(Number(limit));
   if (!Number.isFinite(max) || max <= 0) return "";
   if (source.length <= max) return source;
-  const room = Math.max(0, max - TRUNCATION_MARKER.length);
+  // Лимит меньше маркера: режем сам маркер, иначе ответ вылезет за caps.maxText.
+  if (max <= TRUNCATION_MARKER.length) return TRUNCATION_MARKER.slice(0, max);
+  const room = max - TRUNCATION_MARKER.length;
   let head = source.slice(0, room);
   const last = head.charCodeAt(head.length - 1);
   if (last >= 0xd800 && last <= 0xdbff) head = head.slice(0, -1);
@@ -159,7 +161,10 @@ function normalizeIncoming(answer) {
   }
 
   if (typeof answer.text === "string") incoming.text = answer.text;
-  const reply = answer.replyToMessageId ?? answer.replyToMessage_id;
+  const reply = answer.replyToMessageId
+    ?? answer.reply_to_message_id
+    ?? answer.reply_to_message?.message_id
+    ?? answer.replyToMessage?.message_id;
   if (reply !== undefined && reply !== null) incoming.replyToMessageId = reply;
   if (answer.answeredBy !== undefined && answer.answeredBy !== null) incoming.answeredBy = answer.answeredBy;
   return incoming;
@@ -247,6 +252,17 @@ export function routeIncoming({ transport, answer, store, log = noop, now = Date
       return "ignored";
     }
 
+    // Транспорт (004) уже разрешил reply/единственный вопрос и прислал shortId:
+    // явное указание важнее любых эвристик ниже.
+    if (incoming.shortId !== null) {
+      const question = store.get(incoming.shortId);
+      if (question === null) {
+        log(`текст для ${incoming.shortId}: вопроса нет — игнор`);
+        return "ignored";
+      }
+      return acceptText(store, question, text, incoming.answeredBy, now(), log);
+    }
+
     if (incoming.replyToMessageId !== null) {
       const question = store.byMessageId(incoming.replyToMessageId);
       if (question === null) {
@@ -288,15 +304,30 @@ export function routeIncoming({ transport, answer, store, log = noop, now = Date
  *
  * @returns {string} строки через перевод строки; пустой список — пустая строка.
  */
-export function describeOpen(questions = []) {
+export function describeOpen(questions = [], { contextOf = null } = {}) {
   const list = (Array.isArray(questions) ? questions : []).filter((question) => question !== null && typeof question === "object");
   return list.map((question, index) => {
-    const workspace = typeof question.workspace === "string" && question.workspace !== ""
-      ? path.basename(question.workspace)
+    // Вопрос домена (002) несёт только sessionId/workspace: роль и задача живут в
+    // контексте (006, `resolveContext`). Резолвер инжектируется, чтобы 007 не
+    // копировал чтение шапки сессии и .kanban.
+    let context = {};
+    if (typeof contextOf === "function") {
+      try {
+        context = contextOf(question) ?? {};
+      } catch {
+        context = {};
+      }
+    }
+    const workspaceSource = typeof question.workspace === "string" && question.workspace !== ""
+      ? question.workspace
+      : context.workspace;
+    const workspace = typeof workspaceSource === "string" && workspaceSource !== ""
+      ? path.basename(workspaceSource)
       : null;
-    const task = question.taskId === null || question.taskId === undefined || question.taskId === ""
+    const taskSource = question.taskId ?? context.taskId;
+    const task = taskSource === null || taskSource === undefined || taskSource === ""
       ? null
-      : `task ${question.taskId}`;
+      : `task ${taskSource}`;
     const where = [workspace, task].filter((part) => part !== null).join(" · ");
     const body = truncateText(String(question.body ?? "").replace(/\s+/g, " ").trim(), DESCRIBE_BODY_LIMIT);
     return `${index + 1}. ${where === "" ? "" : `${where} — `}«${body}»`;

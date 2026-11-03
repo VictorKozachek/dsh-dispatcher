@@ -229,11 +229,12 @@ test("describeOpen: номера, воркспейс, задача; без во�
   assert.equal(describeOpen(null), "");
 });
 
-test("текст от чужого пользователя не доходит до маршрутизации (allowlist 004)", async () => {
-  const question = openQuestion();
-  const store = createQuestionStore([question]);
+test("текст от чужого пользователя не доходит до роутинга, от своего — попадает (004)", async () => {
+  const first = openQuestion({ id: "q1" });
+  const store = createQuestionStore([first]);
   const routed = [];
-  let polls = [];
+  const polls = [];
+  let sent = 0;
 
   const fetchImpl = async (url, init = {}) => {
     const method = url.split("/").pop();
@@ -247,7 +248,8 @@ test("текст от чужого пользователя не доходит 
         }, { once: true });
       });
     }
-    return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1, username: "test_bot" } }; } };
+    sent += 1;
+    return jsonResponse({ ok: true, result: { message_id: 100 + sent, username: "test_bot" } });
   };
 
   const transport = createTelegramTransport({
@@ -261,50 +263,119 @@ test("текст от чужого пользователя не доходит 
     log: () => {},
     persistOffset: () => {},
   });
-  transport.onAnswer((answer) => routed.push(routeIncoming({ transport, answer, store, log: () => {}, now: () => NOW })));
+  transport.onAnswer((answer) => routed.push(routeIncoming({ transport, answer, store, now: () => NOW })));
 
   const settle = async () => {
     for (let index = 0; index < 4; index += 1) await new Promise((resolve) => setImmediate(resolve));
   };
 
+  // Вопрос отправлен транспортом — только тогда он знает, к какому вопросу
+  // относится свободный текст (единственный открытый).
+  await transport.sendQuestion(first);
   await transport.start();
   await settle();
 
-  // Чужой пользователь: транспорт обязан отбросить апдейт до роутинга.
-  polls.shift()(jsonResponse({
+  const textUpdate = (updateId, from, text, replyTo) => jsonResponse({
     ok: true,
     result: [{
-      update_id: 1,
-      callback_query: {
-        id: "cb1",
-        from: { id: 99 },
-        message: { chat: { id: 42 } },
-        data: callbackData(question.shortId, "o1"),
+      update_id: updateId,
+      message: {
+        from: { id: from },
+        chat: { id: 42 },
+        text,
+        ...(replyTo === undefined ? {} : { reply_to_message: { message_id: replyTo } }),
       },
     }],
-  }));
-  await settle();
-  assert.deepEqual(routed, [], "чужой ответ не дошёл до роутинга");
-  assert.equal(question.isOpen, true);
+  });
 
-  // Свой пользователь: тот же ответ проходит и попадает в вопрос.
-  polls.shift()(jsonResponse({
-    ok: true,
-    result: [{
-      update_id: 2,
-      callback_query: {
-        id: "cb2",
-        from: { id: 7 },
-        message: { chat: { id: 42 } },
-        data: callbackData(question.shortId, "o1"),
-      },
-    }],
-  }));
+  polls.shift()(textUpdate(1, 99, "чужой текст"));
   await settle();
+  assert.deepEqual(routed, [], "чужой текст отброшен allowlist'ом 004");
+  assert.equal(first.isOpen, true);
 
-  assert.equal(routed.length, 1);
-  assert.equal(routed[0].answer.selected[0], "Да");
-  assert.equal(question.isOpen, false);
+  polls.shift()(textUpdate(2, 7, "свой текст"));
+  await settle();
+  assert.equal(routed.length, 1, "свой текст дошёл до роутинга");
+  assert.equal(routed[0].question, first);
+  assert.equal(routed[0].answer.custom, "свой текст");
+  assert.equal(first.isOpen, false);
+
+  // reply на сообщение вопроса — тоже через 004.
+  const second = openQuestion({ id: "q2" });
+  store.add(second);
+  const sentSecond = await transport.sendQuestion(second);
+  polls.shift()(textUpdate(3, 7, "ответ реплаем", sentSecond.messageId));
+  await settle();
+  assert.equal(routed.length, 2);
+  assert.equal(routed[1].question, second, "reply адресован второму вопросу");
+  assert.equal(second.isOpen, false);
 
   await transport.stop();
+});
+
+// --- регрессии по ревью 007 -------------------------------------------------
+
+test("текст с явным shortId адресует именно этот вопрос (двух открытых)", () => {
+  const first = openQuestion({ id: "q1" });
+  const second = openQuestion({ id: "q2", workspace: "/p/other" });
+  const store = createQuestionStore([first, second]);
+
+  const result = router(store)({ shortId: second.shortId, text: "во второй" });
+
+  assert.equal(result.question, second);
+  assert.deepEqual(result.answer, { id: "q2", selected: [], custom: "во второй" });
+  assert.equal(first.isOpen, true, "первый вопрос не тронут");
+});
+
+test("текст с shortId не уезжает в вопрос, ждущий «Другой ответ…»", () => {
+  const waiting = openQuestion({ id: "q3" });
+  const target = openQuestion({ id: "q4" });
+  const store = createQuestionStore([waiting, target]);
+  const route = router(store);
+  route({ callbackData: callbackData(waiting.shortId, FREE_TEXT_OPTION) });
+
+  const result = route({ shortId: target.shortId, text: "в четвёртый" });
+
+  assert.equal(result.question, target);
+  assert.equal(waiting.isOpen, true);
+});
+
+test("reply в snake_case и вложенный reply_to_message тоже понимаются", () => {
+  const first = openQuestion({ id: "q1" });
+  const second = openQuestion({ id: "q2" });
+  const store = createQuestionStore([first, second]);
+  store.registerMessage(500, second.shortId);
+  const route = router(store);
+
+  assert.equal(route({ text: "snake", reply_to_message_id: 500 }).question, second);
+
+  const nested = openQuestion({ id: "q3" });
+  store.add(nested);
+  store.registerMessage(600, nested.shortId);
+  assert.equal(route({ text: "nested", reply_to_message: { message_id: 600 } }).question, nested);
+});
+
+test("малый caps.maxText: ответ не вылезает за лимит", () => {
+  const question = openQuestion();
+  const store = createQuestionStore([question]);
+
+  for (const maxText of [5, 8]) {
+    const fresh = openQuestion({ id: `q-${maxText}` });
+    store.add(fresh);
+    const result = router(store, { caps: { maxText } })({ shortId: fresh.shortId, text: "я".repeat(100) });
+    assert.ok(result.answer.custom.length <= maxText, `при maxText ${maxText} длина ${result.answer.custom.length}`);
+  }
+});
+
+test("describeOpen: вопрос из 002 без taskId — контекст подставляется резолвером", () => {
+  const question = openQuestion({ id: "q1" });
+  assert.equal(question.taskId, null, "домен 002 задачу не знает");
+
+  const bare = describeOpen([question]);
+  assert.doesNotMatch(bare, /task /, "без контекста задачи нет — это ожидаемо");
+
+  const withContext = describeOpen([question], {
+    contextOf: () => ({ workspace: "/p/dsh-dispatcher", taskId: "007" }),
+  });
+  assert.match(withContext, /^1\. dsh-dispatcher · task 007 — «Вопрос q1»/);
 });
