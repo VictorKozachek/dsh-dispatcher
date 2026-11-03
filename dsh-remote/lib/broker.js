@@ -127,11 +127,22 @@ export function createBroker({
         if (signal?.aborted === true) return { transport, ok: false, reason: "aborted" };
         const result = await deliverOne(transport, question, { signal, chatId, threadId, channelFor });
         if (!result.ok) {
+          try {
+            metrics?.inc?.("deliveries.failed");
+            metrics?.transportError?.(transport.id);
+          } catch {
+            /* метрики не должны ронять доставку */
+          }
           log(`broker: канал ${transport.id} не доставил вопрос ${question.shortId}`
             + `${result.reason === undefined ? "" : ` (${result.reason})`}`);
           return { transport, ...result };
         }
         question.addDelivery({ transport: transport.id, messageId: result.messageId, chatId: result.chatId });
+        try {
+          metrics?.inc?.("deliveries.sent");
+        } catch {
+          /* метрики не должны ронять доставку */
+        }
         return { transport, ok: true };
       }),
     );
