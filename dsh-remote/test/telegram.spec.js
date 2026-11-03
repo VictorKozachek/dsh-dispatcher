@@ -597,8 +597,9 @@ test("плагин: async apply -> remoteTransport -> answerer подписан 
   const transportEntries = provided.filter((entry) => entry.name === "remoteTransport");
   assert.equal(transportEntries.length, 1, "транспорт зарегистрирован ровно один раз");
   assert.ok(provided.some((entry) => entry.name === "remoteStore"), "состояние зарегистрировано как сервис");
-  const transport = transportEntries[0].service;
-  assert.equal(transport.polling, true, "поллинг запущен после async-привязки");
+  const facade = transportEntries[0].service;
+  assert.equal(facade.current?.polling, true, "поллинг запущен после async-привязки");
+  const transport = facade.current;
 
   // Главное: ответчик не пропущен — его needs увидел сервис, подписка встала.
   const listeners = hooks.get("user-questions/request") ?? [];
@@ -620,16 +621,17 @@ test("фича telegram заявляет имя и не требует серв�
 test("выгрузка во время credentials.resolve: поллинг не поднимается", async () => {
   let releaseResolve;
   const provided = [];
-  const ctx = { provide: (name, service) => provided.push({ name, service }) };
-  const { deps, disposers } = fakeDeps({
-    services: {
-      credentials: {
+  const ctx = {
+    provide: (name, service) => provided.push({ name, service }),
+    get: (name) => (name === "credentials"
+      ? {
         resolve: () => new Promise((resolve) => {
           releaseResolve = resolve;
         }),
-      },
-    },
-  });
+      }
+      : null),
+  };
+  const { deps, disposers } = fakeDeps();
 
   const pending = telegramFeature.apply(
     ctx,
@@ -661,11 +663,9 @@ test("фича telegram без привязки спит: ни транспор�
 test("фича telegram без токена в credentials спит с предупреждением", async () => {
   const ctx = {
     provide: () => assert.fail("без токена сервис не регистрируется"),
+    get: (name) => (name === "credentials" ? { resolve: async () => undefined } : null),
   };
-  const { deps, logs, disposers } = fakeDeps({
-    // Настоящий провайдер: асинхронный resolve -> {value, source} | undefined.
-    services: { credentials: { resolve: async () => undefined } },
-  });
+  const { deps, logs, disposers } = fakeDeps();
 
   await telegramFeature.apply(ctx, { telegram: { tokenRef: "tg", chatId: 42 } }, deps);
 
@@ -676,10 +676,9 @@ test("фича telegram без токена в credentials спит с пред�
 test("фича telegram без chatId спит с предупреждением", async () => {
   const ctx = {
     provide: () => assert.fail("без chatId сервис не регистрируется"),
+    get: (name) => (name === "credentials" ? { resolve: async () => ({ value: "123456:TEST-TOKEN", source: "file" }) } : null),
   };
-  const { deps, logs } = fakeDeps({
-    services: { credentials: { resolve: async () => ({ value: "123456:TEST-TOKEN", source: "file" }) } },
-  });
+  const { deps, logs } = fakeDeps();
 
   await telegramFeature.apply(ctx, { telegram: { tokenRef: "tg" } }, deps);
 
@@ -844,4 +843,49 @@ test("зависшая правка сообщения не задерживае
   assert.deepEqual(result.answers, [{ id: "q1", selected: ["Да"] }], "ответ пришёл, несмотря на зависшую правку");
   assert.equal(closeCalls, 1, "правку всё же попросили");
   await transport.stop();
+});
+
+test("фича telegram: config + токен в окружении без ctx.credentials", async (t) => {
+  /** getUpdates висит, пока не отменят: транспорт должен подняться и не мешать тесту. */
+  const hangingTelegramFetch = async (url, init = {}) => {
+    const method = url.split("/").pop();
+    if (method === "getUpdates") {
+      return new Promise((resolve, reject) => {
+        init.signal?.addEventListener?.("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    }
+    return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1, username: "test_bot" } }; } };
+  };
+  const tokenRef = "DSH_REMOTE_TEST_TOKEN";
+  const previous = process.env[tokenRef];
+  process.env[tokenRef] = "123456:TEST-TOKEN";
+  t.after(() => {
+    if (previous === undefined) delete process.env[tokenRef];
+    else process.env[tokenRef] = previous;
+  });
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = hangingTelegramFetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const provided = [];
+  const ctx = {
+    provide: (name, service) => provided.push({ name, service }),
+    // ctx.credentials нет вовсе — токен должен прийти из окружения.
+    get: () => null,
+  };
+  const { deps } = fakeDeps();
+
+  await telegramFeature.apply(ctx, { telegram: { tokenRef, chatId: 42, allowedUserIds: [7] } }, deps);
+
+  const entry = provided.find((item) => item.name === "remoteTransport");
+  assert.ok(entry, "транспорт поднят из env-fallback");
+  assert.equal(entry.service.polling, true);
+  await entry.service.stop();
 });

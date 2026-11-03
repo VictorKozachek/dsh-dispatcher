@@ -40,9 +40,11 @@ export const STATE_SERVICE = "remoteStore";
  */
 function createTransportFacade() {
   let current = null;
+  /** Отписки подписчиков на текущем транспорте (чтобы снимать их при подмене). */
+  const offs = new Map();
   const subscribers = new Set();
 
-  return {
+  const facade = {
     id: "telegram",
     get caps() {
       return current?.caps ?? DEFAULT_CAPS;
@@ -51,17 +53,43 @@ function createTransportFacade() {
     get current() {
       return current;
     },
+    /** Маркер для фичи telegram (004): «я — фасад, положи транспорт внутрь». */
+    __isTransportFacade: true,
     set(transport) {
-      current = transport;
-      for (const handler of subscribers) transport?.onAnswer?.(handler);
+      // Сначала снимаем подписки со старого транспорта, потом подписываем на новый.
+      for (const off of offs.values()) {
+        try {
+          off?.();
+        } catch {
+          /* отписка не должна мешать подмене */
+        }
+      }
+      offs.clear();
+      current = transport ?? null;
+      for (const handler of subscribers) {
+        offs.set(handler, current?.onAnswer?.(handler) ?? null);
+      }
     },
     clear() {
-      current = null;
+      facade.set(null);
     },
-    sendQuestion: (question, options) => current?.sendQuestion?.(question, options),
-    closeQuestion: (question, summary) => current?.closeQuestion?.(question, summary),
-    editQuestion: (question, text) => current?.editQuestion?.(question, text),
-    start: () => current?.start?.(),
+    sendQuestion(question, options) {
+      if (current === null || typeof current.sendQuestion !== "function") {
+        // Не no-op: иначе ответчик решит, что вопрос отправлен, и будет ждать ответ
+        // вечно. Ошибка уводит вопрос в GUI через next().
+        throw new Error("канал не поднят: /remote connect");
+      }
+      return current.sendQuestion(question, options);
+    },
+    closeQuestion(question, summary) {
+      return current?.closeQuestion?.(question, summary);
+    },
+    editQuestion(question, text) {
+      return current?.editQuestion?.(question, text);
+    },
+    start() {
+      return current?.start?.() ?? false;
+    },
     async stop() {
       const transport = current;
       current = null;
@@ -70,12 +98,20 @@ function createTransportFacade() {
     healthCheck: () => current?.healthCheck?.() ?? { ok: false, detail: "транспорт не поднят" },
     onAnswer(handler) {
       subscribers.add(handler);
-      current?.onAnswer?.(handler);
+      offs.set(handler, current?.onAnswer?.(handler) ?? null);
       return () => {
         subscribers.delete(handler);
+        const off = offs.get(handler);
+        offs.delete(handler);
+        try {
+          off?.();
+        } catch {
+          /* уже отписан */
+        }
       };
     },
   };
+  return facade;
 }
 
 /**
@@ -90,7 +126,11 @@ async function ensureTransport(ctx, store, deps, facade, isDisposed = () => fals
   const binding = store.read().bindings;
 
   if (binding === null || binding.transport !== "telegram") {
-    if (facade.current !== null) await facade.stop();
+    // Канал из config.telegram (004) мы не создавали — его не гасим: без привязки
+    // в состоянии он и есть рабочий канал.
+    const adopted = facade.current;
+    if (adopted !== null && adopted.__bindingKey === undefined) return adopted;
+    if (adopted !== null) await facade.stop();
     return null;
   }
 
@@ -156,29 +196,41 @@ export const commandsFeature = {
       deps.logger.warn(`фича commands: сервис ${STATE_SERVICE} не зарегистрирован (${error?.message ?? error})`);
     }
 
-    // Свой фасад — только если канал не поднят конфигом профиля (004).
-    let facade = null;
-    if ((ctx?.get?.(TRANSPORT_SERVICE) ?? null) === null) {
-      facade = createTransportFacade();
+    // Фасад регистрируем всегда: он же управляет каналом из config.telegram (004),
+    // который фича telegram положит внутрь (adopt), а connect/disconnect смогут
+    // остановить и заменить.
+    const existing = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
+    const facade = existing?.__isTransportFacade === true ? existing : createTransportFacade();
+    if (existing !== null && existing !== facade) facade.set(existing);
+    if (existing === null || existing !== facade) {
       try {
         ctx.provide?.(TRANSPORT_SERVICE, facade);
       } catch (error) {
-        facade = null;
         deps.logger.warn(`фича commands: сервис ${TRANSPORT_SERVICE} не зарегистрирован (${error?.message ?? error})`);
       }
     }
+    // Выгрузка плагина: подписки снимаются, поллинг останавливается.
+    deps.onDispose(() => {
+      void facade.stop();
+    });
 
     /** Ответчик уже применён (каркасом или нами) — второй раз не подписываем. */
     let answererReady = false;
 
-    const ensure = async () => {
+    /** Стартовый подъём канала: ответчика применит каркас (порядок фич). */
+    const ensureAtStart = async () => {
       if (disposed) return null;
-      if (facade === null) return ctx?.get?.(TRANSPORT_SERVICE) ?? null;
       const transport = await ensureTransport(ctx, store, deps, facade, () => disposed);
       if (disposed) {
         await facade.stop();
         return null;
       }
+      return transport;
+    };
+
+    /** Хук для connect: канал поднимаем и ответчика применяем сразу, если ещё нет. */
+    const ensure = async () => {
+      const transport = await ensureAtStart();
       if (transport !== null && !answererReady) {
         answererReady = true;
         await answererFeature.apply(ctx, config, deps);
@@ -186,12 +238,13 @@ export const commandsFeature = {
       return transport;
     };
 
-    const remote = createRemoteCommands({ ctx, store, log, ensureTransport: ensure });
+    const currentChannel = () => facade.current;
+    const remote = createRemoteCommands({ ctx, store, log, ensureTransport: ensure, currentChannel });
     deps.onDispose(remote.register());
 
     // Привязка из прошлого запуска: поднимаем канал до того, как каркас дойдёт до
     // фичи ответчика, — её `needs` уже будут выполнены.
-    const transport = await ensure();
+    const transport = await ensureAtStart();
     if (transport !== null) answererReady = true;
 
     deps.logger.info("фича commands: /remote зарегистрирована");

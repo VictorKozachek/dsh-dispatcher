@@ -11,6 +11,7 @@
  */
 
 import { createTelegramTransport } from "../transport/telegram.js";
+import { createCredentialAccess } from "../store.js";
 
 /** Имя сервиса транспорта в контексте плагина. */
 export const TRANSPORT_SERVICE = "remoteTransport";
@@ -25,18 +26,12 @@ export const TRANSPORT_SERVICE = "remoteTransport";
  * фейки в тестах и будущие провайдеры могут отличаться, а токен в конфиге
  * профиля не лежит — там только `tokenRef`.
  */
-async function resolveToken(settings, deps) {
+async function resolveToken(settings, ctx, deps) {
   if (typeof settings.tokenRef !== "string" || settings.tokenRef === "") return null;
-  const credentials = deps.get("credentials");
-  if (credentials === null || typeof credentials?.resolve !== "function") return null;
-  try {
-    const resolved = await credentials.resolve(settings.tokenRef);
-    if (typeof resolved === "string" && resolved !== "") return resolved;
-    if (typeof resolved?.value === "string" && resolved.value !== "") return resolved.value;
-  } catch (error) {
-    deps.logger.warn(`фича telegram: токен не прочитан (${error?.message ?? error})`);
-  }
-  return null;
+  // Общий доступ к секретам (005): ctx.credentials с fallback на окружение.
+  const credentials = createCredentialAccess(ctx, { log: (message) => deps.logger.debug(message) });
+  if (!credentials.availableFor(settings.tokenRef)) return null;
+  return credentials.resolve(settings.tokenRef);
 }
 
 export const telegramFeature = {
@@ -55,7 +50,7 @@ export const telegramFeature = {
       return;
     }
 
-    const token = await resolveToken(settings, deps);
+    const token = await resolveToken(settings, ctx, deps);
     if (disposed) {
       deps.logger.debug("фича telegram: плагин выгружен во время чтения токена — не запускаю");
       return;
@@ -84,8 +79,16 @@ export const telegramFeature = {
     }
 
     try {
-      ctx.provide?.(TRANSPORT_SERVICE, transport);
-      deps.logger.info("фича telegram: транспорт зарегистрирован как remoteTransport");
+      const facade = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
+      if (facade !== null && facade.__isTransportFacade === true) {
+        // Фича commands (005) уже держит фасад: кладём транспорт внутрь, чтобы
+        // connect/disconnect могли его заменить и остановить.
+        facade.set(transport);
+        deps.logger.info("фича telegram: транспорт положен в фасад remoteTransport");
+      } else {
+        ctx.provide?.(TRANSPORT_SERVICE, transport);
+        deps.logger.info("фича telegram: транспорт зарегистрирован как remoteTransport");
+      }
     } catch (error) {
       deps.logger.warn(`фича telegram: сервис ${TRANSPORT_SERVICE} не зарегистрирован (${error?.message ?? error})`);
     }

@@ -115,9 +115,28 @@ export function createRemoteCommands({
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   pairingTtlMs = PAIRING_TTL_MS,
   ensureTransport = null,
+  /** Живой транспорт канала (фасад): null, если канала нет. */
+  currentChannel = null,
+  testAnswerTimeoutMs = 30 * 60 * 1000,
+  setTimeout: setTimeoutImpl = setTimeout,
 } = {}) {
   const registry = createRegistry({ readState: () => store.read().enabled, log });
   const credentials = createCredentialAccess(ctx, { log });
+
+  /**
+   * Живой транспорт канала: у фасада (005) — `current`, у обычного сервиса — он
+   * сам. `null` значит «канала нет»: отправлять некуда, вопрос должен уйти в GUI.
+   */
+  function liveTransport() {
+    if (typeof currentChannel === "function") {
+      const live = currentChannel();
+      if (live !== null && live !== undefined) return live;
+    }
+    const service = ctx?.get?.("remoteTransport") ?? null;
+    if (service === null) return null;
+    if (service.__isTransportFacade === true) return service.current ?? null;
+    return service;
+  }
 
   /** cwd текущей сессии: из неё берётся scope «воркспейс». */
   function sessionInfo(invocation) {
@@ -340,7 +359,7 @@ export function createRemoteCommands({
           log(`ensureTransport после привязки: ${humanError(error, token)}`);
         }
       }
-      if (transport === null) transport = ctx?.get?.("remoteTransport") ?? null;
+      if (transport === null) transport = liveTransport();
       if (typeof transport?.start === "function") {
         try {
           await transport.start();
@@ -365,8 +384,25 @@ export function createRemoteCommands({
   }
 
   /** `/remote on|off [--all|--session]`. */
-  function setMode(invocation, enabled, flags) {
+  async function setMode(invocation, enabled, flags) {
     const { sessionId, cwd } = sessionInfo(invocation);
+    if (enabled) {
+      // Включённый режим без канала = вопрос уходит в ответчик, который не может
+      // его доставить, и сессия висит. Требуем привязку и живой канал.
+      const state = store.read();
+      if (state.bindings === null) {
+        return failure("сначала привяжите бота: /remote connect");
+      }
+      if (typeof ensureTransport === "function") {
+        try {
+          await ensureTransport();
+        } catch (error) {
+          return failure(`канал не поднят: ${humanError(error)}`);
+        }
+      }
+      const channel = liveTransport();
+      if (channel === null) return failure("канал не поднят: проверьте токен и /remote status");
+    }
     try {
       if (flags.has("all")) {
         store.setEnabled({ kind: "global" }, enabled);
@@ -429,9 +465,9 @@ export function createRemoteCommands({
   async function testChannel(invocation) {
     const state = store.read();
     if (state.bindings === null) return failure("бот не привязан: /remote connect");
-    const transport = ctx?.get?.("remoteTransport") ?? null;
+    const transport = liveTransport();
     if (transport === null || typeof transport.sendQuestion !== "function") {
-      return failure("транспорт не поднят: проверьте привязку и токен (/remote status)");
+      return failure("канал не поднят: /remote connect");
     }
     const shortId = String(Math.floor(random() * 0xffffffff)).padStart(8, "0").slice(0, 8);
     const question = {
@@ -443,19 +479,32 @@ export function createRemoteCommands({
     // Тестовый вопрос не проходит через ответчик (у него свой реестр), поэтому
     // ответ на кнопку закрываем здесь: сообщение не останется с кнопками.
     let off = null;
+    let timer = null;
+    const cleanup = () => {
+      off?.();
+      off = null;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
     try {
       if (typeof transport.onAnswer === "function") {
         off = transport.onAnswer((event) => {
           if (event?.shortId !== shortId) return;
-          off?.();
-          off = null;
+          cleanup();
           void transport.closeQuestion?.(question, "тест пройден");
         });
+        // Если человек так и не нажал — подписка не должна жить вечно.
+        timer = setTimeoutImpl(() => {
+          cleanup();
+          log(`/remote test: ответа на тестовый вопрос ${shortId} не было — подписка снята`);
+        }, testAnswerTimeoutMs);
+        timer?.unref?.();
       }
       await transport.sendQuestion(question);
     } catch (error) {
-      off?.();
-      off = null;
+      cleanup();
       return failure(`отправить не удалось: ${humanError(error)}`);
     }
     store.addRecent({ shortId, sessionId: sessionInfo(invocation).sessionId, status: "test" });
@@ -533,9 +582,9 @@ export function createRemoteCommands({
         case "connect":
           return await connect(invocation);
         case "on":
-          return setMode(invocation, true, flags);
+          return await setMode(invocation, true, flags);
         case "off":
-          return setMode(invocation, false, flags);
+          return await setMode(invocation, false, flags);
         case "status":
           return await status(invocation);
         case "test":

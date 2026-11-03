@@ -15,6 +15,7 @@ import path from "node:path";
 
 import { createStore } from "../lib/store.js";
 import { commandsFeature } from "../lib/features/commands.js";
+import { telegramFeature } from "../lib/features/telegram.js";
 import { answererFeature } from "../lib/features/answerer.js";
 import {
   PAIRING_TTL_MS,
@@ -365,27 +366,44 @@ test("connect: человек закрыл вопрос — ошибка тек�
 
 test("on/off: воркспейс по умолчанию, --all и --session", async (t) => {
   const stand = harness(t);
+  stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  const channel = { id: "telegram", start: async () => {}, stop: async () => {}, sendQuestion: async () => ({}) };
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    currentChannel: () => channel,
+  });
 
-  const onWorkspace = await stand.remote.handler(invoke("on"));
+  const onWorkspace = await remote.handler(invoke("on"));
   assert.equal(onWorkspace.kind, "success");
   assert.match(onWorkspace.text, /\/p/);
   assert.equal(stand.store.read().enabled.workspaces[WORKSPACE], true);
 
-  await stand.remote.handler(invoke("on --all"));
+  await remote.handler(invoke("on --all"));
   assert.equal(stand.store.read().enabled.global, true);
 
-  await stand.remote.handler(invoke("on --session"));
+  await remote.handler(invoke("on --session"));
   assert.equal(stand.store.read().enabled.sessions[SESSION_ID], true);
 
-  const off = await stand.remote.handler(invoke("off --all"));
+  const off = await remote.handler(invoke("off --all"));
   assert.equal(off.kind, "success");
   assert.equal(stand.store.read().enabled.global, false);
 });
 
 test("on без cwd: подсказка про --all и --session", async (t) => {
   const stand = harness(t, { sessions: { get: () => ({ header: {} }) } });
+  stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    currentChannel: () => ({ id: "telegram", start: async () => {}, stop: async () => {} }),
+  });
 
-  const result = await stand.remote.handler(invoke("on"));
+  const result = await remote.handler(invoke("on"));
 
   assert.equal(result.kind, "error");
   assert.match(result.text, /--all/);
@@ -436,7 +454,7 @@ test("test без транспорта и без привязки — текст
   bound.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
   const noTransport = await bound.remote.handler(invoke("test"));
   assert.equal(noTransport.kind, "error");
-  assert.match(noTransport.text, /транспорт не поднят/);
+  assert.match(noTransport.text, /канал не поднят/);
 });
 
 test("disconnect: подтверждение снимает привязку, режим и секрет", async (t) => {
@@ -946,4 +964,196 @@ test("фича commands: выгрузка во время credentials.resolve н
   assert.ok(facade, "сервис зарегистрирован");
   assert.equal(facade.current, null, "канал не поднят после выгрузки");
   assert.equal(fetchCalls, 0, "сеть не тронули");
+});
+
+// --- регрессии по второму ревью 005 ----------------------------------------
+
+/** Фейковый контекст с подменяемыми сервисами и учётом эффектов. */
+function makePluginCtx({ token = "111:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", services = new Map() } = {}) {
+  const provided = new Map();
+  const disposers = [];
+  const hooks = new Map();
+  const ctx = {
+    provide: (name, service) => {
+      if (services.has(name)) services.set(name, service);
+      provided.set(name, service);
+      return service;
+    },
+    get: (name) => {
+      if (name === "credentials") return { resolve: async () => ({ value: token, source: "file" }) };
+      if (name === "sessionController") return null;
+      return services.get(name) ?? provided.get(name) ?? null;
+    },
+    on: (event, handler, options) => {
+      hooks.set(event, (hooks.get(event) ?? []).concat([{ handler, options }]));
+      return () => {};
+    },
+    effect: (execute) => {
+      const disposable = execute();
+      disposers.push(disposable);
+      return () => disposable?.();
+    },
+    logger: () => ({ debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }),
+  };
+  return { ctx, provided, hooks, disposers, services };
+}
+
+function withTempState(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-facade-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "state.json");
+  const previous = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = file;
+  t.after(() => {
+    if (previous === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previous;
+  });
+  return { dir, file, store: createStore({ file }) };
+}
+
+test("фасад: dispose гасит запущенный канал и снимает подписки", async (t) => {
+  const { store } = withTempState(t);
+  store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = hangingTelegramFetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { ctx, provided } = makePluginCtx();
+  const { deps, disposers } = fakeDeps();
+  const api = await commandsFeature.apply(ctx, {}, deps);
+  const facade = provided.get("remoteTransport");
+  const live = facade.current;
+  assert.equal(live?.polling, true, "канал запущен");
+
+  const seen = [];
+  facade.onAnswer((answer) => seen.push(answer));
+  assert.equal(typeof facade.onAnswer, "function");
+  await live.stop(); // снимаем поллинг, чтобы тест не ждал сеть
+  // Выгрузка плагина: наш dispose + фасадный.
+  for (const dispose of [...disposers].reverse()) await dispose?.();
+  assert.equal(facade.current, null, "живого канала после dispose нет");
+  void api;
+});
+
+test("фасад без канала: отправка — ошибка, /remote test и on честно отказывают", async (t) => {
+  const stand = harness(t);
+  const { ctx, provided } = makePluginCtx();
+  const { deps, disposers } = fakeDeps();
+  await commandsFeature.apply(ctx, {}, deps);
+  const facade = provided.get("remoteTransport");
+  assert.equal(facade.current, null, "привязки нет — канала нет");
+
+  assert.throws(() => facade.sendQuestion({ shortId: "a1" }), /канал не поднят/);
+  assert.equal(facade.start(), false, "start без канала — false, а не undefined");
+
+  const noBinding = await stand.remote.handler(invoke("on"));
+  assert.equal(noBinding.kind, "error");
+  assert.match(noBinding.text, /сначала привяжите бота/);
+
+  const testCommand = await stand.remote.handler(invoke("test"));
+  assert.equal(testCommand.kind, "error");
+
+  for (const dispose of [...disposers].reverse()) dispose?.();
+});
+
+test("config-путь: транспорт из config кладётся в фасад и заменяется при connect", async (t) => {
+  const { store } = withTempState(t);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = hangingTelegramFetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  // Имитируем фичу telegram (004): транспорт из config уже в контексте.
+  const configTransport = {
+    id: "telegram",
+    polling: true,
+    stalled: [],
+    async start() {
+      this.polling = true;
+    },
+    async stop() {
+      this.polling = false;
+    },
+    async sendQuestion() {
+      return { messageId: 1 };
+    },
+    onAnswer: () => () => {},
+    caps: {},
+  };
+  const services = new Map([["remoteTransport", configTransport]]);
+  const { ctx, provided } = makePluginCtx({ services });
+  const { deps } = fakeDeps();
+  const api = await commandsFeature.apply(ctx, {}, deps);
+
+  const facade = provided.get("remoteTransport");
+  assert.equal(facade.__isTransportFacade, true, "config-транспорт обёрнут фасадом");
+  assert.equal(facade.current, configTransport, "живой канал — из config");
+
+  // Новая привязка и новый токен: config-транспорт должен быть остановлен.
+  store.setBinding({ transport: "telegram", chatId: 43, userId: 8, botUsername: "test_bot" });
+  const replaced = await api.ensureTransport();
+  assert.notEqual(replaced, configTransport, "канал пересоздан из состояния");
+  assert.equal(configTransport.polling, false, "config-транспорт остановлен");
+  assert.equal(facade.current, replaced);
+  await facade.stop();
+});
+
+test("connect: при пустом канале не пишет «канал поднят»", async (t) => {
+  const telegram = telegramFetch();
+  const stand = harness(t, { answers: CONNECT_ANSWERS, fetchImpl: telegram.fetch });
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    fetch: telegram.fetch,
+    random: () => CODE_RANDOM,
+    sleep: async () => {},
+    ensureTransport: async () => null,
+    currentChannel: () => null,
+  });
+
+  const result = await remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "success", result.text);
+  assert.match(result.text, /канал не поднят|канал поднимется/);
+  assert.doesNotMatch(result.text, /канал поднят:/);
+});
+
+test("/remote test: подписка снимается по таймауту, если никто не нажал", async (t) => {
+  let offCalls = 0;
+  const transport = {
+    id: "telegram",
+    sendQuestion: async () => ({ messageId: 1 }),
+    closeQuestion: async () => {},
+    onAnswer: (handler) => {
+      void handler;
+      return () => {
+        offCalls += 1;
+      };
+    },
+    stop: async () => {},
+  };
+  const stand = harness(t, { transport });
+  stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    currentChannel: () => transport,
+    testAnswerTimeoutMs: 1000,
+    setTimeout: (callback) => {
+      callback();
+      return { unref: () => {} };
+    },
+  });
+
+  const result = await remote.handler(invoke("test"));
+
+  assert.equal(result.kind, "success", result.text);
+  assert.equal(offCalls, 1, "подписка снята таймаутом, listener не утёк");
 });

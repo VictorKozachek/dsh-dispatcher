@@ -30,8 +30,10 @@ import { telegramFeature } from "./features/telegram.js";
 import { commandsFeature } from "./features/commands.js";
 import { answererFeature } from "./features/answerer.js";
 
+// Порядок: commands регистрирует фасад remoteTransport и состояние, telegram
+// кладёт транспорт в фасад (config-путь), answerer подписывается последним.
 export const features = [
-  telegramFeature,
   commandsFeature,
+  telegramFeature,
   answererFeature,
 ];
