@@ -71,6 +71,20 @@ fn internal() -> Response {
     )
 }
 
+/// Отвергнуть незнакомые поля: 016 требует `additionalProperties: false`
+/// на запросах, иначе опечатка в имени поля молча теряется.
+fn reject_unknown(body: &Value, allowed: &[&str]) -> Result<(), String> {
+    let Some(object) = body.as_object() else {
+        return Err("ожидался JSON-объект".into());
+    };
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("лишнее поле {key}"));
+        }
+    }
+    Ok(())
+}
+
 /// Кто вызывает: агент (плагин) или устройство.
 enum Auth {
     Agent,
@@ -110,11 +124,15 @@ fn device_allowed(state: &AppState, device_id: &str) -> bool {
 /// `GET /v1/health` — живость, версия и счётчики (без секретов).
 pub async fn health(State(state): State<AppState>) -> Response {
     let devices = db::device_count(&state.db).await.unwrap_or(0);
+    let questions = db::open_question_count(&state.db).await.unwrap_or(0);
+    let answers = db::answer_count(&state.db).await.unwrap_or(0);
     Json(json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
         "at": db::now_iso(),
         "devices": devices,
+        "questions": questions,
+        "answers": answers,
     }))
     .into_response()
 }
@@ -124,6 +142,12 @@ pub async fn create_device(State(state): State<AppState>, body: Option<Json<Valu
     let Some(Json(body)) = body else {
         return bad_request("нужно JSON-тело");
     };
+    if let Err(reason) = reject_unknown(
+        &body,
+        &["platform", "publicKey", "pushToken", "label", "version"],
+    ) {
+        return bad_request(&reason);
+    }
     let platform = body.get("platform").and_then(Value::as_str).unwrap_or("");
     if !matches!(platform, "ios" | "android" | "web") {
         return bad_request("platform: ожидалось ios, android или web");
@@ -226,6 +250,9 @@ pub async fn create_pairing_code(State(state): State<AppState>, headers: HeaderM
 
 /// `POST /v1/pair` — подтверждение привязки: выдаёт `deviceToken`.
 pub async fn pair(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    if let Err(reason) = reject_unknown(&body, &["pairCode", "deviceId", "version"]) {
+        return bad_request(&reason);
+    }
     let code = body.get("pairCode").and_then(Value::as_str).unwrap_or("");
     let device_id = body.get("deviceId").and_then(Value::as_str).unwrap_or("");
     if code.len() != 6 || !code.chars().all(|ch| ch.is_ascii_digit()) {
@@ -376,7 +403,39 @@ pub async fn publish_question(
         }
         Err(response) => return response,
     }
-    let question = body.get("question").cloned().unwrap_or(body.clone());
+    if let Err(reason) = reject_unknown(&body, &["question", "version"]) {
+        return bad_request(&reason);
+    }
+    let Some(question) = body
+        .get("question")
+        .filter(|value| value.is_object())
+        .cloned()
+    else {
+        return bad_request("нужен wrapper {\"question\": {...}} (QuestionPublishRequest)");
+    };
+    if let Err(reason) = reject_unknown(
+        &question,
+        &[
+            "id",
+            "shortId",
+            "workspace",
+            "taskId",
+            "role",
+            "title",
+            "body",
+            "detail",
+            "options",
+            "optionCount",
+            "multiSelect",
+            "allowFreeText",
+            "createdAt",
+            "expiresAt",
+            "enc",
+            "version",
+        ],
+    ) {
+        return bad_request(&reason);
+    }
     if let Err(reason) = validate_question(&question) {
         tracing::warn!(reason = %reason, "вопрос отклонён");
         return bad_request(&reason);
@@ -461,8 +520,16 @@ pub async fn list_questions(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait);
     loop {
         match db::list_questions(&state.db, since.as_deref(), limit).await {
-            Ok(questions) if !questions.is_empty() || wait == 0 => {
-                return Json(json!({ "questions": questions, "nextSince": db::now_iso() }))
+            Ok(rows) if !rows.is_empty() || wait == 0 => {
+                // Курсор — created_at последнего элемента: страница не теряет
+                // остаток и не повторяет уже отданное.
+                let next_since = rows
+                    .last()
+                    .map(|(created_at, _)| created_at.clone())
+                    .or_else(|| since.clone())
+                    .unwrap_or_else(db::now_iso);
+                let questions: Vec<Value> = rows.into_iter().map(|(_, value)| value).collect();
+                return Json(json!({ "questions": questions, "nextSince": next_since }))
                     .into_response();
             }
             Ok(_) => {}
@@ -575,6 +642,20 @@ pub async fn answer(
         }
         Ok(Auth::Agent) => {}
         Err(response) => return response,
+    }
+    if let Err(reason) = reject_unknown(
+        &body,
+        &[
+            "questionId",
+            "selected",
+            "custom",
+            "answeredAt",
+            "idempotencyKey",
+            "enc",
+            "version",
+        ],
+    ) {
+        return bad_request(&reason);
     }
     if let Err(reason) = validate_answer(&body) {
         return bad_request(&reason);

@@ -207,17 +207,17 @@ pub async fn confirm_pairing(
     code: &str,
     device_id: &str,
 ) -> anyhow::Result<Option<(String, DeviceRow)>> {
-    let row = sqlx::query("SELECT * FROM pairing_codes WHERE code = ?1")
-        .bind(code)
-        .fetch_optional(pool)
-        .await?;
-    let Some(row) = row else { return Ok(None) };
-    let confirmed: i64 = row.get("confirmed");
-    let expires_at: String = row.get("expires_at");
-    let expired = parse_iso(&expires_at)
-        .map(|value| value <= Utc::now())
-        .unwrap_or(true);
-    if confirmed != 0 || expired {
+    // Гонка двух /pair: код подтверждается атомарно (confirmed = 0 и TTL — в
+    // том же UPDATE), поэтому ровно один запрос получит строку.
+    let claimed = sqlx::query(
+        "UPDATE pairing_codes SET confirmed = 1, device_id = ?1
+         WHERE code = ?2 AND confirmed = 0 AND datetime(expires_at) > datetime('now')",
+    )
+    .bind(device_id)
+    .bind(code)
+    .execute(pool)
+    .await?;
+    if claimed.rows_affected() != 1 {
         return Ok(None);
     }
     let Some(device) = device_by_id(pool, device_id).await? else {
@@ -227,11 +227,6 @@ pub async fn confirm_pairing(
         return Ok(None);
     }
     let token = random_token();
-    sqlx::query("UPDATE pairing_codes SET confirmed = 1, device_id = ?1 WHERE code = ?2")
-        .bind(device_id)
-        .bind(code)
-        .execute(pool)
-        .await?;
     sqlx::query("UPDATE devices SET token_hash = ?1 WHERE id = ?2")
         .bind(hash_token(&token))
         .bind(device_id)
@@ -262,7 +257,9 @@ pub async fn insert_answer(
         let existing: String = row.get("payload");
         let value: Value = serde_json::from_str(&existing).unwrap_or(Value::Null);
         let same_question = value.get("questionId").and_then(Value::as_str) == Some(question_id);
-        return Ok(if same_question {
+        // 016: тот же ключ и то же тело — 200; тот же ключ, другое тело — 409.
+        let same_body = same_question && value == *payload;
+        return Ok(if same_body {
             AnswerOutcome::Duplicate(value)
         } else {
             AnswerOutcome::Conflict
@@ -366,11 +363,11 @@ pub async fn list_questions(
     pool: &SqlitePool,
     since: Option<&str>,
     limit: i64,
-) -> anyhow::Result<Vec<Value>> {
+) -> anyhow::Result<Vec<(String, Value)>> {
     let rows = if let Some(since) = since {
         sqlx::query(
-            "SELECT payload FROM questions
-             WHERE created_at >= ?1 AND answered = 0 AND expired = 0 AND expires_at > ?2
+            "SELECT created_at, payload FROM questions
+             WHERE created_at > ?1 AND answered = 0 AND expired = 0 AND expires_at > ?2
              ORDER BY created_at ASC LIMIT ?3",
         )
         .bind(since)
@@ -380,7 +377,7 @@ pub async fn list_questions(
         .await?
     } else {
         sqlx::query(
-            "SELECT payload FROM questions
+            "SELECT created_at, payload FROM questions
              WHERE answered = 0 AND expired = 0 AND expires_at > ?1
              ORDER BY created_at ASC LIMIT ?2",
         )
@@ -392,8 +389,11 @@ pub async fn list_questions(
     Ok(rows
         .into_iter()
         .filter_map(|row| {
+            let created_at: String = row.get("created_at");
             let payload: String = row.get("payload");
-            serde_json::from_str(&payload).ok()
+            serde_json::from_str(&payload)
+                .ok()
+                .map(|value| (created_at, value))
         })
         .collect())
 }
@@ -452,6 +452,25 @@ pub async fn record_event(
 
 pub async fn device_count(pool: &SqlitePool) -> anyhow::Result<i64> {
     let row = sqlx::query("SELECT COUNT(*) AS count FROM devices WHERE revoked = 0")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.get("count"))
+}
+
+/// Открытые (живые и неотвеченные) вопросы — для `/v1/health` и `/healthz`.
+pub async fn open_question_count(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS count FROM questions WHERE answered = 0 AND expired = 0 AND expires_at > ?1",
+    )
+    .bind(now_iso())
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("count"))
+}
+
+/// Всего ответов — счётчик для наблюдаемости.
+pub async fn answer_count(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let row = sqlx::query("SELECT COUNT(*) AS count FROM answers")
         .fetch_one(pool)
         .await?;
     Ok(row.get("count"))

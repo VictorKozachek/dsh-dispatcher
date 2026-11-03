@@ -102,6 +102,19 @@ async fn handle(state: AppState, mut socket: WebSocket, device_id: Option<String
                         tracing::debug!(device = %id, "WS: чужой отзыв — игнор");
                     }
                     Ok(RelayEvent::Protocol(event)) => {
+                        // Событие с `payload.deviceId` адресовано конкретному
+                        // устройству (pairing.confirmed, device.revoked) — чужим
+                        // его не отдаём. Вопросы/ответы — общие для устройств
+                        // пользователя (релей однопользовательский).
+                        let target = event
+                            .get("payload")
+                            .and_then(|payload| payload.get("deviceId"))
+                            .and_then(serde_json::Value::as_str);
+                        if let (Some(target), Some(mine)) = (target, device_id.as_deref()) {
+                            if target != mine {
+                                continue;
+                            }
+                        }
                         if let Ok(text) = serde_json::to_string(&event) {
                             if socket.send(Message::Text(text.into())).await.is_err() {
                                 break;

@@ -12,6 +12,16 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 const AGENT_TOKEN: &str = "test-agent-token";
 
+/// Клиент с обязательным `X-Relay-Version: 1` (016 §2).
+fn client() -> reqwest::Client {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-relay-version", "1".parse().expect("заголовок"));
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("клиент")
+}
+
 fn now() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -47,7 +57,7 @@ async fn spawn() -> Server {
 }
 
 async fn device(stack: &Server) -> (String, String) {
-    let client = reqwest::Client::new();
+    let client = client();
     let register: Value = client
         .post(format!("{}/v1/devices", stack.base))
         .header("x-relay-version", "1")
@@ -103,7 +113,7 @@ fn question(id: &str, short_id: &str) -> Value {
 #[tokio::test]
 async fn scenario_pairing_question_answer_ttl() {
     let stack = spawn().await;
-    let client = reqwest::Client::new();
+    let client = client();
 
     let health: Value = client
         .get(format!("{}/v1/health", stack.base))
@@ -258,12 +268,15 @@ fn ws_request(
         format!("Bearer {token}").parse().expect("заголовок"),
     );
     request
+        .headers_mut()
+        .insert("x-relay-version", "1".parse().expect("версия"));
+    request
 }
 
 #[tokio::test]
 async fn broken_envelope_and_unknown_version_are_rejected_without_panic() {
     let stack = spawn().await;
-    let client = reqwest::Client::new();
+    let client = client();
 
     let broken = client
         .post(format!("{}/v1/questions", stack.base))
@@ -322,7 +335,7 @@ async fn broken_envelope_and_unknown_version_are_rejected_without_panic() {
 #[tokio::test]
 async fn revoked_device_cannot_answer() {
     let stack = spawn().await;
-    let client = reqwest::Client::new();
+    let client = client();
     let (device_id, token) = device(&stack).await;
 
     let revoked = client
@@ -373,7 +386,7 @@ async fn logs_do_not_contain_question_bodies_or_tokens() {
         .try_init();
 
     let stack = spawn().await;
-    let client = reqwest::Client::new();
+    let client = client();
     let (_device_id, token) = device(&stack).await;
     let secret_body = "SECRET-QUESTION-BODY-42";
 
@@ -420,4 +433,338 @@ impl std::io::Write for BufferGuard {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+// --- регрессии по ревью 017 ------------------------------------------------
+
+fn after_millis(ms: i64) -> String {
+    (Utc::now() + chrono::Duration::milliseconds(ms))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+async fn publish(stack: &Server, client: &reqwest::Client, question: Value) -> reqwest::Response {
+    client
+        .post(format!("{}/v1/questions", stack.base))
+        .header("authorization", format!("Bearer {AGENT_TOKEN}"))
+        .json(&json!({ "question": question }))
+        .send()
+        .await
+        .expect("публикация")
+}
+
+#[tokio::test]
+async fn missing_version_is_rejected() {
+    let stack = spawn().await;
+    let no_version = reqwest::Client::new();
+    let response = no_version
+        .get(format!("{}/v1/health", stack.base))
+        .send()
+        .await
+        .expect("без версии");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["error"]["code"], "bad-request");
+    assert_eq!(body["error"]["details"]["supported"][0], 1);
+}
+
+#[tokio::test]
+async fn unknown_fields_and_raw_question_are_rejected() {
+    let stack = spawn().await;
+    let client = client();
+
+    let extra_device = client
+        .post(format!("{}/v1/devices", stack.base))
+        .json(&json!({ "platform": "ios", "publicKey": "pub-key-with-enough-length-123456", "extra": 1 }))
+        .send()
+        .await
+        .expect("устройство с лишним полем");
+    assert_eq!(extra_device.status(), StatusCode::BAD_REQUEST);
+
+    let mut raw = question("q-raw00001", "0badf00d");
+    raw.as_object_mut().expect("объект").remove("version");
+    let raw_response = client
+        .post(format!("{}/v1/questions", stack.base))
+        .header("authorization", format!("Bearer {AGENT_TOKEN}"))
+        .json(&raw)
+        .send()
+        .await
+        .expect("сырой вопрос");
+    assert_eq!(
+        raw_response.status(),
+        StatusCode::BAD_REQUEST,
+        "нужен wrapper question"
+    );
+
+    let (_device_id, token) = device(&stack).await;
+    assert_eq!(
+        publish(&stack, &client, question("q-extra001", "aaaabbbb"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let answer = json!({
+        "questionId": "q-extra001",
+        "selected": ["o1"],
+        "answeredAt": now(),
+        "idempotencyKey": "22222222-2222-4222-8222-222222222222",
+        "extra": true,
+    });
+    let extra_answer = client
+        .post(format!("{}/v1/answers", stack.base))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&answer)
+        .send()
+        .await
+        .expect("ответ с лишним полем");
+    assert_eq!(extra_answer.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn pagination_uses_real_cursor_and_does_not_lose_rest() {
+    let stack = spawn().await;
+    let client = client();
+    let (_device_id, token) = device(&stack).await;
+
+    for index in 0..60 {
+        let mut item = question(&format!("q-page{index:04}"), &format!("{index:08x}"));
+        item["createdAt"] = json!(after_millis(index as i64));
+        item["expiresAt"] = json!(after(600));
+        assert_eq!(
+            publish(&stack, &client, item).await.status(),
+            StatusCode::CREATED
+        );
+    }
+
+    let first: Value = client
+        .get(format!("{}/v1/questions?limit=50", stack.base))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("страница 1")
+        .json()
+        .await
+        .expect("json");
+    let first_ids: Vec<String> = first["questions"]
+        .as_array()
+        .expect("массив")
+        .iter()
+        .map(|item| item["id"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(first_ids.len(), 50);
+    let cursor = first["nextSince"].as_str().expect("курсор").to_string();
+
+    let second: Value = client
+        .get(format!(
+            "{}/v1/questions?limit=50&since={cursor}",
+            stack.base
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .expect("страница 2")
+        .json()
+        .await
+        .expect("json");
+    let second_ids: Vec<String> = second["questions"]
+        .as_array()
+        .expect("массив")
+        .iter()
+        .map(|item| item["id"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(second_ids.len(), 10, "остаток не потерян");
+    for id in &second_ids {
+        assert!(!first_ids.contains(id), "страницы не пересекаются: {id}");
+    }
+    assert_eq!(first_ids.len() + second_ids.len(), 60);
+}
+
+#[tokio::test]
+async fn idempotency_key_with_different_body_conflicts() {
+    let stack = spawn().await;
+    let client = client();
+    let (_device_id, token) = device(&stack).await;
+    assert_eq!(
+        publish(&stack, &client, question("q-idem0001", "abcdefff"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    let key = "33333333-3333-4333-8333-333333333333";
+    let first = json!({ "questionId": "q-idem0001", "selected": ["o1"], "answeredAt": now(), "idempotencyKey": key });
+    let created = client
+        .post(format!("{}/v1/answers", stack.base))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&first)
+        .send()
+        .await
+        .expect("первый ответ");
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let other = json!({ "questionId": "q-idem0001", "selected": ["o2"], "answeredAt": now(), "idempotencyKey": key });
+    let conflict = client
+        .post(format!("{}/v1/answers", stack.base))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&other)
+        .send()
+        .await
+        .expect("другой ответ");
+    assert_eq!(
+        conflict.status(),
+        StatusCode::CONFLICT,
+        "тот же ключ, другое тело — 409"
+    );
+}
+
+#[tokio::test]
+async fn pairing_code_is_atomic_under_concurrency() {
+    let stack = spawn().await;
+    let client = client();
+    let register: Value = client
+        .post(format!("{}/v1/devices", stack.base))
+        .json(&json!({ "platform": "ios", "publicKey": format!("pub-{}", dsh_relay::db::random_token()) }))
+        .send()
+        .await
+        .expect("регистрация")
+        .json()
+        .await
+        .expect("json");
+    let device_id = register["deviceId"].as_str().expect("deviceId").to_string();
+    let code: Value = client
+        .post(format!("{}/v1/pairing-codes", stack.base))
+        .header("authorization", format!("Bearer {AGENT_TOKEN}"))
+        .send()
+        .await
+        .expect("код")
+        .json()
+        .await
+        .expect("json");
+    let pair_code = code["pairCode"].as_str().expect("pairCode").to_string();
+
+    let request = |client: reqwest::Client| {
+        let url = format!("{}/v1/pair", stack.base);
+        let body = json!({ "pairCode": pair_code.clone(), "deviceId": device_id.clone() });
+        async move {
+            client
+                .post(url)
+                .json(&body)
+                .send()
+                .await
+                .expect("pair")
+                .status()
+        }
+    };
+    let (first, second) = tokio::join!(request(client.clone()), request(client.clone()));
+    let successes = [first, second]
+        .iter()
+        .filter(|status| **status == StatusCode::OK)
+        .count();
+    assert_eq!(
+        successes, 1,
+        "ровно одна привязка выигрывает гонку: {first:?} {second:?}"
+    );
+}
+
+#[tokio::test]
+async fn ws_does_not_leak_other_device_events() {
+    let stack = spawn().await;
+    let client = client();
+    let (device_one, _token_one) = device(&stack).await;
+    let (_device_two, token_two) = device(&stack).await;
+
+    let mut ws = tokio_tungstenite::connect_async(ws_request(&stack, &token_two))
+        .await
+        .expect("WS второго устройства")
+        .0;
+
+    // Отзываем ПЕРВОЕ устройство: второе не должно получить чужой device.revoked.
+    let revoked = client
+        .delete(format!("{}/v1/devices/{device_one}", stack.base))
+        .header("authorization", format!("Bearer {AGENT_TOKEN}"))
+        .send()
+        .await
+        .expect("отзыв");
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+
+    // Публикуем вопрос: второе устройство должно получить именно его.
+    assert_eq!(
+        publish(&stack, &client, question("q-ws000001", "1234abcd"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut seen = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(message))) => {
+                let text = message.into_text().expect("текст").to_string();
+                let event: Value = serde_json::from_str(&text).expect("json");
+                let kind = event["type"].as_str().unwrap_or("").to_string();
+                let device_id = event["payload"]["deviceId"]
+                    .as_str()
+                    .map(|value| value.to_string());
+                seen.push(kind.clone());
+                if device_id.as_deref() == Some(device_one.as_str()) {
+                    panic!("второму устройству пришло событие чужого: {event}");
+                }
+                if kind == "question.created" {
+                    break;
+                }
+            }
+            Ok(Some(Err(error))) => panic!("WS: {error}"),
+            Ok(None) => break,
+            Err(_) => {}
+        }
+    }
+    assert!(
+        seen.contains(&"question.created".to_string()),
+        "вопрос доставлен второму устройству: {seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn healthz_alias_and_metrics_are_available() {
+    let stack = spawn().await;
+    let client = client();
+    let (_device_id, token) = device(&stack).await;
+    assert_eq!(
+        publish(&stack, &client, question("q-metric01", "00c0ffee"))
+            .await
+            .status(),
+        StatusCode::CREATED
+    );
+    let answer = json!({
+        "questionId": "q-metric01",
+        "selected": ["o1"],
+        "answeredAt": now(),
+        "idempotencyKey": "44444444-4444-4444-8444-444444444444",
+    });
+    client
+        .post(format!("{}/v1/answers", stack.base))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&answer)
+        .send()
+        .await
+        .expect("ответ");
+
+    let healthz: Value = client
+        .get(format!("{}/healthz", stack.base))
+        .send()
+        .await
+        .expect("healthz")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(healthz["ok"], true);
+    assert_eq!(
+        healthz["answers"].as_i64().unwrap_or(0) >= 1,
+        true,
+        "счётчик ответов: {healthz}"
+    );
+    assert!(
+        healthz.get("questions").is_some(),
+        "счётчик открытых вопросов"
+    );
 }

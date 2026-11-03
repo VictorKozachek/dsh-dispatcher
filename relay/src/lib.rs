@@ -144,6 +144,7 @@ impl AppState {
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/v1/health", get(routes::health))
+        .route("/healthz", get(routes::health))
         .route("/v1/devices", post(routes::create_device))
         .route("/v1/devices/{id}", delete(routes::delete_device))
         .route("/v1/pair", post(routes::pair))
@@ -173,8 +174,23 @@ async fn version_guard(
         .get("x-relay-version")
         .and_then(|value| value.to_str().ok())
         .map(|value| value.trim().to_string());
-    if let Some(version) = requested {
-        if version != PROTOCOL_VERSION.to_string() {
+    match requested {
+        None => {
+            // 016 §2: заголовок несёт каждый запрос; без него непонятно, какой
+            // версии клиент — отвечаем 400, а не угадываем.
+            let mut response = routes::error_response(
+                StatusCode::BAD_REQUEST,
+                "bad-request",
+                "нужен заголовок X-Relay-Version: 1",
+                false,
+                Some(json!({ "supported": [PROTOCOL_VERSION] })),
+            );
+            response
+                .headers_mut()
+                .insert("x-relay-version", HeaderValue::from_static("1"));
+            return response;
+        }
+        Some(version) if version != PROTOCOL_VERSION.to_string() => {
             let mut response = routes::error_response(
                 StatusCode::UPGRADE_REQUIRED,
                 "unsupported-version",
@@ -187,6 +203,7 @@ async fn version_guard(
                 .insert("x-relay-version", HeaderValue::from_static("1"));
             return response;
         }
+        Some(_) => {}
     }
     let mut response = next.run(request).await;
     response
