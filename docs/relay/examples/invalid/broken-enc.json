@@ -1,0 +1,14 @@
+{
+  "id": "b1e2c3d4-0000-4000-8000-000000000003",
+  "shortId": "cafebabe",
+  "options": [],
+  "createdAt": "2026-11-03T18:01:00Z",
+  "expiresAt": "2026-11-03T18:31:00Z",
+  "enc": {
+    "enc": "short",
+    "nonce": "bad",
+    "keyId": "k",
+    "alg": "rot13",
+    "plainSize": 999999
+  }
+}
