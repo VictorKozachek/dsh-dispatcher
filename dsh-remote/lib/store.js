@@ -64,51 +64,63 @@ export function credentialRef(name) {
   return name;
 }
 
-/** Доступ к `ctx.credentials`: тонкая обёртка, которая не бросает наружу. */
+/**
+ * Доступ к `ctx.credentials`: тонкая обёртка, которая не бросает наружу.
+ *
+ * Настоящий провайдер — `CredentialProvider` (`packages/credentials/credentials/src/index.ts`):
+ * **все** методы асинхронные —
+ * `resolve(ref) => Promise<{value, source} | undefined>`,
+ * `describe(ref) => Promise<{configured, source?, writable}>`,
+ * `set(ref, value) => Promise<void>`, `unset(ref) => Promise<void>`.
+ * Резолв делается на каждую операцию (кэшировать нельзя — это механизм ротации),
+ * а `describe().writable === false` означает «секрет пришёл из окружения»: писать
+ * его бессмысленно, и `status` обязан это показать.
+ */
 export function createCredentialAccess(ctx, { log = () => {} } = {}) {
   const service = ctx?.get?.("credentials") ?? null;
-  const call = (method, ...args) => {
+  const has = (method) => typeof service?.[method] === "function";
+
+  /** Вызов сервиса: любой отказ — null и строка в лог, без исключения. */
+  async function settle(method, ...args) {
+    if (!has(method)) return null;
     try {
-      return service?.[method]?.(...args) ?? null;
+      return await service[method](...args);
     } catch (error) {
       log(`credentials.${method}: ${error?.message ?? error}`);
       return null;
     }
-  };
+  }
+
   return {
-    /** Есть ли сервис вообще: без него токен взять неоткуда. */
+    /** Есть ли сервис: без него токен взять неоткуда. */
     get available() {
-      return service !== null && typeof service?.resolve === "function";
+      return has("resolve");
     },
-    /** Значение секрета или null (не бросает). */
-    resolve(ref) {
-      const value = call("resolve", ref);
+    /** Значение секрета или null (не бросает, принимает строку и `{value}`). */
+    async resolve(ref) {
+      const value = await settle("resolve", ref);
       if (typeof value === "string") return value;
       if (typeof value?.value === "string") return value.value;
       return null;
     },
-    /**
-     * Откуда берётся секрет: `{ source: "env" | "file" | null, writable, present }`.
-     * Окружение главнее файла `~/.dsh/.credentials.yaml`, и в этом случае
-     * `writable === false` — `status` обязан это показать, иначе человек правит
-     * файл, который никто не читает.
-     */
-    describe(ref) {
-      const value = call("describe", ref);
-      if (value === null || typeof value !== "object") {
+    /** `{source, writable, present}`: откуда секрет и можно ли его записать. */
+    async describe(ref) {
+      const info = await settle("describe", ref);
+      if (info === null || typeof info !== "object") {
         return { source: null, writable: false, present: false };
       }
+      const source = typeof info.source === "string" ? info.source : null;
       return {
-        source: typeof value.source === "string" ? value.source : null,
-        writable: value.writable === true,
-        present: value.present === true,
+        source,
+        writable: info.writable === true,
+        present: info.configured === true || info.present === true || source !== null,
       };
     },
-    /** Записать секрет. Успех — отсутствие исключения: сервис может вернуть void. */
-    set(ref, value) {
-      if (typeof service?.set !== "function") return false;
+    /** Записать секрет. Успех — отсутствие исключения: сервис возвращает void. */
+    async set(ref, value) {
+      if (!has("set")) return false;
       try {
-        service.set(ref, value);
+        await service.set(ref, value);
         return true;
       } catch (error) {
         log(`credentials.set: ${error?.message ?? error}`);
@@ -116,10 +128,10 @@ export function createCredentialAccess(ctx, { log = () => {} } = {}) {
       }
     },
     /** Удалить секрет (не бросает: у env-источника записи нет). */
-    unset(ref) {
-      if (typeof service?.unset !== "function") return false;
+    async unset(ref) {
+      if (!has("unset")) return false;
       try {
-        service.unset(ref);
+        await service.unset(ref);
         return true;
       } catch (error) {
         log(`credentials.unset: ${error?.message ?? error}`);

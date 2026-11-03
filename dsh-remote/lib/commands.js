@@ -294,7 +294,7 @@ export function createRemoteCommands({
         createdAt: now(),
       });
 
-      const saved = credentials.set(TELEGRAM_TOKEN_REF, token);
+      const saved = await credentials.set(TELEGRAM_TOKEN_REF, token);
       const tokenNote = saved
         ? `токен сохранён как ${TELEGRAM_TOKEN_REF}`
         : `токен не сохранён: источник ${TELEGRAM_TOKEN_REF} только для чтения (переменная окружения)`;
@@ -354,7 +354,7 @@ export function createRemoteCommands({
   }
 
   /** `/remote status`. */
-  function status(invocation) {
+  async function status(invocation) {
     const state = store.read();
     const { sessionId, cwd } = sessionInfo(invocation);
     const lines = [];
@@ -368,7 +368,7 @@ export function createRemoteCommands({
       lines.push(`бот: @${state.bindings.botUsername ?? "?"} (${state.bindings.transport}), чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
     }
 
-    const described = credentials.describe(TELEGRAM_TOKEN_REF);
+    const described = await credentials.describe(TELEGRAM_TOKEN_REF);
     if (described.source === null) {
       lines.push(`секрет: ${TELEGRAM_TOKEN_REF} — не найден`);
     } else {
@@ -439,10 +439,10 @@ export function createRemoteCommands({
       return failure(`не удалось очистить привязку: ${humanError(error)}`);
     }
 
-    const described = credentials.describe(TELEGRAM_TOKEN_REF);
+    const described = await credentials.describe(TELEGRAM_TOKEN_REF);
     let secretNote = `секрет ${TELEGRAM_TOKEN_REF} оставлен`;
     if (described.present && described.writable) {
-      secretNote = credentials.unset(TELEGRAM_TOKEN_REF)
+      secretNote = (await credentials.unset(TELEGRAM_TOKEN_REF))
         ? `секрет ${TELEGRAM_TOKEN_REF} удалён`
         : `секрет ${TELEGRAM_TOKEN_REF} удалить не удалось — удалите вручную`;
     } else if (described.present) {
@@ -473,7 +473,7 @@ export function createRemoteCommands({
         case "off":
           return setMode(invocation, false, flags);
         case "status":
-          return status(invocation);
+          return await status(invocation);
         case "test":
           return await testChannel(invocation);
         case "who":

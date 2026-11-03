@@ -56,25 +56,26 @@ function telegramFetch({ updates } = {}) {
 
 /** Фейковый `ctx.credentials`. */
 function fakeCredentials({ value = null, source = "file", writable = true } = {}) {
+  // Форма CredentialProvider: всё асинхронное, describe -> {configured, source, writable}.
   const values = new Map();
   if (value !== null) values.set(TELEGRAM_TOKEN_REF, value);
   const calls = [];
   return {
     values,
     calls,
-    resolve: (ref) => values.get(ref) ?? null,
-    describe: (ref) => (values.has(ref)
-      ? { source, writable, present: true }
-      : { source: null, writable: false, present: false }),
-    set: (ref, secret) => {
+    resolve: async (ref) => (values.has(ref)
+      ? { value: values.get(ref), source }
+      : undefined),
+    describe: async (ref) => (values.has(ref)
+      ? { configured: true, source, writable }
+      : { configured: false, writable: false }),
+    set: async (ref, secret) => {
       calls.push(["set", ref, secret]);
       values.set(ref, secret);
-      return true;
     },
-    unset: (ref) => {
+    unset: async (ref) => {
       calls.push(["unset", ref]);
       values.delete(ref);
-      return true;
     },
   };
 }

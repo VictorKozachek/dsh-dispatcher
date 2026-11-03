@@ -219,45 +219,50 @@ test("credentialRef пропускает только POSIX-имена", () => {
   assert.throws(() => credentialRef("1НАЧИНАЕТСЯ_С_ЦИФРЫ"), TypeError);
 });
 
-test("credentials: resolve/describe/set/unset и терпимость к отказу", async () => {
+test("credentials: настоящий API (async resolve/describe/set/unset) и терпимость к отказу", async () => {
   const ref = credentialRef("DSH_REMOTE_TELEGRAM_TOKEN");
+  // Форма CredentialProvider из packages/credentials/credentials: всё async,
+  // resolve -> {value, source}, describe -> {configured, source?, writable}.
   const service = {
-    store: new Map(),
-    resolve(name) {
-      return this.store.get(name) ?? null;
+    store: new Map([["DSH_REMOTE_ENV_TOKEN", "ENV-SECRET"]]),
+    async resolve(name) {
+      const value = this.store.get(name);
+      return value === undefined ? undefined : { value, source: "file" };
     },
-    describe(name) {
+    async describe(name) {
       return this.store.has(name)
-        ? { source: "file", writable: true, present: true }
-        : { source: null, writable: false, present: false };
+        ? { configured: true, source: "file", writable: true }
+        : { configured: false, writable: false };
     },
-    set(name, value) {
+    async set(name, value) {
       this.store.set(name, value);
-      return true;
     },
-    unset(name) {
+    async unset(name) {
       this.store.delete(name);
-      return true;
     },
   };
   const ctx = { get: (name) => (name === "credentials" ? service : null) };
   const access = createCredentialAccess(ctx);
 
   assert.equal(access.available, true);
-  assert.equal(access.resolve(ref), null);
-  assert.deepEqual(access.describe(ref), { source: null, writable: false, present: false });
+  assert.equal(await access.resolve(ref), null);
+  assert.deepEqual(await access.describe(ref), { source: null, writable: false, present: false });
 
-  assert.equal(access.set(ref, "SECRET"), true);
-  assert.equal(access.resolve(ref), "SECRET");
-  assert.deepEqual(access.describe(ref), { source: "file", writable: true, present: true });
+  assert.equal(await access.set(ref, "SECRET"), true);
+  assert.equal(await access.resolve(ref), "SECRET");
+  assert.deepEqual(await access.describe(ref), { source: "file", writable: true, present: true });
 
-  access.unset(ref);
-  assert.equal(access.resolve(ref), null);
+  await access.unset(ref);
+  assert.equal(await access.resolve(ref), null);
+
+  // Строка вместо объекта тоже принимается (старые/простые провайдеры).
+  const simple = createCredentialAccess({ get: () => ({ resolve: async () => "PLAIN" }) });
+  assert.equal(await simple.resolve(ref), "PLAIN");
 
   // Сломанный сервис не бросает наружу.
-  const broken = createCredentialAccess({ get: () => ({ resolve() { throw new Error("boom"); } }) });
-  assert.equal(broken.resolve(ref), null);
+  const broken = createCredentialAccess({ get: () => ({ resolve: async () => { throw new Error("boom"); } }) });
+  assert.equal(await broken.resolve(ref), null);
   const missing = createCredentialAccess({ get: () => null });
   assert.equal(missing.available, false);
-  assert.equal(missing.resolve(ref), null);
+  assert.equal(await missing.resolve(ref), null);
 });
