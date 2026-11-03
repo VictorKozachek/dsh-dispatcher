@@ -1244,3 +1244,36 @@ test("аборт на уровне фичевой сборки закрывае�
 
   for (const dispose of [...disposers].reverse()) await dispose?.();
 });
+
+test("dispose мультиканального ответчика закрывает оба канала", async () => {
+  const telegram = fakeTransport("telegram");
+  const max = fakeTransport("max");
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({ transports: [telegram, max], registry, log: () => {}, now: () => 0 });
+  const detach = answerer.attach({
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+    get: () => null,
+  });
+  // Ошибки ожиданий не должны всплывать как unhandledRejection.
+  process.once("unhandledRejection", () => {});
+
+  const pending = answerer.handler(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: "s1" } },
+    () => assert.fail("next() нельзя"),
+  );
+  pending.catch(() => {});
+  await tick();
+  assert.equal(telegram.sent.length, 1);
+  assert.equal(max.sent.length, 1);
+
+  answerer.dispose("disposed"); // выгрузка плагина: открытые вопросы снимаются
+  await tick();
+
+  assert.deepEqual(telegram.closed.map((item) => item.summary), ["disposed"], "telegram закрыт");
+  assert.deepEqual(max.closed.map((item) => item.summary), ["disposed"], "max закрыт");
+  detach(); // повторная выгрузка — no-op
+});

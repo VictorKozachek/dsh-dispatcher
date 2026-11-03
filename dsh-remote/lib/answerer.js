@@ -548,12 +548,17 @@ export function createAnswerer({
   function dispose(reason = "disposed") {
     disposed = true;
     for (const entry of pending.values()) {
-      entry.question.cancel(reason, now());
+      const question = entry.question;
+      question.cancel(reason, now());
       try {
-        const closing = transport?.closeQuestion?.(entry.question, reason);
+        // 012: в мультиканале закрываем все доставки через брокер (одиночный
+        // `transport` — пустой фасад, и кнопки остались бы в обоих каналах).
+        const closing = useBroker && (question.deliveries?.length ?? 0) > 0
+          ? broker.closeAll(question, { winner: null, summary: reason })
+          : primary?.closeQuestion?.(question, reason);
         if (closing !== null && typeof closing?.then === "function") closing.catch(() => {});
       } catch (error) {
-        log(`вопрос ${entry.question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
+        log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
       }
       entry.reject(abortError(reason));
     }
