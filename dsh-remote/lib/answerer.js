@@ -144,6 +144,8 @@ export function createAnswerer({
   channelOf = null,
   /** Гибридный режим (013): `{enabled, waitMs}` или функция, отдающая его. */
   hybrid = null,
+  /** 031: метрики (только числа). */
+  metrics = null,
   /** 013: доставка позднего ответа; по умолчанию `sessionController.prompt`. */
   steer = null,
   /** 013: таймеры инжектируются, тесты не ждут реальные 20 секунд. */
@@ -202,7 +204,7 @@ export function createAnswerer({
   const channels = (Array.isArray(transports) && transports.length > 0 ? transports : (transport === null ? [] : [transport]))
     .filter((item) => item !== null && typeof item === "object");
   const useBroker = channels.length > 1;
-  const broker = useBroker ? createBroker({ transports: channels, deliverFor, log }) : null;
+  const broker = useBroker ? createBroker({ transports: channels, deliverFor, log, metrics }) : null;
   const primary = channels[0] ?? null;
   /**
    * Доставка вопроса: по умолчанию — транспорт, но 008 подставляет сюда
@@ -407,6 +409,13 @@ export function createAnswerer({
       return;
     }
     if (!entry.question.accept(parsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
+    try {
+      metrics?.inc?.("questions.answered");
+      const createdAt = entry.question.createdAt ?? null;
+      if (Number.isFinite(createdAt)) metrics?.observeLatency?.(Math.max(0, now() - createdAt));
+    } catch {
+      /* метрики не должны ронять ответ */
+    }
     entry.question.answeredVia = sourceTransport?.id ?? entry.question.answeredVia ?? null;
     pending.delete(normalized.shortId);
     reliability?.unwatch?.(normalized.shortId);
@@ -496,6 +505,11 @@ export function createAnswerer({
         known.set(created.shortId, created);
         if (known.size > 200) known.delete(known.keys().next().value);
         questions.push(created);
+        try {
+          metrics?.inc?.("questions.asked");
+        } catch {
+          /* метрики не должны ронять вопрос */
+        }
       }
     } catch (error) {
       log(`вопрос: разобрать запрос не удалось (${error?.message ?? error}) — отдаю GUI`);
@@ -524,6 +538,11 @@ export function createAnswerer({
       reliability?.watch?.(question, {
         sessionId: question.sessionId,
         onExpire: (info) => {
+          try {
+            metrics?.inc?.("questions.expired");
+          } catch {
+            /* метрики не должны ронять TTL */
+          }
           const entry = pending.get(question.shortId);
           if (entry === undefined) return;
           pending.delete(question.shortId);
@@ -633,18 +652,39 @@ export function createAnswerer({
           }
           const outcome = await Promise.race([sendOne(question, request?.signal), aborted]);
           if (outcome === "give-up") {
+            try {
+              metrics?.inc?.("deliveries.failed");
+              metrics?.transportError?.(primary?.id ?? "other");
+            } catch {
+              /* метрики не должны ронять доставку */
+            }
             // Недоставка за отведённое время: вопрос достаётся GUI, сессия не висит.
             log(`вопрос ${question.shortId}: не доставлен — отдаю GUI (next)`);
             await closeQuestions(questions, "undelivered", attempted);
             return next();
           }
+          try {
+            metrics?.inc?.("deliveries.sent");
+          } catch {
+            /* метрики не должны ронять доставку */
+          }
         }
       } catch (error) {
         if (error?.name === "AbortError") {
+          try {
+            metrics?.inc?.("questions.cancelled", questions.length);
+          } catch {
+            /* метрики не должны ронять аборт */
+          }
           await closeQuestions(questions, "aborted", attempted);
           throw error;
         }
         log(`вопрос: доставить не удалось (${error?.message ?? error}) — снимаю и отдаю GUI`);
+        try {
+          metrics?.inc?.("questions.cancelled", questions.length);
+        } catch {
+          /* метрики не должны ронять отправку */
+        }
         await closeQuestions(questions, "send-failed", attempted);
         return next();
       }
@@ -659,6 +699,11 @@ export function createAnswerer({
       } catch (error) {
         cleanupHybrid();
         if (error?.name === "AbortError") {
+          try {
+            metrics?.inc?.("questions.cancelled", questions.length);
+          } catch {
+            /* метрики не должны ронять аборт */
+          }
           await closeQuestions(questions, "aborted", attempted);
           throw error;
         }

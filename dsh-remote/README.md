@@ -487,3 +487,30 @@ approvals:
   раньше: TTL — отказ (`decision=timeout`, поздний клик только логируется), hybrid
   — уход в GUI (`decision=gui`, поздний клик — `decision=late`). Второй таймер
   снимается, поэтому ровно один исход, один `next()` и одна запись решения.
+
+## Метрики и `/remote stats`
+
+Плагин ведёт счётчики в памяти процесса (сброс при старте) и публикует их как
+сервис `remoteMetrics` — его читают `/remote stats`, панель (009) и doctor (030).
+
+```
+/remote stats          # человеческая сводка
+/remote stats --json   # машиночитаемо
+```
+
+Что считается (только числа, без тел вопросов, id людей и токенов):
+
+- **вопросы**: `asked`, `answered`, `expired`, `cancelled`;
+- **подтверждения**: `allowed_once`, `rejected`, `unavailable`, `cancelled`,
+  `policy_gui` (отдано GUI политикой), `timeout` (TTL-отказ), `late` (поздний клик
+  после гибрида);
+- **доставки**: `sent`, `failed`, `retried` (повторы reliability);
+- **латентность ответа**: `count`, `sumMs` и гистограмма с фиксированными бакетами
+  (`100 мс … 5 мин`) — память не растёт;
+- **ошибки транспортов**: по id (`telegram`/`max`/`relay`/`fake`), остальные —
+  `other` (чужие идентификаторы в метрики не попадают);
+- **очереди**: `deliveries_pending`, `timers_active`, `approvals_open` (живые
+  значения на момент `/remote stats`).
+
+`--json` отдаёт стабильную структуру
+`{questions, approvals, deliveries, errors, queues, latency:{count,sumMs,buckets}, uptimeMs}`.

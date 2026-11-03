@@ -291,6 +291,8 @@ export function createReliability({
   setTimeout: setTimeoutImpl = setTimeout,
   /** 012: (transportId) => transport, чтобы TTL/напоминания шли во все каналы. */
   transportFor = null,
+  /** 031: метрики повторов доставки. */
+  metrics = null,
 } = {}) {
   if (!ON_EXPIRE_VALUES.includes(onExpire)) {
     throw new TypeError(`reliability: onExpire должен быть одним из ${ON_EXPIRE_VALUES.join(", ")}`);
@@ -499,6 +501,12 @@ export function createReliability({
         const backoff = Math.min(backoffMaxMs, backoffBaseMs * 2 ** (attempt - 1));
         const wait = retryAfter > 0 ? retryAfter : backoff;
         const remaining = deadline - now();
+        try {
+          metrics?.inc?.("deliveries.retried");
+          metrics?.transportError?.(active?.id ?? "other");
+        } catch {
+          /* метрики не должны ронять доставку */
+        }
         journal.append({
           event: "delivery-failed",
           shortId: question.shortId,

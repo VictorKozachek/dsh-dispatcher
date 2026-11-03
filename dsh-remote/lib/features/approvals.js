@@ -103,6 +103,7 @@ export const approvalsFeature = {
       registry,
       audit,
       hybrid,
+      metrics: deps.get("remoteMetrics") ?? null,
       // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
       channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
       policy,
@@ -114,7 +115,13 @@ export const approvalsFeature = {
     deps.onDispose(approvals.attach(ctx));
 
     try {
-      ctx.provide?.(APPROVALS_SERVICE, { stats: approvals.stats, policy });
+      ctx.provide?.(APPROVALS_SERVICE, {
+        stats: approvals.stats,
+        policy,
+        get pendingOpen() {
+          return approvals.pending?.size ?? 0;
+        },
+      });
       // Для `/remote status` (025): действующая политика.
       ctx.provide?.("remoteApprovalPolicy", policy);
     } catch (error) {

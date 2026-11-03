@@ -29,6 +29,7 @@ import { createRegistry } from "./domain/registry.js";
 import { credentialRef, createCredentialAccess } from "./store.js";
 import { RELAY_TOKEN_REF } from "./transport/relay.js";
 import { createAudit } from "./audit.js";
+import { formatStats } from "./metrics.js";
 import { randomUUID } from "node:crypto";
 
 /** Имя ссылки на токен Telegram в `ctx.credentials` (не значение!). */
@@ -55,7 +56,8 @@ const HELP_TEXT = [
   "  /remote audit [N]  — последние N решений по подтверждениям (по умолчанию 20)",
   "  /remote test       — отправить тестовый вопрос в мессенджер",
   "  /remote who        — сессия, воркспейс и эффективный режим",
-  "  /remote doctor     — проверка привязки, канала и состояния (ok/warn/fail)",
+  "  /remote doctor [--json] — проверка привязки, канала и состояния (ok/warn/fail; JSON для скриптов)",
+  "  /remote stats [--json] — метрики: вопросы, подтверждения, доставки, латентность, очереди",
   "  /remote channel <проект> <chatId> [threadId] — канал проекта (топик форума)",
   "    --force          — если бот действительно в другом чате (чужой чат иначе отвергается)",
   "    --transport=<id> — канал для конкретного канала (telegram, max); по умолчанию — транспорт привязки",
@@ -1014,6 +1016,33 @@ export function createRemoteCommands({
   }
 
   /** `/remote doctor` — диагностика: токен, getMe, поллеры, канал, состояние. */
+  /**
+   * `/remote stats [--json]` — метрики за время работы плагина (031).
+   *
+   * Только числа: счётчики вопросов/подтверждений, доставки, латентность,
+   * размеры очередей. `--json` — стабильная структура для панели и скриптов.
+   */
+  async function stats(invocation, flags) {
+    const metrics = ctx?.get?.("remoteMetrics") ?? null;
+    if (metrics === null || typeof metrics?.snapshot !== "function") {
+      return failure("метрики недоступны: плагин без фичи metrics (031)");
+    }
+    // Живые размеры очередей: устойчивость знает pending/timers, approvals — open.
+    try {
+      const reliability = ctx?.get?.("remoteReliability") ?? null;
+      const health = typeof reliability?.healthCheck === "function" ? await reliability.healthCheck() : null;
+      if (Number.isFinite(health?.pending)) metrics.gauge("deliveries_pending", health.pending);
+      if (Number.isFinite(health?.watching)) metrics.gauge("timers_active", health.watching);
+      const approvals = ctx?.get?.("remoteApprovals") ?? null;
+      if (Number.isFinite(approvals?.pendingOpen)) metrics.gauge("approvals_open", approvals.pendingOpen);
+    } catch (error) {
+      log(`stats: размеры очередей не прочитаны (${humanError(error)})`);
+    }
+    const snapshot = metrics.snapshot();
+    if (flags?.has?.("json") === true) return success(JSON.stringify(snapshot));
+    return success(formatStats(snapshot));
+  }
+
   async function doctor() {
     const checks = await runDoctorChecks({
       store,
@@ -1117,7 +1146,9 @@ export function createRemoteCommands({
         case "who":
           return who(invocation);
         case "doctor":
-          return await doctor();
+          return await doctor(invocation, flags);
+        case "stats":
+          return await stats(invocation, flags);
         case "channel":
           return channelCommand(invocation, flags, rest, flagValues);
         case "disconnect":
