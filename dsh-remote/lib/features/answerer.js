@@ -70,6 +70,7 @@ export const answererFeature = {
       hybrid: () => (store?.read?.().hybrid ?? { enabled: false }),
       registry,
       reliability,
+      metrics: deps.get("remoteMetrics") ?? null,
       deliver: reliability === null ? null : (argument) => reliability.deliver(argument),
       log: (message) => deps.logger.debug(message),
     });
