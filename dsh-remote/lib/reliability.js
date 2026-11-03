@@ -109,17 +109,23 @@ export function findSecrets(text) {
   value = value.replace(PRIVATE_KEY, () => mask("<private key скрыт>"));
   value = value.replace(BOT_TOKEN, (_match, id) => mask(`${id}:<redacted>`));
   value = value.replace(API_KEY, () => mask("sk-<redacted>"));
-  value = value.replace(BASE64_RUN, (candidate, offset) => {
+  value = value.replace(BASE64_RUN, (candidate) => {
     const digits = (candidate.match(/\d/g) ?? []).length;
-    const before = value[offset - 1] ?? "";
     const segments = candidate.split("/");
-    // Путь узнаём по структуре: абсолютный (перед ним или в начале слэш) либо
-    // относительный из CamelCase-сегментов. Доля цифр ничего не решает: в
-    // /Projects/2026/11/03 их много, а base64 без '+'/'=' их может не иметь.
-    const absolute = before === "/" || candidate.startsWith("/");
-    const camel = segments.length >= 2
-      && segments.every((part) => /^[A-Z][a-z0-9][A-Za-z0-9._-]*$/.test(part));
-    const looksLikePath = absolute || camel;
+    // Путь узнаём по структуре сегментов: слово в CamelCase/нижнем регистре,
+    // короткая аббревиатура из заглавных или число (дата). Base64 так не
+    // выглядит: в его сегментах заглавные буквы стоят в середине слова, а доля
+    // цифр ничего не решает — в /Projects/2026/11/03 их много.
+    // Сегмент пути — слово (CamelCase с заглавной, нижний регистр, короткая
+    // аббревиатура или число), но не «случайная» base64-строка: у той внутри
+    // слова много переходов нижний→верхний регистр, а длина обычно ≥ 10.
+    const looksRandom = (part) => part.length >= 10
+      && /[a-z]/.test(part) && /[A-Z]/.test(part) && /\d/.test(part)
+      && (part.match(/[a-z][A-Z]/g) ?? []).length >= 2;
+    const pathSegment = (part) => part.length <= 40
+      && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part)
+      && !looksRandom(part);
+    const looksLikePath = candidate.length <= 200 && segments.every(pathSegment);
     if (!(/[A-Z]/.test(candidate) && /[a-z]/.test(candidate) && digits > 0) || looksLikePath) return candidate;
     return mask("<redacted-base64>");
   });

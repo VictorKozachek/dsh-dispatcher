@@ -15,6 +15,7 @@ import path from "node:path";
 import { createQuestion } from "../lib/domain/question.js";
 import { createRegistry } from "../lib/domain/registry.js";
 import { createAnswerer } from "../lib/answerer.js";
+import { createTelegramTransport } from "../lib/transport/telegram.js";
 import {
   CONNECT_TIMEOUT_MS,
   REMINDER_MS,
@@ -1066,4 +1067,64 @@ test("answerer -> watch/deliver -> state с chatId -> recover после рес�
   const { reliability: afterRestart } = makeReliability(t, { transport: restarted, clock, state: reliability.store });
   await afterRestart.recoverOrphans();
   assert.deepEqual(edited[0].target, { chatId, messageId: 500 }, "recover не падает на chatId null");
+});
+
+test("настоящий telegram: chatId транспорта доезжает до состояния и recover", async (t) => {
+  const clock = fakeClock();
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const method = url.split("/").pop();
+    calls.push(method);
+    if (method === "getUpdates") {
+      return new Promise((resolve, reject) => {
+        init.signal?.addEventListener?.("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    }
+    if (method === "sendMessage") {
+      return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 900 } }; } };
+    }
+    return { ok: true, status: 200, async json() { return { ok: true, result: { message_id: 1, username: "test_bot" } }; } };
+  };
+  const transport = createTelegramTransport({
+    token: "123456:TEST-TOKEN",
+    chatId: 42,
+    allowedUserIds: [7],
+    fetch: fetchImpl,
+    jitter: () => 0,
+    now: () => 0,
+    sleep: async () => {},
+    log: () => {},
+    persistOffset: () => {},
+  });
+  t.after(() => {
+    void transport.stop?.();
+  });
+  const { reliability } = makeReliability(t, { clock, transport });
+
+  assert.equal(await reliability.deliver({ question: openQuestion() }), "delivered");
+
+  const [saved] = reliability.store.read().questions;
+  assert.equal(saved.chatId, 42, "chatId взят из настоящего транспорта (get chatId)");
+  assert.equal(saved.messageId, 900);
+
+  const edited = [];
+  const restarted = {
+    id: "telegram",
+    caps: {},
+    async editMessage(target, text) { edited.push({ target, text }); },
+    async clearButtons() {},
+  };
+  const { reliability: afterRestart } = makeReliability(t, { transport: restarted, clock, state: reliability.store });
+  await afterRestart.recoverOrphans();
+  assert.deepEqual(edited[0].target, { chatId: 42, messageId: 900 }, "recover правит по реальным id");
+});
+
+test("redact: base64 после слэша маскируется, путь — нет", () => {
+  assert.match(redact("ключ: /QWxhZGRpbjpvcGVu/c2FtZQ1hZWxsbw/QWxhZGRpbjpvcG"), /<redacted-base64>/);
+  assert.equal(redact("/Users/Victor/Projects/DSHDispatcher/Worktree008"), "/Users/Victor/Projects/DSHDispatcher/Worktree008");
+  assert.equal(redact("/Users/Victor/Projects/2026/11/03/DSH/Worktree008"), "/Users/Victor/Projects/2026/11/03/DSH/Worktree008");
 });

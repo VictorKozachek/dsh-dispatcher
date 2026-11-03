@@ -520,6 +520,10 @@ export function createTelegramTransport(options = {}) {
 
   const transport = {
     id: "telegram",
+    /** Чат привязки: reliability сохраняет его рядом с messageId для recover. */
+    get chatId() {
+      return chatId;
+    },
     caps,
 
     /** Поднять поллинг. Повторный вызов безопасен. */
