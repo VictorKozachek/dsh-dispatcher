@@ -109,10 +109,17 @@ function withFeatures(extra, run) {
   }
 }
 
-test("каркас: имя плагина, пустой inject и пустой реестр фич", () => {
+test("каркас: имя плагина, пустой inject и фичи с контрактом", () => {
   assert.equal(name, "dsh-remote");
   assert.deepEqual(inject, []);
-  assert.deepEqual(features, []);
+  // Реестр больше не пуст: задачу 001 он поднимал пустым, 002 подключила ответчика.
+  // Здесь проверяем контракт фичи, а не конкретный состав — состав растёт с задачами.
+  for (const feature of features) {
+    assert.equal(typeof feature.name, "string", "у фичи есть имя для лога");
+    assert.equal(typeof feature.apply, "function", "у фичи есть apply");
+    assert.ok(Array.isArray(feature.needs ?? []), "needs — список сервисов или отсутствует");
+  }
+  assert.deepEqual(features.map((feature) => feature.name), ["answerer"]);
 });
 
 test("apply поднимается на пустом ctx без сервисов и не бросает", () => {
