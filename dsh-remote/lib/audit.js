@@ -34,8 +34,11 @@ export const DEFAULT_KEEP_ROTATED = 3;
 /** Что пишем: только подтверждения (вопросы — история сессии в DSH). */
 export const AUDIT_KIND_APPROVAL = "approval";
 
-/** Откуда пришло решение: удалённо, отдано GUI, истекло/снято без ответа. */
-export const AUDIT_DECISIONS = Object.freeze(["remote", "gui", "timeout"]);
+/**
+ * Откуда пришло решение: удалённо, отдано GUI, истекло/снято без ответа,
+ * `late` — ответ пришёл после ухода запроса в GUI (гибрид, задача 028).
+ */
+export const AUDIT_DECISIONS = Object.freeze(["remote", "gui", "timeout", "late"]);
 
 /** Разрешённые поля записи (лишние отбрасываются — так безопаснее). */
 export const ALLOWED_KEYS = Object.freeze([
@@ -245,11 +248,12 @@ export function createAudit({
   /** Сводка для `/remote status`: сколько решено удалённо/GUI/без ответа. */
   function stats() {
     const all = entries();
-    const summary = { total: all.length, remote: 0, gui: 0, timeout: 0 };
+    const summary = { total: all.length, remote: 0, gui: 0, timeout: 0, late: 0 };
     for (const entry of all) {
       if (entry.decision === "remote") summary.remote += 1;
       else if (entry.decision === "gui") summary.gui += 1;
       else if (entry.decision === "timeout") summary.timeout += 1;
+      else if (entry.decision === "late") summary.late += 1;
     }
     return summary;
   }

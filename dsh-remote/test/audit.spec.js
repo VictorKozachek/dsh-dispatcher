@@ -62,7 +62,7 @@ test("запись и чтение: JSONL, только разрешённые �
   assert.equal(fs.readFileSync(file, "utf8").includes("rm -rf"), false);
 
   assert.deepEqual(audit.tail(5), [parsed]);
-  assert.deepEqual(audit.stats(), { total: 1, remote: 1, gui: 0, timeout: 0 });
+  assert.deepEqual(audit.stats(), { total: 1, remote: 1, gui: 0, timeout: 0, late: 0 });
 });
 
 test("секреты вычищаются даже из разрешённых полей", (t) => {
@@ -116,7 +116,7 @@ test("пустой и битый журнал не ломают чтение", (
 
   const empty = createAudit({ file });
   assert.deepEqual(empty.tail(20), []);
-  assert.deepEqual(empty.stats(), { total: 0, remote: 0, gui: 0, timeout: 0 });
+  assert.deepEqual(empty.stats(), { total: 0, remote: 0, gui: 0, timeout: 0, late: 0 });
 
   fs.writeFileSync(file, '{"ts":"t","kind":"approval","decision":"remote"}\nОБРЫВОК{');
   const broken = createAudit({ file });
@@ -156,4 +156,14 @@ test("существующий файл с 644 чинится до 600 при з
   audit.append(entry({ questionId: "approval-2" }));
 
   assert.equal(fs.statSync(file).mode & 0o777, 0o600, "журнал должен быть доступен только владельцу");
+});
+
+test("decision late: поздний ответ хранится и считается отдельно", (t) => {
+  const dir = tempDir(t);
+  const audit = createAudit({ file: path.join(dir, AUDIT_FILE_NAME) });
+
+  assert.equal(audit.append(entry({ decision: "late", outcome: "rejected" })), true);
+
+  assert.deepEqual(audit.stats(), { total: 1, remote: 0, gui: 0, timeout: 0, late: 1 });
+  assert.equal(sanitizeEntry({ ts: "t", kind: "approval", decision: "late" })?.decision, "late");
 });

@@ -1433,3 +1433,21 @@ test("status: сводка по подтверждениям — удалённ�
   assert.equal(result.kind, "success");
   assert.match(result.text, /подтверждения: удалённо 1, в GUI 1, без ответа 1 \(всего 3\)/);
 });
+
+test("/remote audit: поздний ответ помечается «поздний», сводка статуса не меняется", async (t) => {
+  const stand = harness(t);
+  writeAudit(stand, [
+    AUDIT_REMOTE,
+    AUDIT_GUI,
+    AUDIT_TIMEOUT,
+    { ...AUDIT_REMOTE, questionId: "a-4", decision: "late", outcome: "rejected" },
+  ]);
+
+  const auditResult = await stand.remote.handler(invoke("audit 1"));
+  assert.equal(auditResult.kind, "success");
+  assert.match(auditResult.text, /поздний/);
+  assert.match(auditResult.text, /rejected/);
+
+  const status = await stand.remote.handler(invoke("status"));
+  assert.match(status.text, /подтверждения: удалённо 1, в GUI 1, без ответа 1 \(всего 4\)/);
+});
