@@ -41,7 +41,7 @@ worktree), тем чаще агент упирается в такой вопр�
 |---|---|---|
 | Вопрос человека | инструмент `ask_user_question` → `ctx.userQuestions.ask({questions, agent, signal})` | `packages/interaction/tool-ask-user/src/index.ts` |
 | **Точка перехвата** | waterfall-событие `user-questions/request` — композиция «ответчиков»; вернуть ответ или вызвать `next()` | `packages/interaction/user-questions/src/index.ts:136` |
-| Форма вопроса | `{id, question, detail?, header?, options?: [{label, description?}], multiSelect?, intent?}` | `packages/interaction/user-questions/src/types.ts` |
+| Форма вопроса | `{id, question, header?, options?: [{label, description?}], multiSelect?}` — `detail`/`intent` есть в сервисе, но **модель их не передаёт** | `packages/interaction/user-questions/src/types.ts`, `tool-ask-user/src/index.ts:23-56` |
 | Форма ответа | `{answers: [{id, selected: string[], custom?: string}]}` | там же |
 | Откуда вопрос | `request.agent.id` = `SessionId`; шапка сессии даёт `cwd` (воркспейс) и `agentPreset` (роль) | `packages/core/session/src/types.ts:68` |
 | Команды в чате | `ctx.commands.register({name, description, handler})` — слэш-команды, исполняются без модели | `packages/interaction/commands/src/index.ts` |
@@ -303,6 +303,10 @@ DSH: (локальный вопрос — удалённый режим ещё �
 30 с) доставить не удалось — ответчик отдаёт вопрос `next()`, то есть **в GUI**:
 лучше спросить локально, чем молчать. В журнал — причина.
 
+Это штатный, а не аварийный путь: `next()` можно звать с задержкой, пока жив
+`signal` запроса; если же `signal` уже абортнут, Gateway сам снимет событие.
+Обратный порядок (сначала GUI, потом телефон) так не работает — см. §7.1.
+
 ### 7.3. Человек не ответил
 
 - за 5 минут до TTL — мягкое напоминание **правкой** сообщения («⏳ осталось 5
@@ -376,6 +380,12 @@ NAT, документированные лимиты), **вторым MAX** — 
 устойчивости: один и тот же вопрос уходит в оба, ответ принимается первый,
 второй канал помечается «отвечено в другом». Транспорт выбирается в
 `/remote connect`, переключение — без переустановки.
+
+Оговорка про входящий трафик: DSH-сервер слушает loopback, а `--host 0.0.0.0`
+запрещён — значит **принять webhook снаружи нельзя в принципе**. Для MAX это
+означает либо туннель (cloudflared/ngrok), проброшенный на loopback:443, либо
+best-effort `GET /updates` с оговорками из отчёта. Ещё один аргумент, почему
+MAX — вторая фаза, а не первая.
 
 Отдельно рассматривали как «дешёвый канал» ntfy/Apprise — годится для
 уведомлений, но интерактивные ответы (кнопки + колбэки + правка сообщения) там
