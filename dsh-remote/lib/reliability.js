@@ -33,6 +33,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+import { rotateIfNeeded } from "./rotate.js";
 import { randomUUID } from "node:crypto";
 
 const noop = () => {};
@@ -203,12 +205,12 @@ export function createJsonState({ file, now = () => Date.now(), logger = noop } 
  * `log.jsonl` без секретов: записи — только служебные поля, значения проходят
  * через `redact`, тела вопросов не пишутся. Ротация по размеру (`.1`).
  */
-export function createJournalLog({ file, maxBytes = 512 * 1024, now = () => Date.now(), logger = noop } = {}) {
+export function createJournalLog({ file, maxBytes = 5 * 1024 * 1024, keep = 5, now = () => Date.now(), logger = noop } = {}) {
   function append(entry) {
     const line = JSON.stringify(redactEntry({ at: now(), ...entry }));
     try {
       fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      rotateIfNeeded(file, maxBytes, line);
+      rotateIfNeeded(fs, file, line.length + 1, { maxBytes, keep, log: logger });
       fs.appendFileSync(file, `${line}\n`, { mode: 0o600 });
       try {
         fs.chmodSync(file, 0o600);
@@ -219,21 +221,6 @@ export function createJournalLog({ file, maxBytes = 512 * 1024, now = () => Date
     } catch (error) {
       logger(`журнал: запись не удалась (${error?.message ?? error})`);
       return false;
-    }
-  }
-
-  function rotateIfNeeded(target, limit, incoming) {
-    let size = 0;
-    try {
-      size = fs.statSync(target).size;
-    } catch {
-      return;
-    }
-    if (size + incoming.length + 1 <= limit) return;
-    try {
-      fs.renameSync(target, `${target}.1`);
-    } catch (error) {
-      logger(`журнал: ротация не удалась (${error?.message ?? error})`);
     }
   }
 
@@ -291,6 +278,10 @@ export function createReliability({
   setTimeout: setTimeoutImpl = setTimeout,
   /** 012: (transportId) => transport, чтобы TTL/напоминания шли во все каналы. */
   transportFor = null,
+  /** 031: метрики повторов доставки. */
+  metrics = null,
+  /** 033: предел очереди pending в state.json. */
+  maxPending = 200,
 } = {}) {
   if (!ON_EXPIRE_VALUES.includes(onExpire)) {
     throw new TypeError(`reliability: onExpire должен быть одним из ${ON_EXPIRE_VALUES.join(", ")}`);
@@ -328,6 +319,14 @@ export function createReliability({
       store.update((raw) => {
         const current = normalizeState(raw);
         const exists = current.pending.some((item) => item.shortId === question.shortId);
+        // 033: очередь не растёт бесконечно — старейший вытесняется с записью в журнал.
+        let dropped = null;
+        if (!exists && current.pending.length >= Math.max(1, Math.floor(maxPending))) {
+          dropped = current.pending.shift() ?? null;
+          if (dropped !== null) {
+            journal.append({ event: "pending-dropped", shortId: dropped.shortId, reason: "max-pending" });
+          }
+        }
         if (!exists) {
           current.pending.push({
             shortId: question.shortId,
@@ -499,6 +498,12 @@ export function createReliability({
         const backoff = Math.min(backoffMaxMs, backoffBaseMs * 2 ** (attempt - 1));
         const wait = retryAfter > 0 ? retryAfter : backoff;
         const remaining = deadline - now();
+        try {
+          metrics?.inc?.("deliveries.retried");
+          metrics?.transportError?.(active?.id ?? "other");
+        } catch {
+          /* метрики не должны ронять доставку */
+        }
         journal.append({
           event: "delivery-failed",
           shortId: question.shortId,
