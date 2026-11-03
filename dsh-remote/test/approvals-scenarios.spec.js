@@ -246,6 +246,54 @@ test("политика onTimeout=unavailable: TTL тоже отказ, но др
   assert.equal(nextCalls.length, 0, "решение принято (отказ), GUI не зовём");
 });
 
+test("нумерация: сбой доставки тратит номер, policy-GUI и ранний аборт — нет", async () => {
+  let sends = 0;
+  const sent = [];
+  const transport = {
+    id: "flaky",
+    async sendQuestion(question) {
+      sends += 1;
+      if (sends === 1) throw new Error("сеть недоступна");
+      sent.push(question);
+      return { messageId: 100 + sent.length };
+    },
+    async closeQuestion() {},
+    onAnswer() {
+      return () => {};
+    },
+  };
+  const policy = createApprovalPolicy({ tools: ["read_file"], denyRemote: [] });
+  const approvals = createApprovals({
+    transport,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    policy,
+    log: () => {},
+  });
+  approvals.attach(fakeContext());
+  const next = async () => "gui";
+
+  // 1) Политика отдаёт GUI (инструмент не в allowlist) — номер не тратится.
+  await approvals.handler(request({ toolName: "bash", callId: "call-policy" }), next);
+  // 2) Ранний аборт — номер тоже не тратится.
+  const aborted = new AbortController();
+  aborted.abort();
+  await approvals.handler(request({ callId: "call-abort", signal: aborted.signal }), next);
+  // 3) Сбой доставки: номер уже выдан перед sendQuestion и остаётся потраченным.
+  const failed = approvals.handler(request({ callId: "call-1" }), next);
+  await tick();
+  assert.equal(await failed, "gui", "сбой доставки уходит в GUI");
+  // 4) Следующее подтверждение получает #2, хотя в канале сообщений с #1 не было.
+  const second = approvals.handler(request({ callId: "call-2" }), next);
+  await tick();
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].queueNumber, 2, "неудачная отправка израсходовала номер #1");
+  assert.match(sent[0].title, /#2$/, "заголовок — «Подтверждение действия #2»");
+  assert.equal(approvals.pending.size, 1, "второе подтверждение ждёт ответа");
+  approvals.dispose("test-cleanup");
+  await second.catch(() => {});
+});
+
 // ---------------------------------------------------------------------------
 // Выключенный режим, аборт, падение транспорта
 // ---------------------------------------------------------------------------
