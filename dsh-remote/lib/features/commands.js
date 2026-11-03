@@ -211,6 +211,15 @@ export const commandsFeature = {
       disposed = true;
     });
 
+    // Реестр каналов (012): в него складывают транспорты фичи telegram/max,
+    // чтобы ответчик мог публиковать вопрос сразу в несколько.
+    const transportRegistry = new Map();
+    try {
+      ctx.provide?.("remoteTransports", transportRegistry);
+    } catch (error) {
+      deps.logger.warn(`фича commands: сервис remoteTransports не зарегистрирован (${error?.message ?? error})`);
+    }
+
     // Состояние как сервис: ответчик читает его для реестра режима.
     try {
       ctx.provide?.(STATE_SERVICE, store);
@@ -253,6 +262,7 @@ export const commandsFeature = {
     /** Хук для connect: канал поднимаем и ответчика применяем сразу, если ещё нет. */
     const ensure = async () => {
       const transport = await ensureAtStart();
+      if (transport !== null) transportRegistry.set(transport.id ?? "telegram", transport);
       if (transport !== null && !answererReady) {
         answererReady = true;
         await answererFeature.apply(ctx, config, deps);

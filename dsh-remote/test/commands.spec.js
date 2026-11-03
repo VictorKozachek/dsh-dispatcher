@@ -604,7 +604,7 @@ test("фича commands: сохранённая привязка поднима�
   await commandsFeature.apply(ctx, {}, deps);
 
   const names = provided.map((entry) => entry.name).sort();
-  assert.deepEqual(names, ["remoteStore", "remoteTransport"], "состояние и транспорт как сервисы");
+  assert.deepEqual(names, ["remoteStore", "remoteTransport", "remoteTransports"], "состояние, фасад и реестр каналов");
   const transportEntry = provided.find((entry) => entry.name === "remoteTransport");
   assert.equal(transportEntry.service.current.polling, true, "поллинг запущен");
   assert.match(logs.join("\n"), /канал поднят из сохранённой привязки/);

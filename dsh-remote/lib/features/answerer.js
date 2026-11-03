@@ -42,8 +42,19 @@ export const answererFeature = {
     // фиче; здесь только передаём их ответчику.
     const reliability = deps.get("remoteReliability");
 
+    // Два канала одновременно (012): список из config.transports, транспорты
+    // берём из реестра. Один канал — прежний путь через фасад.
+    const requested = Array.isArray(config?.transports) ? config.transports.filter((id) => typeof id === "string") : null;
+    const transportRegistry = deps.get("remoteTransports");
+    let transports = null;
+    if (requested !== null && requested.length > 1 && transportRegistry !== null) {
+      transports = requested.map((id) => transportRegistry.get(id) ?? null).filter((transport) => transport !== null);
+      if (transports.length <= 1) transports = null;
+    }
+
     const answerer = createAnswerer({
       transport: deps.get(TRANSPORT_SERVICE),
+      transports,
       registry,
       reliability,
       deliver: reliability === null ? null : (argument) => reliability.deliver(argument),

@@ -93,6 +93,13 @@ export const telegramFeature = {
       deps.logger.warn(`фича telegram: сервис ${TRANSPORT_SERVICE} не зарегистрирован (${error?.message ?? error})`);
     }
 
+    // Реестр каналов (012): ответчик может публиковать вопрос в несколько.
+    try {
+      ctx?.get?.("remoteTransports")?.set?.("telegram", transport);
+    } catch (error) {
+      deps.logger.debug(`фича telegram: реестр каналов недоступен (${error?.message ?? error})`);
+    }
+
     deps.onDispose(() => {
       void transport.stop();
     });
