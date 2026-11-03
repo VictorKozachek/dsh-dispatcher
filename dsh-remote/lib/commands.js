@@ -27,6 +27,8 @@ import { fileURLToPath } from "node:url";
 
 import { createRegistry } from "./domain/registry.js";
 import { credentialRef, createCredentialAccess } from "./store.js";
+import { RELAY_TOKEN_REF } from "./transport/relay.js";
+import { randomUUID } from "node:crypto";
 
 /** Имя ссылки на токен Telegram в `ctx.credentials` (не значение!). */
 export const TELEGRAM_TOKEN_REF = credentialRef("DSH_REMOTE_TELEGRAM_TOKEN");
@@ -461,10 +463,114 @@ export function createRemoteCommands({
   }
 
   /** `/remote connect` — пошаговая привязка бота. */
-  async function connect(invocation) {
-    if (!credentials.availableFor(TELEGRAM_TOKEN_REF)) {
-      return failure(`токен неоткуда взять: нет ctx.credentials и нет переменной ${TELEGRAM_TOKEN_REF}`);
+  /**
+   * `/remote connect relay`: URL релея + токен агента (секрет), проверка `/healthz`.
+   *
+   * В протоколе v1 плагин — **агент** (публикует вопросы и читает ответы), поэтому
+   * ему нужен `RELAY_AGENT_TOKEN` сервера, а не `deviceToken` телефона: pairing-код
+   * выдаёт токен устройству, которое не может публиковать вопросы (403). Это
+   * осознанное отличие от формулировки карточки, зафиксировано в README.
+   */
+  async function connectRelay(invocation) {
+    const urlAnswer = await askStep(invocation, {
+      id: "remote-connect-relay-url",
+      question: "URL релея (например https://relay.example): в ответе «Другой ответ».",
+    });
+    const url = String(urlAnswer.custom ?? "").trim().replace(/\/+$/, "");
+    if (url === "" || !/^https?:\/\//.test(url)) {
+      return failure("URL релея должен начинаться с http:// или https:// — привязка отменена");
     }
+
+    const tokenAnswer = await askStep(invocation, {
+      id: "remote-connect-relay-token",
+      question: `Токен агента релея (RELAY_AGENT_TOKEN сервера) — сохраним как ${RELAY_TOKEN_REF}. В ответе «Другой ответ».`,
+    });
+    const token = String(tokenAnswer.custom ?? "").trim();
+    if (token === "") return failure("токен не получен — привязка отменена");
+
+    let health;
+    try {
+      health = await relayHealth(url, token);
+    } catch (error) {
+      return failure(`релей недоступен: ${humanError(error, token)}`);
+    }
+    if (!health.ok) return failure(`релей не подтвердил себя: ${health.detail}`);
+    // Публичный /healthz не проверяет токен: нужен авторизованный пробник,
+    // иначе неверный токен сохранится и всплывёт только на отправке вопроса.
+    const probe = await relayAuthProbe(url, token);
+    if (!probe.ok) return failure(`релей не принял токен агента: ${probe.detail} — привязка отменена`);
+
+    const scopeAnswer = await askStep(invocation, {
+      id: "remote-connect-scope",
+      question: "Включить удалённый режим?",
+      options: ["Только этот проект", "Все проекты", "Пока не включать"],
+    });
+    const scope = planConnectScope(scopeAnswer, invocation);
+    try {
+      store.update((state) => {
+        state.bindings = {
+          transport: "relay",
+          url,
+          botUsername: "relay",
+          createdAt: now(),
+        };
+        if (scope.plan?.kind === "global") state.enabled.global = true;
+        if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
+        return state;
+      });
+    } catch (error) {
+      return failure(`привязка не сохранена: ${humanError(error, token)}`);
+    }
+    const saved = await credentials.set(RELAY_TOKEN_REF, token);
+    const tokenNote = saved
+      ? `токен сохранён как ${RELAY_TOKEN_REF}`
+      : credentials.available
+        ? `токен не сохранён: источник ${RELAY_TOKEN_REF} только для чтения`
+        : `токен взят из окружения (${RELAY_TOKEN_REF}) и не сохранён`;
+
+    return success([
+      `релей привязан: ${url} (${health.detail})`,
+      tokenNote,
+      scope.note,
+      "канал поднимется при следующей загрузке профиля (или после /remote on)",
+    ].join("\n"));
+  }
+
+  /**
+   * Авторизованный пробник: `GET /v1/answers?questionId=<uuid>`.
+   * `404` — токен принят (ответа ещё нет), `401/403` — токен неверный.
+   */
+  async function relayAuthProbe(url, token) {
+    const fetchFn = fetchImpl ?? globalThis.fetch;
+    try {
+      const response = await fetchFn(`${url}/v1/answers?questionId=${randomUUID()}`, {
+        method: "GET",
+        headers: { authorization: `Bearer ${token}`, "x-relay-version": "1" },
+      });
+      if (response.status === 404) return { ok: true, detail: "токен принят" };
+      if (response.status === 401 || response.status === 403) {
+        return { ok: false, detail: `unauthorized (HTTP ${response.status})` };
+      }
+      return { ok: false, detail: `неожиданный ответ HTTP ${response.status}` };
+    } catch (error) {
+      return { ok: false, detail: humanError(error, token) };
+    }
+  }
+
+  /** Проверка живости релея без транспорта: `/healthz` + обязательный заголовок версии. */
+  async function relayHealth(url, token) {
+    const response = await (fetchImpl ?? globalThis.fetch)(`${url}/healthz`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${token}`, "x-relay-version": "1" },
+    });
+    if (!response.ok) {
+      return { ok: false, detail: `HTTP ${response.status}` };
+    }
+    const body = await response.json();
+    return { ok: body?.ok === true, detail: `relay ${body?.version ?? "?"}` };
+  }
+
+  async function connect(invocation) {
     // Шаги connect спрашиваются локальными вопросами. Если удалённый режим уже
     // включён, ответчик перехватит их и отправит в мессенджер — в том числе
     // вопрос про токен. Поэтому сначала просим выключить.
@@ -479,13 +585,21 @@ export function createRemoteCommands({
 
     let token = null;
     try {
-      const transportAnswer = await askStep(invocation, {
+      // Выбор транспорта — до проверок Telegram: у relay свой токен
+      // (`DSH_REMOTE_RELAY_TOKEN`), и без Telegram-секрета его тоже можно подключить.
+      const choice = await askStep(invocation, {
         id: "remote-connect-transport",
         question: "Какой транспорт подключить?",
-        options: ["Telegram", "MAX (пока недоступен)"],
+        options: ["Telegram", "Relay (свой сервер)", "MAX (пока недоступен)"],
       });
-      if (transportAnswer.selected[0]?.startsWith("MAX") === true) {
-        return failure("MAX пока не поддерживается (фаза 2) — выберите Telegram");
+      if (choice.selected[0]?.startsWith("MAX") === true) {
+        return failure("MAX пока не поддерживается (фаза 2) — выберите Telegram или Relay");
+      }
+      if (choice.selected[0]?.startsWith("Relay") === true) {
+        return await connectRelay(invocation);
+      }
+      if (!credentials.availableFor(TELEGRAM_TOKEN_REF)) {
+        return failure(`токен неоткуда взять: нет ctx.credentials и нет переменной ${TELEGRAM_TOKEN_REF}`);
       }
 
       const tokenAnswer = await askStep(invocation, {
@@ -655,7 +769,14 @@ export function createRemoteCommands({
       const created = Number.isFinite(state.bindings.createdAt)
         ? new Date(state.bindings.createdAt).toISOString()
         : "?";
-      lines.push(`бот: @${state.bindings.botUsername ?? "?"} (${state.bindings.transport}), чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
+      if (state.bindings.transport === "relay") {
+        const relay = liveTransport();
+        const health = typeof relay?.healthCheck === "function" ? await relay.healthCheck() : { ok: false, detail: "канал не поднят" };
+        lines.push(`релей: ${state.bindings.url ?? "?"}, ${health.ok ? "на связи" : `нет связи (${health.detail})`}`
+          + `${Number.isFinite(relay?.pending) ? `, ждёт ответа: ${relay.pending}` : ""}`);
+      } else {
+        lines.push(`бот: @${state.bindings.botUsername ?? "?"} (${state.bindings.transport}), чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
+      }
     }
 
     const described = await credentials.describe(TELEGRAM_TOKEN_REF);
