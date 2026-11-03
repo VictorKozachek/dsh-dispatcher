@@ -1,0 +1,25 @@
+{
+  "id": "b1e2c3d4-0000-4000-8000-000000000002",
+  "shortId": "deadbeef",
+  "workspace": "/home/vic/projects/dsh-dispatcher",
+  "options": [
+    {
+      "id": "o1",
+      "label": "Да"
+    },
+    {
+      "id": "o2",
+      "label": "Нет"
+    }
+  ],
+  "multiSelect": false,
+  "createdAt": "2026-11-03T18:01:00Z",
+  "expiresAt": "2026-11-03T18:31:00Z",
+  "enc": {
+    "enc": "Y2lwaGVydGV4dC1ieXRlcy0wMTIzNDU2Nzg5YWJjZGVm",
+    "nonce": "MDEyMzQ1Njc4OWFi",
+    "keyId": "key-2026-11",
+    "alg": "xchacha20poly1305",
+    "plainSize": 42
+  }
+}

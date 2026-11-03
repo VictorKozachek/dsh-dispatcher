@@ -1,0 +1,9 @@
+{
+  "deviceToken": "dt_0123456789abcdef0123456789abcdef",
+  "device": {
+    "deviceId": "7d0d9f7e-3c2a-4b1e-9f11-2a5c8e6b4d10",
+    "platform": "ios",
+    "createdAt": "2026-11-03T18:00:00Z"
+  },
+  "confirmedAt": "2026-11-03T18:00:05Z"
+}

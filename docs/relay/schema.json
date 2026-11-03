@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dsh-dispatcher.local/relay/v1.json",
+  "title": "DSH Relay Protocol v1",
+  "description": "Контракт плагина dsh-remote с релеем. Документ: docs/relay/PROTOCOL.md",
+  "version": "1.0.0",
+  "paths": {
+    "/v1/devices": { "post": { "request": "#/components/schemas/DeviceCreateRequest", "response": "#/components/schemas/Device" } },
+    "/v1/devices/{id}": { "delete": { "request": null, "response": null } },
+    "/v1/pair": { "post": { "request": "#/components/schemas/PairRequest", "response": "#/components/schemas/PairResponse" } },
+    "/v1/questions": { "post": { "request": "#/components/schemas/QuestionPublishRequest", "response": "#/components/schemas/Question" }, "get": { "request": null, "response": "#/components/schemas/QuestionList" } },
+    "/v1/answers": { "post": { "request": "#/components/schemas/AnswerRequest", "response": "#/components/schemas/Answer" }, "get": { "request": null, "response": "#/components/schemas/Answer" } },
+    "/v1/events": { "get": { "request": null, "response": "#/components/schemas/Event" } },
+    "/v1/health": { "get": { "request": null, "response": "#/components/schemas/Health" } },
+    "/v1/heartbeat": { "post": { "request": null, "response": null } }
+  },
+  "components": {
+    "schemas": {
+      "Version": { "type": "integer", "const": 1 },
+      "Device": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["deviceId", "platform", "createdAt"],
+        "properties": {
+          "deviceId": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "platform": { "type": "string", "enum": ["ios", "android", "web"] },
+          "createdAt": { "type": "string", "minLength": 20, "maxLength": 30 },
+          "pushToken": { "type": "string", "maxLength": 512 },
+          "label": { "type": "string", "maxLength": 120 }
+        }
+      },
+      "DeviceCreateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["platform", "publicKey"],
+        "properties": {
+          "platform": { "type": "string", "enum": ["ios", "android", "web"] },
+          "publicKey": { "type": "string", "minLength": 32, "maxLength": 4096 },
+          "pushToken": { "type": "string", "maxLength": 512 },
+          "label": { "type": "string", "maxLength": 120 },
+          "version": { "$ref": "#/components/schemas/Version" }
+        }
+      },
+      "PairRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pairCode", "deviceId"],
+        "properties": {
+          "pairCode": { "type": "string", "pattern": "^[0-9]{6}$" },
+          "deviceId": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "version": { "$ref": "#/components/schemas/Version" }
+        }
+      },
+      "PairResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["deviceToken", "device", "confirmedAt"],
+        "properties": {
+          "deviceToken": { "type": "string", "minLength": 32, "maxLength": 512 },
+          "device": { "$ref": "#/components/schemas/Device" },
+          "confirmedAt": { "type": "string", "minLength": 20, "maxLength": 30 }
+        }
+      },
+      "EncEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["enc", "nonce", "keyId", "alg", "plainSize"],
+        "properties": {
+          "enc": { "type": "string", "minLength": 16, "maxLength": 65536 },
+          "nonce": { "type": "string", "minLength": 16, "maxLength": 16 },
+          "keyId": { "type": "string", "minLength": 4, "maxLength": 64 },
+          "alg": { "type": "string", "enum": ["xchacha20poly1305", "aes256gcm"] },
+          "plainSize": { "type": "integer", "minimum": 0, "maximum": 49152 }
+        }
+      },
+      "QuestionOption": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "label"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 8 },
+          "label": { "type": "string", "minLength": 1, "maxLength": 120 }
+        }
+      },
+      "Question": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "shortId", "options", "createdAt", "expiresAt"],
+        "oneOf": [
+          { "required": ["body"] },
+          { "required": ["enc"] }
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "shortId": { "type": "string", "pattern": "^[0-9a-f]{8}$" },
+          "workspace": { "type": "string", "maxLength": 512 },
+          "taskId": { "type": "string", "maxLength": 16 },
+          "role": { "type": "string", "maxLength": 32 },
+          "title": { "type": "string", "maxLength": 200 },
+          "body": { "type": "string", "maxLength": 4000 },
+          "detail": { "type": "string", "maxLength": 2000 },
+          "options": { "type": "array", "minItems": 0, "maxItems": 10, "items": { "$ref": "#/components/schemas/QuestionOption" } },
+          "multiSelect": { "type": "boolean" },
+          "allowFreeText": { "type": "boolean" },
+          "createdAt": { "type": "string", "minLength": 20, "maxLength": 30 },
+          "expiresAt": { "type": "string", "minLength": 20, "maxLength": 30 },
+          "enc": { "$ref": "#/components/schemas/EncEnvelope" },
+          "version": { "$ref": "#/components/schemas/Version" }
+        }
+      },
+      "QuestionPublishRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["question"],
+        "properties": {
+          "question": { "$ref": "#/components/schemas/Question" },
+          "version": { "$ref": "#/components/schemas/Version" }
+        }
+      },
+      "QuestionList": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["questions", "nextSince"],
+        "properties": {
+          "questions": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/Question" } },
+          "nextSince": { "type": "string", "minLength": 20, "maxLength": 30 }
+        }
+      },
+      "AnswerRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["questionId", "selected", "answeredBy", "answeredAt", "idempotencyKey"],
+        "properties": {
+          "questionId": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "selected": { "type": "array", "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": 120 } },
+          "custom": { "type": "string", "maxLength": 2000 },
+          "answeredBy": { "type": "string", "maxLength": 64 },
+          "answeredAt": { "type": "string", "minLength": 20, "maxLength": 30 },
+          "idempotencyKey": { "type": "string", "pattern": "^[0-9a-fA-F-]{16,64}$" },
+          "enc": { "$ref": "#/components/schemas/EncEnvelope" },
+          "version": { "$ref": "#/components/schemas/Version" }
+        }
+      },
+      "Answer": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["questionId", "selected", "answeredBy", "answeredAt", "idempotencyKey"],
+        "properties": {
+          "questionId": { "type": "string", "minLength": 8, "maxLength": 64 },
+          "selected": { "type": "array", "maxItems": 10, "items": { "type": "string", "minLength": 1, "maxLength": 120 } },
+          "custom": { "type": "string", "maxLength": 2000 },
+          "answeredBy": { "type": "string", "maxLength": 64 },
+          "answeredAt": { "type": "string", "minLength": 20, "maxLength": 30 },
+          "idempotencyKey": { "type": "string", "pattern": "^[0-9a-fA-F-]{16,64}$" }
+        }
+      },
+      "Event": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "at"],
+        "properties": {
+          "type": { "type": "string", "enum": ["question.created", "question.answered", "question.expired", "pairing.confirmed", "device.revoked", "heartbeat"] },
+          "at": { "type": "string", "minLength": 20, "maxLength": 30 },
+          "questionId": { "type": "string", "maxLength": 64 },
+          "payload": { "type": "object" }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok", "version", "at"],
+        "properties": {
+          "ok": { "type": "boolean" },
+          "version": { "type": "string", "minLength": 1, "maxLength": 16 },
+          "at": { "type": "string", "minLength": 20, "maxLength": 30 }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["code", "message"],
+            "properties": {
+              "code": { "type": "string", "enum": ["bad-request", "unauthorized", "forbidden", "not-found", "conflict", "expired", "payload-too-large", "unsupported-version", "rate-limited", "internal"] },
+              "message": { "type": "string", "minLength": 1, "maxLength": 400 },
+              "retryable": { "type": "boolean" },
+              "details": { "type": "object" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
