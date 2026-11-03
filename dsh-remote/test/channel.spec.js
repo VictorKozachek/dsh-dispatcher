@@ -61,10 +61,13 @@ test("resolveChannel: канал проекта, fallback на общий чат
     channels: { alpha: { chatId: 100, threadId: 7 }, beta: { chatId: 200 } },
   };
 
-  assert.deepEqual(resolveChannel(state, "/p/alpha"), { chatId: 100, threadId: 7, source: "workspace" });
-  assert.deepEqual(resolveChannel(state, "/p/beta/"), { chatId: 200, threadId: null, source: "workspace" });
-  assert.deepEqual(resolveChannel(state, "/p/gamma"), { chatId: 42, threadId: null, source: "default" });
-  assert.deepEqual(resolveChannel({ bindings: null, channels: {} }, "/p/gamma"), { chatId: null, threadId: null, source: null });
+  assert.deepEqual(resolveChannel(state, "/p/alpha"), { chatId: 100, threadId: 7, transport: "telegram", source: "workspace" });
+  assert.deepEqual(resolveChannel(state, "/p/beta/"), { chatId: 200, threadId: null, transport: "telegram", source: "workspace" });
+  assert.deepEqual(resolveChannel(state, "/p/gamma"), { chatId: 42, threadId: null, transport: "telegram", source: "default" });
+  assert.deepEqual(resolveChannel({ bindings: null, channels: {} }, "/p/gamma"), { chatId: null, threadId: null, transport: null, source: null });
+  // Чужой транспорт не получает telegram-чат: для max канала нет.
+  assert.deepEqual(resolveChannel(state, "/p/alpha", "telegram"), { chatId: 100, threadId: 7, transport: "telegram", source: "workspace" });
+  assert.deepEqual(resolveChannel(state, "/p/alpha", "max"), { chatId: null, threadId: null, transport: "max", source: null });
 });
 
 test("вопрос уходит в канал своего проекта; нет канала — в общий чат", async (t) => {
@@ -78,7 +81,7 @@ test("вопрос уходит в канал своего проекта; не�
   const answerer = createAnswerer({
     transport,
     registry,
-    channelOf: (workspace) => resolveChannel(store.read(), workspace),
+    channelOf: (workspace, transportId) => resolveChannel(store.read(), workspace, transportId),
     log: () => {},
     now: () => 0,
   });
@@ -176,6 +179,8 @@ test("telegram: threadId едет как message_thread_id, чаты проек�
   assert.equal(answers.length, 0, "без апдейтов ответов нет");
 });
 
+const transportIdOf = (store) => store.read().bindings?.transport ?? "default";
+
 /** Команды `/remote` на временном состоянии. */
 function makeCommands(t) {
   const store = tempStore(t);
@@ -210,13 +215,13 @@ test("/remote channel: канал в свой чат, list, remove и status", a
 
   const set = await remote.handler(invoke("channel alpha 42 7"));
   assert.equal(set.kind, "success", set.text);
-  assert.deepEqual(store.read().channels.alpha, { chatId: 42, threadId: 7 });
+  assert.deepEqual(store.read().channels.alpha, { telegram: { chatId: 42, threadId: 7 } });
 
   const list = await remote.handler(invoke("channel list"));
-  assert.match(list.text, /alpha → чат 42, топик 7/);
+  assert.match(list.text, /alpha \(telegram\) → чат 42, топик 7/);
 
   const status = await remote.handler(invoke("status"));
-  assert.match(status.text, /канал alpha: чат 42, топик 7/);
+  assert.match(status.text, /канал alpha \(telegram\): чат 42, топик 7/);
 
   const removed = await remote.handler(invoke("channel remove alpha"));
   assert.equal(removed.kind, "success");
@@ -234,7 +239,7 @@ test("/remote channel: чужой chatId отвергается, --force обх�
 
   const forced = await remote.handler(invoke("channel beta 999 --force"));
   assert.equal(forced.kind, "success", forced.text);
-  assert.equal(store.read().channels.beta.chatId, 999);
+  assert.deepEqual(store.read().channels.beta.telegram, { chatId: 999 });
 });
 
 test("/remote channel: без привязки канал всё равно можно задать", async (t) => {
@@ -261,7 +266,7 @@ test("/remote channel: без привязки канал всё равно мо
   });
 
   assert.equal(result.kind, "success", result.text);
-  assert.equal(store.read().channels.gamma.chatId, 123);
+  assert.deepEqual(store.read().channels.gamma[transportIdOf(store)], { chatId: 123 });
 });
 
 test("/remote channel: нечисловой chatId отвергается", async (t) => {
@@ -279,7 +284,7 @@ test("/remote channel: отрицательный chatId группы/супер
   const result = await remote.handler(invoke("channel forum -1001234567890 7 --force"));
 
   assert.equal(result.kind, "success", result.text);
-  assert.deepEqual(store.read().channels.forum, { chatId: -1001234567890, threadId: 7 });
+  assert.deepEqual(store.read().channels.forum.telegram, { chatId: -1001234567890, threadId: 7 });
 });
 
 test("/remote channel: полный путь проекта нормализуется до basename", async (t) => {
@@ -289,7 +294,8 @@ test("/remote channel: полный путь проекта нормализуе
 
   assert.equal(result.kind, "success", result.text);
   assert.deepEqual(Object.keys(store.read().channels), ["alpha"], "ключ — basename");
-  assert.deepEqual(resolveChannel(store.read(), "/p/alpha"), { chatId: 42, threadId: null, source: "workspace" });
+  assert.deepEqual(resolveChannel(store.read(), "/p/alpha"), { chatId: 42, threadId: null, transport: "telegram", source: "workspace" });
+  assert.deepEqual(resolveChannel(store.read(), "/p/alpha", "max"), { chatId: null, threadId: null, transport: "max", source: null });
 });
 
 test("allowlist проектных чатов обновляется без рестарта транспорта", async (t) => {
@@ -315,7 +321,9 @@ test("allowlist проектных чатов обновляется без ре
     token: "123:TEST",
     chatId: 42,
     allowedUserIds: [7],
-    allowedChatIds: () => Object.values(store.read().channels).map((channel) => channel.chatId),
+    allowedChatIds: () => Object.values(store.read().channels)
+      .flatMap((perTransport) => Object.values(perTransport))
+      .map((channel) => channel.chatId),
     fetch: fetchImpl,
     jitter: () => 0,
     now: () => 0,
@@ -386,7 +394,7 @@ test("normalizeState нормализует ключи channels (старый/м
 
   const channels = store.read().channels;
   assert.deepEqual(Object.keys(channels).sort(), ["alpha", "beta"], "ключи — basename, мусор выброшен");
-  assert.deepEqual(channels.beta, { chatId: 200, threadId: 5 });
+  assert.deepEqual(channels.beta, { default: { chatId: 200, threadId: 5 } }, "плоская запись читается как default");
 });
 
 test("/remote channel: remove неизвестного проекта и битый threadId отвергаются", async (t) => {
@@ -400,4 +408,73 @@ test("/remote channel: remove неизвестного проекта и бит�
   assert.equal(badThread.kind, "error");
   assert.match(badThread.text, /threadId .* положительным/);
   assert.equal(store.read().channels.alpha, undefined, "канал не сохранён");
+});
+
+// --- 015 (ревью): канал проекта свой для каждого транспорта ------------------
+
+test("два проекта × два транспорта: chatId не уезжает в чужой транспорт", async (t) => {
+  const store = tempStore(t);
+  store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  store.setChannel("alpha", { chatId: 100, threadId: 7 }, "telegram");
+  store.setChannel("alpha", { chatId: 500 }, "max");
+  store.setChannel("beta", { chatId: 300 }, "telegram");
+
+  const telegram = fakeTransport("telegram");
+  const max = fakeTransport("max");
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({
+    transports: [telegram, max],
+    registry,
+    channelOf: (workspace, transportId) => resolveChannel(store.read(), workspace, transportId),
+    log: () => {},
+    now: () => 0,
+  });
+  answerer.attach({
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+    get: (name) => (name === "sessions" ? { get: (id) => ({ header: { cwd: id } }) } : null),
+  });
+
+  const ask = (sessionId) => answerer.handler(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: sessionId } },
+    () => assert.fail("next() нельзя"),
+  );
+
+  const alpha = ask("/p/alpha");
+  await tick();
+  assert.equal(telegram.sent[0].options.chatId, 100, "alpha → telegram 100");
+  assert.equal(telegram.sent[0].options.threadId, 7);
+  assert.equal(max.sent[0].options.chatId, 500, "alpha → max 500 (свой chatId, не telegram)");
+  telegram.answer({ shortId: telegram.sent[0].question.shortId, optionId: "o1" });
+  await alpha;
+
+  const beta = ask("/p/beta");
+  await tick();
+  assert.equal(telegram.sent[1].options.chatId, 300, "beta → telegram 300");
+  assert.equal(max.sent[1].options.chatId, undefined, "у beta нет max-канала — транспорт идёт в свой общий чат");
+  telegram.answer({ shortId: telegram.sent[1].question.shortId, optionId: "o1" });
+  await beta;
+});
+
+test("/remote channel --transport: канал на конкретный транспорт", async (t) => {
+  const { store, remote, invoke } = makeCommands(t);
+
+  const result = await remote.handler(invoke("channel alpha 42 7 --transport=telegram"));
+  assert.equal(result.kind, "success", result.text);
+  assert.deepEqual(store.read().channels.alpha.telegram, { chatId: 42, threadId: 7 });
+
+  const maxChannel = await remote.handler(invoke("channel alpha 900 --transport=max --force"));
+  assert.equal(maxChannel.kind, "success", maxChannel.text);
+  assert.deepEqual(store.read().channels.alpha.max, { chatId: 900 });
+
+  const list = await remote.handler(invoke("channel list"));
+  assert.match(list.text, /alpha \(telegram\) → чат 42, топик 7/);
+  assert.match(list.text, /alpha \(max\) → чат 900/);
+
+  const removed = await remote.handler(invoke("channel remove alpha --transport=max"));
+  assert.equal(removed.kind, "success", removed.text);
+  assert.deepEqual(store.read().channels.alpha, { telegram: { chatId: 42, threadId: 7 } });
 });

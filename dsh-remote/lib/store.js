@@ -49,47 +49,100 @@ function projectKey(name) {
   return raw.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
 }
 
-/** Каналы проектов: только `{chatId, threadId?}`, ключ — basename проекта. */
+/**
+ * Каналы проектов (015): `channels[project][transportId] = {chatId, threadId?}`.
+ *
+ * Старая плоская форма `channels[project] = {chatId, threadId?}` читается как
+ * канал `default` (он применяется к транспорту привязки или когда транспорт не
+ * указан) — состояние, записанное прошлой версией, не теряется.
+ */
 function normalizeChannels(value) {
   const base = {};
   if (value === null || typeof value !== "object" || Array.isArray(value)) return base;
-  for (const [name, channel] of Object.entries(value)) {
+  for (const [name, entry] of Object.entries(value)) {
     const key = projectKey(name);
     if (key === "") continue;
-    if (channel === null || typeof channel !== "object") continue;
-    const chatId = channel.chatId;
-    if (chatId === undefined || chatId === null || chatId === "") continue;
-    base[key] = {
-      chatId,
-      ...(channel.threadId === undefined || channel.threadId === null || channel.threadId === "" ? {} : { threadId: channel.threadId }),
-    };
+    if (entry === null || typeof entry !== "object") continue;
+    // Плоская запись (или объект с chatId) — канал default.
+    const isFlat = entry.chatId !== undefined && entry.chatId !== null && entry.chatId !== "";
+    const byTransport = {};
+    if (isFlat) {
+      byTransport.default = channelOfEntry(entry);
+    } else {
+      for (const [transportId, channel] of Object.entries(entry)) {
+        if (typeof transportId !== "string" || transportId === "") continue;
+        if (channel === null || typeof channel !== "object") continue;
+        const normalized = channelOfEntry(channel);
+        if (normalized !== null) byTransport[transportId] = normalized;
+      }
+    }
+    if (Object.keys(byTransport).length > 0) base[key] = byTransport;
   }
   return base;
 }
 
+/** Канал из записи: `{chatId, threadId?}` или `null`, если chatId нет. */
+function channelOfEntry(channel) {
+  const chatId = channel?.chatId;
+  if (chatId === undefined || chatId === null || chatId === "") return null;
+  return {
+    chatId,
+    ...(channel.threadId === undefined || channel.threadId === null || channel.threadId === "" ? {} : { threadId: channel.threadId }),
+  };
+}
+
 /**
- * Канал вопроса по воркспейсу (015).
+ * Канал вопроса по воркспейсу и транспорту (015).
  *
- * Сначала ищем проект по `basename(cwd)` в `state.channels`, затем — общий чат
- * привязки. `source` говорит, куда попали: `workspace`, `default` или `null`
- * (канала нет вовсе). Чистая функция: тесты гоняют её на объекте состояния.
+ * Порядок: канал проекта для этого транспорта → общий канал проекта
+ * (`default`) для транспорта привязки или без транспорта → общий чат привязки
+ * (только для транспорта привязки). Чистая функция: тесты гоняют её на объекте
+ * состояния.
  *
  * @param {object} state — состояние store.
  * @param {string|null} workspace — cwd сессии/вопроса.
- * @returns {{chatId: any, threadId: any, source: "workspace"|"default"|null}}
+ * @param {string|null} [transportId] — id транспорта (`telegram`, `max`).
+ * @returns {{chatId: any, threadId: any, transport: string|null, source: "workspace"|"default"|null}}
  */
-export function resolveChannel(state, workspace) {
+export function resolveChannel(state, workspace, transportId = null) {
   const channels = normalizeChannels(state?.channels);
-  const name = typeof workspace === "string" && workspace !== "" ? workspace.replace(/[\\/]+$/, "").split(/[\\/]/).pop() : null;
+  const name = typeof workspace === "string" && workspace !== ""
+    ? workspace.replace(/[\\/]+$/, "").split(/[\\/]/).pop()
+    : null;
   const project = name === null ? undefined : channels[name];
+  const bindingTransport = state?.bindings?.transport ?? null;
+  const requested = typeof transportId === "string" && transportId !== "" ? transportId : null;
+
   if (project !== undefined) {
-    return { chatId: project.chatId, threadId: project.threadId ?? null, source: "workspace" };
+    if (requested !== null && project[requested] !== undefined) {
+      return { chatId: project[requested].chatId, threadId: project[requested].threadId ?? null, transport: requested, source: "workspace" };
+    }
+    // Без транспорта показываем канал привязки, если он есть у проекта.
+    if (requested === null && bindingTransport !== null && project[bindingTransport] !== undefined) {
+      return { chatId: project[bindingTransport].chatId, threadId: project[bindingTransport].threadId ?? null, transport: bindingTransport, source: "workspace" };
+    }
+    // `default` — общий канал проекта: применяем только к транспорту привязки
+    // (или когда транспорт не назван), иначе telegram-chatId уедет в MAX.
+    if (project.default !== undefined && (requested === null || requested === bindingTransport)) {
+      return { chatId: project.default.chatId, threadId: project.default.threadId ?? null, transport: requested ?? bindingTransport, source: "workspace" };
+    }
   }
+
   const fallback = state?.bindings?.chatId;
-  if (fallback !== undefined && fallback !== null && fallback !== "") {
-    return { chatId: fallback, threadId: null, source: "default" };
+  if (fallback !== undefined && fallback !== null && fallback !== "" && (requested === null || requested === bindingTransport)) {
+    return { chatId: fallback, threadId: null, transport: requested ?? bindingTransport, source: "default" };
   }
-  return { chatId: null, threadId: null, source: null };
+  return { chatId: null, threadId: null, transport: requested, source: null };
+}
+
+/** Какие транспорты настроены у проекта (для status/list). */
+export function channelTransports(state, workspace) {
+  const channels = normalizeChannels(state?.channels);
+  const name = typeof workspace === "string" && workspace !== ""
+    ? workspace.replace(/[\\/]+$/, "").split(/[\\/]/).pop()
+    : null;
+  if (name === null) return {};
+  return channels[name] ?? {};
 }
 
 /** Состояние по умолчанию: пустая привязка, режим выключен, ничего не ждёт. */
@@ -291,7 +344,7 @@ export function createStore({
    * «Свой/чужой» здесь не проверяем — это делает `/remote channel`; allowlist
    * транспорта всё равно отклонит чат, куда бота не добавляли.
    */
-  function setChannel(name, channel) {
+  function setChannel(name, channel, transportId = null) {
     // Имя проекта — basename: `/remote channel /full/path/alpha 100` должен
     // совпадать с resolveChannel, который ищет именно basename(cwd).
     const key = projectKey(name);
@@ -299,12 +352,19 @@ export function createStore({
     if (channel === null || typeof channel !== "object" || channel.chatId === undefined || channel.chatId === null || channel.chatId === "") {
       throw new TypeError("setChannel: нужен chatId");
     }
+    const transport = typeof transportId === "string" && transportId !== ""
+      ? transportId
+      : (channel.transport ?? read()?.bindings?.transport ?? "default");
     return update((state) => {
+      const current = normalizeChannels(state.channels)[key] ?? {};
       state.channels = normalizeChannels({
         ...state.channels,
         [key]: {
-          chatId: channel.chatId,
-          ...(channel.threadId === undefined || channel.threadId === null || channel.threadId === "" ? {} : { threadId: channel.threadId }),
+          ...current,
+          [transport]: {
+            chatId: channel.chatId,
+            ...(channel.threadId === undefined || channel.threadId === null || channel.threadId === "" ? {} : { threadId: channel.threadId }),
+          },
         },
       });
       return state;
@@ -312,13 +372,20 @@ export function createStore({
   }
 
   /** Убрать канал проекта: вопросы снова идут в общий чат. */
-  function removeChannel(name) {
+  function removeChannel(name, transportId = null) {
     // Та же нормализация, что у setChannel: полный путь тоже должен удалять
     // канал проекта, а не создавать «висячий» ключ.
     const key = projectKey(name);
     return update((state) => {
-      const channels = { ...state.channels };
-      delete channels[key];
+      const channels = normalizeChannels(state.channels);
+      if (typeof transportId === "string" && transportId !== "") {
+        const project = { ...(channels[key] ?? {}) };
+        delete project[transportId];
+        if (Object.keys(project).length === 0) delete channels[key];
+        else channels[key] = project;
+      } else {
+        delete channels[key];
+      }
       state.channels = normalizeChannels(channels);
       return state;
     });

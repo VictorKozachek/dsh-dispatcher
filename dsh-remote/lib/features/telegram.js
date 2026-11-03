@@ -19,9 +19,16 @@ function projectChatIds(deps) {
   try {
     const state = deps.get("remoteStore")?.read?.() ?? null;
     const channels = state?.channels ?? {};
-    return Object.values(channels)
-      .map((channel) => channel?.chatId)
-      .filter((chatId) => chatId !== undefined && chatId !== null && chatId !== "");
+    // 015: канал проекта хранится по транспортам: {project: {telegram: {chatId}, ...}}.
+    const ids = [];
+    for (const perTransport of Object.values(channels)) {
+      if (perTransport === null || typeof perTransport !== "object") continue;
+      for (const channel of Object.values(perTransport)) {
+        const chatId = channel?.chatId;
+        if (chatId !== undefined && chatId !== null && chatId !== "") ids.push(chatId);
+      }
+    }
+    return ids;
   } catch {
     return [];
   }

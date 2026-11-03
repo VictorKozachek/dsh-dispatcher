@@ -53,7 +53,7 @@ export function createBroker({
   }
 
   /** Доставка в один канал: результат нормализуем к `{ok, messageId, chatId}`. */
-  async function deliverOne(transport, question, { signal, chatId, threadId } = {}) {
+  async function deliverOne(transport, question, { signal, chatId, threadId, channelFor } = {}) {
     const deliver = typeof deliverFor === "function" ? deliverFor(transport) : null;
     // Свой контроллер на канал: зависший транспорт не должен держать Promise.all.
     const controller = new AbortController();
@@ -77,13 +77,20 @@ export function createBroker({
     timer?.unref?.();
     let token;
     try {
+      // 015: канал проекта — свой для каждого транспорта (telegram-chatId не
+      // должен уходить в MAX). `channelFor` пересчитывается на транспорт.
+      // Канал, заданный для другого транспорта, сюда не подставляем: у MAX нет
+      // telegram-chatId, он идёт в свой общий чат (без chatId в опциях).
+      const perTransport = typeof channelFor === "function" ? (channelFor(transport.id) ?? {}) : null;
+      const targetChatId = perTransport === null ? chatId : (perTransport.chatId ?? undefined);
+      const targetThreadId = perTransport === null ? threadId : (perTransport.threadId ?? undefined);
       const target = {
         signal: controller.signal,
-        ...(chatId === undefined || chatId === null ? {} : { chatId }),
-        ...(threadId === undefined || threadId === null ? {} : { threadId }),
+        ...(targetChatId === undefined || targetChatId === null ? {} : { chatId: targetChatId }),
+        ...(targetThreadId === undefined || targetThreadId === null ? {} : { threadId: targetThreadId }),
       };
       const send = typeof deliver === "function"
-        ? deliver({ question, signal: controller.signal, chatId, threadId })
+        ? deliver({ question, signal: controller.signal, chatId: targetChatId, threadId: targetThreadId })
         : transport.sendQuestion(question, target);
       const outcome = await Promise.race([send, aborted]);
       // `deliver` из 008 возвращает строку; прямой sendQuestion — `{messageId}`,
@@ -113,12 +120,12 @@ export function createBroker({
    * @param {{signal?: AbortSignal}} [options]
    * @returns {{delivered: object[], failed: object[], anyDelivered: boolean, allFailed: boolean}}
    */
-  async function publish(question, { signal, chatId, threadId } = {}) {
+  async function publish(question, { signal, chatId, threadId, channelFor } = {}) {
     if (question === null || typeof question !== "object") throw new TypeError("broker: нужен вопрос");
     const results = await Promise.all(
       channels.map(async (transport) => {
         if (signal?.aborted === true) return { transport, ok: false, reason: "aborted" };
-        const result = await deliverOne(transport, question, { signal, chatId, threadId });
+        const result = await deliverOne(transport, question, { signal, chatId, threadId, channelFor });
         if (!result.ok) {
           log(`broker: канал ${transport.id} не доставил вопрос ${question.shortId}`
             + `${result.reason === undefined ? "" : ` (${result.reason})`}`);

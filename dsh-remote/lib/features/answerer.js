@@ -65,7 +65,7 @@ export const answererFeature = {
       transport: deps.get(TRANSPORT_SERVICE),
       deliverFor,
       // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
-      channelOf: (workspace) => resolveChannel(store?.read?.() ?? {}, workspace),
+      channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
       transports,
       hybrid: () => (store?.read?.().hybrid ?? { enabled: false }),
       registry,

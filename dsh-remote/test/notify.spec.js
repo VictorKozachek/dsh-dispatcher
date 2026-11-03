@@ -526,3 +526,51 @@ test("фича notify: уведомление проекта уходит в е�
 
   notifier.stop();
 });
+
+test("фича notify в мультиканале: уведомление идёт в транспорт своего канала", async (t) => {
+  const { notifyFeature } = await import("../lib/features/notify.js");
+  const { createStore } = await import("../lib/store.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+
+  const alpha = makeWorkspace(t, [{ id: "001", status: "todo", updated: "t1" }]);
+  const beta = makeWorkspace(t, [{ id: "002", status: "todo", updated: "t1" }]);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-notify-multi-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json") });
+  store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  store.setChannel(path.basename(alpha), { chatId: 100 }, "telegram");
+  store.setChannel(path.basename(beta), { chatId: 200 }, "max");
+
+  const telegram = { id: "telegram", caps: { maxText: 4096 }, sent: [], async sendQuestion(question, options) { this.sent.push({ question, options }); } };
+  const max = { id: "max", caps: { maxText: 4000 }, sent: [], async sendQuestion(question, options) { this.sent.push({ question, options }); } };
+  const provided = new Map();
+  const ctx = { provide: (name, service) => provided.set(name, service), get: () => null };
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => {
+      if (name === "remoteStore") return store;
+      if (name === "remoteTransports") return new Map([["telegram", telegram], ["max", max]]);
+      return null;
+    },
+    onDispose: () => {},
+  };
+
+  notifyFeature.apply(ctx, { notify: { workspaces: [alpha, beta], quietHours: false, intervalMs: 0 } }, deps);
+  const notifier = provided.get("remoteNotifier");
+
+  await notifier.scan();
+  writeCard(alpha, { id: "001", status: "ready", updated: "t2" });
+  writeCard(beta, { id: "002", status: "ready", updated: "t2" });
+  await notifier.scan();
+
+  assert.equal(telegram.sent.length, 1, "alpha ушла только в telegram");
+  assert.equal(telegram.sent[0].options.chatId, 100);
+  assert.match(telegram.sent[0].question.body, /#001/);
+  assert.equal(max.sent.length, 1, "beta ушла только в max");
+  assert.equal(max.sent[0].options.chatId, 200);
+  assert.match(max.sent[0].question.body, /#002/);
+
+  notifier.stop();
+});

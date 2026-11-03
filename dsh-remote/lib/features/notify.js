@@ -11,7 +11,7 @@
  */
 
 import { createNotifier } from "../notify.js";
-import { resolveChannel } from "../store.js";
+import { channelTransports, resolveChannel } from "../store.js";
 
 /** Имя сервиса уведомлений: статистика и ручной scan для команд/панели. */
 export const NOTIFIER_SERVICE = "remoteNotifier";
@@ -52,28 +52,52 @@ export const notifyFeature = {
 
     let counter = 0;
     /** Отправка «уведомления»: вопрос без вариантов и без свободного ответа. */
-    async function send(message) {
-      const transport = liveTransport();
-      if (transport === null || typeof transport.sendQuestion !== "function") {
-        throw new Error("канал не поднят: /remote connect");
+    /** Транспорты из реестра (012) или фасад 005 — по одному на канал. */
+    function liveTransports() {
+      const registry = deps.get("remoteTransports");
+      if (registry !== null && typeof registry?.values === "function") {
+        const list = [...registry.values()];
+        if (list.length > 0) return list;
       }
-      counter += 1;
-      const shortId = `n${String(counter).padStart(7, "0")}`;
-      // 015: уведомление проекта идёт в его канал (свой чат/топик); нет
-      // канала — в общий чат привязки.
-      const channel = resolveChannel(deps.get("remoteStore")?.read?.() ?? {}, message.workspace ?? null);
-      await transport.sendQuestion({
-        shortId,
-        questionId: `notify-${shortId}`,
-        title: "Доска",
-        body: message.text,
-        options: [],
-        multiSelect: false,
-        allowFreeText: false,
-      }, {
-        ...(channel.chatId === null || channel.chatId === undefined ? {} : { chatId: channel.chatId }),
-        ...(channel.threadId === null || channel.threadId === undefined ? {} : { threadId: channel.threadId }),
-      });
+      const one = liveTransport();
+      return one === null ? [] : [one];
+    }
+
+    async function send(message) {
+      const all = liveTransports();
+      if (all.length === 0) throw new Error("канал не поднят: /remote connect");
+
+      const state = deps.get("remoteStore")?.read?.() ?? {};
+      // 015: у проекта может быть свой канал на конкретный транспорт; шлём в
+      // те транспорты, для которых он задан, иначе — в первый живой.
+      const configured = channelTransports(state, message.workspace ?? null);
+      const targets = [];
+      for (const [transportId, channel] of Object.entries(configured)) {
+        const transport = all.find((item) => item.id === transportId) ?? null;
+        if (transport !== null) targets.push({ transport, channel });
+      }
+      if (targets.length === 0) {
+        const transport = all[0];
+        targets.push({ transport, channel: resolveChannel(state, message.workspace ?? null, transport.id) });
+      }
+
+      for (const { transport, channel } of targets) {
+        if (typeof transport.sendQuestion !== "function") continue;
+        counter += 1;
+        const shortId = `n${String(counter).padStart(7, "0")}`;
+        await transport.sendQuestion({
+          shortId,
+          questionId: `notify-${shortId}`,
+          title: "Доска",
+          body: message.text,
+          options: [],
+          multiSelect: false,
+          allowFreeText: false,
+        }, {
+          ...(channel.chatId === null || channel.chatId === undefined ? {} : { chatId: channel.chatId }),
+          ...(channel.threadId === null || channel.threadId === undefined ? {} : { threadId: channel.threadId }),
+        });
+      }
     }
 
     const notifier = createNotifier({
