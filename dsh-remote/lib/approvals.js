@@ -30,6 +30,7 @@ import { createBroker } from "./broker.js";
 import { createApprovalPolicy } from "./approvals/policy.js";
 import {
   APPROVAL_OUTCOME,
+  APPROVAL_TITLE,
   RemoteApproval,
   outcomeOfOption,
   outcomeSummary,
@@ -141,6 +142,10 @@ export function createApprovals({
 
   /** Открытые подтверждения: `shortId → {approval, resolve, settled}`. */
   const pending = new Map();
+  /** Закрытые подтверждения: поздний ответ логируем, но исход не меняем (027). */
+  const recentlyClosed = new Map();
+  /** Номер в очереди подтверждений (027): «#1, #2…» для человека и журнала. */
+  let queueCounter = 0;
   /**
    * Подтверждения, отданные GUI по гибридному таймауту (028): ждём поздний
    * ответ только чтобы записать его в аудит — исход уже не переигрывается.
@@ -238,12 +243,12 @@ export function createApprovals({
   }
 
   /** Закрыть сообщение по всем каналам ровно один раз. */
-  async function closeMessage(approval, summary) {
+  async function closeMessage(approval, summary, winner = null) {
     if (closed.has(approval.shortId)) return;
     closed.add(approval.shortId);
     try {
       if (useBroker) {
-        await broker.closeAll(approval, { winner: null, summary });
+        await broker.closeAll(approval, { winner, summary });
       } else {
         await primary?.closeQuestion?.(approval, summary);
       }
@@ -255,6 +260,15 @@ export function createApprovals({
   /** Выдать исход ожидающему слушателю: ровно один раз. */
   function settle(entry, outcome) {
     if (entry.settled) return;
+    recentlyClosed.set(entry.approval.shortId, {
+      approval: entry.approval,
+      outcome,
+      at: now(),
+    });
+    if (recentlyClosed.size > 100) {
+      const oldest = recentlyClosed.keys().next().value;
+      recentlyClosed.delete(oldest);
+    }
     // 025 + 028: снимаем ОБА таймера — TTL политики и гибридный waitMs.
     // Сработавший первым решает исход, второй уже не должен ни аудитить, ни
     // вызывать next(), ни отменять запись.
@@ -353,19 +367,81 @@ export function createApprovals({
    * Свободный текст у подтверждений не принимается: решение — только кнопка.
    * Неизвестная кнопка не роняет ожидание: сообщение остаётся с кнопками.
    */
-  function onTransportAnswer(event, channel = null) {
+  /**
+   * Подсказка «решение — кнопкой»: свободный текст не считается ответом (027).
+   * Шлём её через тот канал, откуда пришёл текст: в мультиканале человек пишет
+   * в MAX, и просьба нажать кнопку должна прийти туда же, а не в primary.
+   */
+  async function sendHint(approval, sourceTransport = null) {
+    const transport = sourceTransport ?? primary;
+    if (typeof transport?.sendQuestion !== "function") return;
+    const delivery = Array.isArray(approval.deliveries)
+      ? approval.deliveries.find((item) => item.transport === transport.id)
+      : undefined;
+    const chatId = delivery?.chatId ?? approval.chatId ?? null;
+    const threadId = approval.threadId ?? null;
+    try {
+      await transport.sendQuestion(
+        {
+          kind: "approval-hint",
+          shortId: `h${approval.shortId}`.slice(0, 8),
+          title: "Подтверждение действия",
+          body: "Решение принимается кнопкой: «Разрешить один раз» или «Отклонить». "
+            + "Свободный текст не считается ответом.",
+          options: [],
+          multiSelect: false,
+          allowFreeText: false,
+          chatId,
+          threadId,
+        },
+        {
+          ...(chatId === null ? {} : { chatId }),
+          ...(threadId === null ? {} : { threadId }),
+        },
+      );
+    } catch (error) {
+      log(`подтверждение ${approval.shortId}: подсказку отправить не удалось (${error?.message ?? error})`);
+    }
+  }
+
+  function onTransportAnswer(event, sourceTransport = null) {
     if (event === null || typeof event !== "object") return;
     const shortId = typeof event.shortId === "string" ? event.shortId : "";
     const entry = pending.get(shortId);
     if (entry === undefined) {
+      // 028: сначала late — клик после гибридного таймаута должен попасть в
+      // аудит как decision=late, а не раствориться в логе 027.
       const lateEntry = late.get(shortId);
-      if (lateEntry === undefined) {
-        log(`подтверждение ${shortId || "(без shortId)"}: ответа никто не ждёт — игнорирую`);
+      if (lateEntry !== undefined) {
+        handleLateAnswer(lateEntry, event, sourceTransport);
         return;
       }
-      handleLateAnswer(lateEntry, event, channel);
+      // 027: остальные закрытые (таймаут/аборт/решено в GUI) только журналируем.
+      const closedApproval = recentlyClosed.get(shortId);
+      if (closedApproval !== undefined) {
+        log(`подтверждение ${shortId}: уже закрыто (${closedApproval.outcome}) — поздний ответ игнорирую`);
+      } else {
+        log(`подтверждение ${shortId || "(без shortId)"}: ответа никто не ждёт — игнорирую`);
+      }
       return;
     }
+    // Подтверждение решается только кнопкой: свободный текст — не ответ (027).
+    const text = typeof event.text === "string" ? event.text.trim() : "";
+    const hasOption = Array.isArray(event.optionIds)
+      ? event.optionIds.length > 0
+      : Array.isArray(event.optionId)
+        ? event.optionId.length > 0
+        : typeof event.optionId === "string" && event.optionId !== "";
+    if (!hasOption) {
+      if (text !== "") {
+        log(`подтверждение ${shortId}: свободный текст не считается ответом — прошу нажать кнопку`);
+        void sendHint(entry.approval, sourceTransport);
+      } else {
+        log(`подтверждение ${shortId}: ответ без кнопки — игнорирую`);
+      }
+      return;
+    }
+
     const optionIds = optionIdsOf(event);
     const outcome = outcomeOfOption(optionIds[0]);
     if (outcome === null) {
@@ -373,16 +449,18 @@ export function createApprovals({
       return;
     }
     if (!entry.approval.decide(outcome, now())) return;
+    // 027 + 028: запомнить канал-победитель и снять гибридный таймер.
+    entry.approval.answeredVia = sourceTransport?.id ?? entry.approval.answeredVia ?? null;
     clearHybridTimer(entry);
     statsFor(outcome);
     record(entry.approval, {
       outcome,
       decision: "remote",
-      channel: channel?.id ?? null,
+      channel: sourceTransport?.id ?? null,
       chatId: typeof event.chatId === "string" || typeof event.chatId === "number" ? String(event.chatId) : entry.approval.chatId,
       answeredBy: typeof event.answeredBy === "string" && event.answeredBy !== "" ? event.answeredBy : null,
     });
-    void closeMessage(entry.approval, outcomeSummary(outcome));
+    void closeMessage(entry.approval, outcomeSummary(outcome), sourceTransport);
     settle(entry, outcome);
   }
 
@@ -502,6 +580,13 @@ export function createApprovals({
       return next();
     }
 
+    // 027: номер в очереди получает только то подтверждение, которое реально
+    // уйдёт в канал. Policy-GUI/аборт/сбой транспорта не «съедают» номер и не
+    // сбивают нумерацию соседних запросов.
+    queueCounter += 1;
+    approval.queueNumber = queueCounter;
+    approval.title = `${APPROVAL_TITLE} #${queueCounter}`;
+
     /** Ожидание решения + гонка с абортом запроса. */
     const outcome = await new Promise((resolve) => {
       const entry = { approval, resolve, settled: false, delivered: false, timer: null };
@@ -611,6 +696,8 @@ export function createApprovals({
       return () => {};
     }
     try {
+      // 027: канал передаётся в обработчик — победитель закрывается ответом,
+      // проигравшие — пометкой «отвечено в другом канале».
       offAnswers = subscribable.map((channel) => channel.onAnswer((event) => onTransportAnswer(event, channel)));
     } catch (error) {
       log(`ответчик подтверждений не подписан: транспорт не отдал onAnswer (${error?.message ?? error})`);
