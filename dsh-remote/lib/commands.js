@@ -28,6 +28,7 @@ import { fileURLToPath } from "node:url";
 import { createRegistry } from "./domain/registry.js";
 import { credentialRef, createCredentialAccess } from "./store.js";
 import { RELAY_TOKEN_REF } from "./transport/relay.js";
+import { randomUUID } from "node:crypto";
 
 /** Имя ссылки на токен Telegram в `ctx.credentials` (не значение!). */
 export const TELEGRAM_TOKEN_REF = credentialRef("DSH_REMOTE_TELEGRAM_TOKEN");
@@ -494,6 +495,10 @@ export function createRemoteCommands({
       return failure(`релей недоступен: ${humanError(error, token)}`);
     }
     if (!health.ok) return failure(`релей не подтвердил себя: ${health.detail}`);
+    // Публичный /healthz не проверяет токен: нужен авторизованный пробник,
+    // иначе неверный токен сохранится и всплывёт только на отправке вопроса.
+    const probe = await relayAuthProbe(url, token);
+    if (!probe.ok) return failure(`релей не принял токен агента: ${probe.detail} — привязка отменена`);
 
     const scopeAnswer = await askStep(invocation, {
       id: "remote-connect-scope",
@@ -529,6 +534,27 @@ export function createRemoteCommands({
       scope.note,
       "канал поднимется при следующей загрузке профиля (или после /remote on)",
     ].join("\n"));
+  }
+
+  /**
+   * Авторизованный пробник: `GET /v1/answers?questionId=<uuid>`.
+   * `404` — токен принят (ответа ещё нет), `401/403` — токен неверный.
+   */
+  async function relayAuthProbe(url, token) {
+    const fetchFn = fetchImpl ?? globalThis.fetch;
+    try {
+      const response = await fetchFn(`${url}/v1/answers?questionId=${randomUUID()}`, {
+        method: "GET",
+        headers: { authorization: `Bearer ${token}`, "x-relay-version": "1" },
+      });
+      if (response.status === 404) return { ok: true, detail: "токен принят" };
+      if (response.status === 401 || response.status === 403) {
+        return { ok: false, detail: `unauthorized (HTTP ${response.status})` };
+      }
+      return { ok: false, detail: `неожиданный ответ HTTP ${response.status}` };
+    } catch (error) {
+      return { ok: false, detail: humanError(error, token) };
+    }
   }
 
   /** Проверка живости релея без транспорта: `/healthz` + обязательный заголовок версии. */

@@ -254,6 +254,10 @@ relay:
   относится к телефону; в состоянии хранится только URL, токен — в
   `ctx.credentials`. Это зафиксировано тестами `relay-transport.spec.js` и
   `commands.spec.js` («connect relay работает без Telegram-токена»).
+- **Токен проверяется авторизованным пробником:** `/healthz` релея публичный
+  (любой Bearer проходит), поэтому `connect` и `healthCheck`/`status` дополнительно
+  зовут `GET /v1/answers?questionId=<uuid>`: `404` — токен принят, `401/403` —
+  «релей не принял токен агента», привязка отменяется и секрет не перезаписывается.
 
 Тесты: `node --test dsh-remote/test/relay-transport.spec.js` — сеть, WebSocket,
 таймеры и `sleep` инжектируются, реальных запросов нет: отправка и повтор,

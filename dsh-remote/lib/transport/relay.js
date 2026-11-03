@@ -22,6 +22,8 @@
  * @typedef {import("./base.js").TransportAnswer} TransportAnswer
  */
 
+import { randomUUID } from "node:crypto";
+
 import { DEFAULT_CAPS } from "./base.js";
 
 /** Заголовок версии протокола: обязателен для каждого запроса (016 §2). */
@@ -451,10 +453,25 @@ export function createRelayTransport({
     },
 
     async healthCheck() {
+      // `/healthz` публичный (в релее 017 любой Bearer проходит), поэтому
+      // проверяем и авторизованный пробник: он ловит неверный токен до того, как
+      // вопрос уйдёт в give-up.
+      let health;
       try {
-        const health = await call("GET", "/healthz");
-        return { ok: true, detail: `relay ${health?.version ?? "?"}` };
+        health = await call("GET", "/healthz");
       } catch (error) {
+        return { ok: false, detail: redact(error?.message ?? error, token) };
+      }
+      const detail = `relay ${health?.version ?? "?"}`;
+      try {
+        await call("GET", `/v1/answers?questionId=${randomUUID()}`);
+        return { ok: true, detail };
+      } catch (error) {
+        // 404 — нормальный ответ «ответа ещё нет»: токен принят.
+        if (error?.status === 404) return { ok: true, detail };
+        if (error?.status === 401 || error?.status === 403) {
+          return { ok: false, detail: `unauthorized: релей не принял токен (${error.status})` };
+        }
         return { ok: false, detail: redact(error?.message ?? error, token) };
       }
     },

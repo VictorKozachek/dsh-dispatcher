@@ -453,3 +453,35 @@ test("после переподключения WS long-poll останавли�
   assert.ok(answersCalls > afterClose, "после нового close long-poll снова идёт");
   await transport.stop();
 });
+
+test("healthCheck ловит неверный токен авторизованным пробником (healthz публичный)", async () => {
+  const calls = [];
+  const transport = createRelayTransport({
+    url: URL_BASE,
+    agentToken: TOKEN,
+    fetch: fakeFetch({
+      "GET /healthz": () => response(200, { ok: true, version: "0.1.0" }),
+      "GET /v1/answers": () => response(401, { error: { code: "unauthorized", message: "нужен Bearer-токен" } }),
+    }, calls),
+  });
+
+  const health = await transport.healthCheck();
+
+  assert.equal(health.ok, false);
+  assert.match(health.detail, /unauthorized/);
+  assert.equal(calls.some((call) => call.key === "GET /v1/answers"), true, "пробник сходил с токеном");
+  assert.equal(health.detail.includes(TOKEN), false, "токен не в detail");
+});
+
+test("healthCheck: 404 от авторизованного пробника — токен принят", async () => {
+  const transport = createRelayTransport({
+    url: URL_BASE,
+    agentToken: TOKEN,
+    fetch: fakeFetch({
+      "GET /healthz": () => response(200, { ok: true, version: "0.1.0" }),
+      "GET /v1/answers": () => response(404, { error: { code: "not-found", message: "ответа нет" } }),
+    }),
+  });
+
+  assert.deepEqual(await transport.healthCheck(), { ok: true, detail: "relay 0.1.0" });
+});

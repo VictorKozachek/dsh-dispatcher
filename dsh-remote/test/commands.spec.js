@@ -1323,7 +1323,8 @@ test("connect relay работает без Telegram-токена и не пиш
     },
     fetchImpl: async (url) => {
       if (String(url).endsWith("/healthz")) return jsonResponse({ ok: true, version: "0.1.0" });
-      return jsonResponse({});
+      // Авторизованный пробник: 404 значит «ответа ещё нет», токен принят.
+      return jsonResponse({ error: { code: "not-found", message: "ответа пока нет" } }, 404);
     },
   });
   // Telegram-секрета нет вовсе: провайдер секретов «пуст», как в сценарии ревью.
@@ -1340,4 +1341,30 @@ test("connect relay работает без Telegram-токена и не пиш
   assert.equal(JSON.stringify(state).includes(RELAY_TOKEN), false, "токен не попал в состояние");
   assert.equal(result.text.includes(RELAY_TOKEN), false, "токен не напечатан");
   assert.equal(RELAY_TOKEN_REF, "DSH_REMOTE_RELAY_TOKEN");
+});
+
+test("connect relay: неверный токен отвергается авторизованным пробником, ничего не сохраняется", async (t) => {
+  const RELAY_TOKEN = "definitely-wrong-token-XXX";
+  const stand = harness(t, {
+    credentials: fakeCredentials({ value: null }),
+    answers: {
+      "remote-connect-transport": { selected: ["Relay (свой сервер)"] },
+      "remote-connect-relay-url": { custom: "https://relay.test" },
+      "remote-connect-relay-token": { custom: RELAY_TOKEN },
+      "remote-connect-scope": { selected: ["Только этот проект"] },
+    },
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/healthz")) return jsonResponse({ ok: true, version: "0.1.0" });
+      return jsonResponse({ error: { code: "unauthorized", message: "нужен Bearer-токен" } }, 401);
+    },
+  });
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "error");
+  assert.match(result.text, /не принял токен агента/);
+  assert.match(result.text, /unauthorized/);
+  assert.equal(stand.store.read().bindings, null, "binding не сохранён");
+  assert.equal(stand.credentials.calls.some(([method, ref]) => method === "set" && ref === RELAY_TOKEN_REF), false, "неверный токен не записан");
+  assert.equal(result.text.includes(RELAY_TOKEN), false, "токен не напечатан");
 });
