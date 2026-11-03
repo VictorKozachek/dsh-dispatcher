@@ -26,7 +26,13 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { createRegistry } from "./domain/registry.js";
-import { credentialRef, createCredentialAccess } from "./store.js";
+import { STATE_VERSION, credentialRef, createCredentialAccess } from "./store.js";
+import {
+  buildReport,
+  formatHealthReport,
+  runHealthChecks,
+  serializeReport,
+} from "./doctor.js";
 import { RELAY_TOKEN_REF } from "./transport/relay.js";
 import { createAudit } from "./audit.js";
 import { randomUUID } from "node:crypto";
@@ -55,7 +61,7 @@ const HELP_TEXT = [
   "  /remote audit [N]  — последние N решений по подтверждениям (по умолчанию 20)",
   "  /remote test       — отправить тестовый вопрос в мессенджер",
   "  /remote who        — сессия, воркспейс и эффективный режим",
-  "  /remote doctor     — проверка привязки, канала и состояния (ok/warn/fail)",
+  "  /remote doctor [--json] — проверка привязки, канала и состояния (ok/warn/fail; JSON для скриптов)",
   "  /remote channel <проект> <chatId> [threadId] — канал проекта (топик форума)",
   "    --force          — если бот действительно в другом чате (чужой чат иначе отвергается)",
   "    --transport=<id> — канал для конкретного канала (telegram, max); по умолчанию — транспорт привязки",
@@ -808,6 +814,18 @@ export function createRemoteCommands({
     lines.push(`режим: глобально ${state.enabled.global ? "вкл" : "выкл"}; проект ${cwd === null ? "?" : cwd} ${cwd !== null && state.enabled.workspaces[cwd] === true ? "вкл" : "выкл"}; сессия ${sessionId === null ? "?" : sessionId} ${sessionId !== null && state.enabled.sessions[sessionId] === true ? "вкл" : "выкл"}`);
     lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
 
+    // 025: действующая политика подтверждений (публикует ответчик approvals 024).
+    try {
+      const policy = ctx?.get?.("remoteApprovalPolicy") ?? null;
+      if (policy !== null && typeof policy?.describe === "function") {
+        for (const line of policy.describe()) lines.push(line);
+      } else {
+        lines.push("approvals: политика не загружена — удалённые подтверждения только в GUI");
+      }
+    } catch (error) {
+      lines.push(`approvals: политика не прочитана (${humanError(error)})`);
+    }
+
     const channels = Object.entries(state.channels ?? {});
     if (channels.length === 0) {
       lines.push("каналы проектов: нет — все вопросы идут в общий чат");
@@ -1001,9 +1019,15 @@ export function createRemoteCommands({
       + `${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
   }
 
-  /** `/remote doctor` — диагностика: токен, getMe, поллеры, канал, состояние. */
-  async function doctor() {
-    const checks = await runDoctorChecks({
+  /**
+   * `/remote doctor [--json]` — диагностика 2.0 (задача 030).
+   *
+   * Legacy-проверки 010 остаются (токен, getMe, поллеры, канал, состояние), к ним
+   * добавляются credentials/relay/schema/timers; человеческий вывод узнаваем,
+   * `--json` — стабильная машиночитаемая структура с кодом возврата.
+   */
+  async function doctor(invocation, flags) {
+    const legacyChecks = await runDoctorChecks({
       store,
       credentials,
       transport: liveTransport(),
@@ -1011,7 +1035,34 @@ export function createRemoteCommands({
       version: readPluginVersion(),
       now,
     });
-    return success(formatDoctorReport(checks));
+
+    const relayService = ctx?.get?.("remoteRelay") ?? null;
+    const live = liveTransport();
+    const relay = relayService !== null
+      ? { url: relayService.url, transport: relayService.transport }
+      : live !== null && live.id === "relay"
+        ? { url: store.read().bindings?.url, transport: live }
+        : store.read().bindings?.transport === "relay"
+          ? { url: store.read().bindings?.url, transport: null }
+          : null;
+
+    // Ссылку relay-токена проверяем только когда релей действительно настроен:
+    // на Telegram-only установке её отсутствие — норма, а не fail.
+    const tokenRefs = relay === null ? [TELEGRAM_TOKEN_REF] : [TELEGRAM_TOKEN_REF, RELAY_TOKEN_REF];
+    const checks = await runHealthChecks({
+      legacyChecks,
+      credentials,
+      tokenRefs,
+      relay,
+      store,
+      reliability: ctx?.get?.("remoteReliability") ?? null,
+      supportedSchemaVersion: STATE_VERSION,
+    });
+    const report = buildReport(checks);
+    if (flags?.has?.("json") === true) {
+      return { ...success(serializeReport(report)), exitCode: report.exitCode };
+    }
+    return { ...success(formatHealthReport(report)), exitCode: report.exitCode };
   }
 
   async function disconnect(invocation) {
@@ -1105,7 +1156,7 @@ export function createRemoteCommands({
         case "who":
           return who(invocation);
         case "doctor":
-          return await doctor();
+          return await doctor(invocation, flags);
         case "channel":
           return channelCommand(invocation, flags, rest, flagValues);
         case "disconnect":

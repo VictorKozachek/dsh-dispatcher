@@ -1,0 +1,471 @@
+/**
+ * Очередь подтверждений и роутинг (027): несколько запросов одновременно,
+ * ответ попадает в свой `callId`/`shortId`, текст не подменяет кнопку,
+ * поздний ответ не переигрывает закрытый исход.
+ */
+
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { APPROVAL_REQUEST_EVENT, createApprovals } from "../lib/approvals.js";
+import { APPROVAL_OUTCOME } from "../lib/domain/approval.js";
+import { createApprovalPolicy } from "../lib/approvals/policy.js";
+
+const tick = async (times = 8) => {
+  for (let index = 0; index < times; index += 1) await new Promise((resolve) => setImmediate(resolve));
+};
+
+function fakeTransport(id = "fake") {
+  const sent = [];
+  const closed = [];
+  const handlers = new Set();
+  return {
+    id,
+    sent,
+    closed,
+    async sendQuestion(question, options) {
+      sent.push({ question, options: options ?? null });
+      return { messageId: `m-${id}-${sent.length}` };
+    },
+    async closeQuestion(question, summary) {
+      closed.push({ shortId: question.shortId, summary });
+    },
+    onAnswer(handler) {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+    answer(event) {
+      for (const handler of [...handlers]) handler(event);
+    },
+  };
+}
+
+function fakeContext() {
+  const subscriptions = [];
+  return {
+    subscriptions,
+    on(name, handler, options) {
+      subscriptions.push({ name, handler, options });
+      return () => {};
+    },
+    get: () => null,
+    provide: () => {},
+    onDispose: () => {},
+  };
+}
+
+function setup({ transports = [fakeTransport()] } = {}) {
+  const approvals = createApprovals({
+    transport: transports.length === 1 ? transports[0] : null,
+    transports: transports.length > 1 ? transports : null,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    // Тесты 027 проверяют очередь/маршрутизацию, а не политику 025: разрешаем
+    // используемые инструменты явно, безопасные дефолты проверяются отдельно.
+    policy: createApprovalPolicy({ tools: ["Bash", "Write", "Edit", "read_file"], denyRemote: [] }),
+    now: () => 1_700_000_000_000,
+    log: () => {},
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const handler = ctx.subscriptions.find((item) => item.name === APPROVAL_REQUEST_EVENT)?.handler;
+  assert.equal(typeof handler, "function");
+  const nextCalls = [];
+  const next = async () => {
+    nextCalls.push(true);
+    return "gui";
+  };
+  return { approvals, transport: transports[0], transports, handler, next, nextCalls };
+}
+
+function request(overrides = {}) {
+  return {
+    agent: { id: "session-1" },
+    toolName: "Bash",
+    callId: "call-1",
+    reason: "нужно запустить тесты",
+    ...overrides,
+  };
+}
+
+test("два подтверждения параллельно: очередь нумеруется, решения независимы", async () => {
+  const { transport, handler, next } = setup();
+
+  const first = handler(request({ toolName: "Bash", callId: "call-1" }), next);
+  const second = handler(request({ toolName: "Write", callId: "call-2", agent: { id: "session-2" } }), next);
+  await tick();
+
+  assert.equal(transport.sent.length, 2, "оба подтверждения ушли в канал");
+  const [a, b] = transport.sent.map((item) => item.question);
+  assert.notEqual(a.shortId, b.shortId, "разные shortId — разные кнопки");
+  assert.match(a.title, /#1/, "первое — №1 в очереди");
+  assert.match(b.title, /#2/, "второе — №2 в очереди");
+  assert.equal(a.callId, "call-1");
+  assert.equal(b.callId, "call-2");
+
+  // Отвечаем второму раньше первого: каждый исход — свой.
+  transport.answer({ shortId: b.shortId, optionIds: ["o2"] });
+  assert.equal(await second, APPROVAL_OUTCOME.rejected);
+  transport.answer({ shortId: a.shortId, optionIds: ["o1"] });
+  assert.equal(await first, APPROVAL_OUTCOME.allowedOnce);
+
+  assert.equal(next.calls ?? 0, 0);
+});
+
+test("ответ на чужой shortId игнорируется, ожидание продолжается", async () => {
+  const { transport, handler, next } = setup();
+  const pending = handler(request(), next);
+  await tick();
+  const approval = transport.sent[0].question;
+
+  transport.answer({ shortId: "deadbeef", optionIds: ["o1"] });
+  await tick();
+  assert.equal(transport.closed.length, 0, "чужой shortId ничего не закрыл");
+
+  transport.answer({ shortId: approval.shortId, optionIds: ["o3"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.unavailable);
+});
+
+test("свободный текст не считается ответом: подсказка и ожидание кнопки", async () => {
+  const { transport, handler, next } = setup();
+  const pending = handler(request(), next);
+  await tick();
+  const approval = transport.sent[0].question;
+
+  transport.answer({ shortId: approval.shortId, text: "да, разрешаю" });
+  await tick();
+
+  assert.equal(transport.sent.length, 2, "отправлена подсказка");
+  const hint = transport.sent[1].question;
+  assert.match(hint.body, /кнопк/, "подсказка просит нажать кнопку");
+  assert.deepEqual(hint.options, [], "в подсказке нет кнопок решения");
+  assert.equal(transport.closed.length, 0, "подтверждение не закрыто текстом");
+
+  // Повтор: только кнопка решает.
+  transport.answer({ shortId: approval.shortId, optionIds: ["o1"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+});
+
+test("поздний ответ после аборта не переигрывает исход", async () => {
+  const controller = new AbortController();
+  const { transport, handler, next } = setup();
+  const pending = handler(request({ signal: controller.signal }), next);
+  await tick();
+  const approval = transport.sent[0].question;
+
+  controller.abort();
+  assert.equal(await pending, APPROVAL_OUTCOME.cancelled);
+  assert.equal(transport.closed.length, 1, "сообщение снято");
+
+  // Поздний ответ: исход уже принят, второй раз не решаем.
+  transport.answer({ shortId: approval.shortId, optionIds: ["o1"] });
+  await tick();
+  assert.equal(transport.closed.length, 1, "повторно сообщение не закрывается");
+});
+
+test("мультиканальность: ответ в одном канале закрывает проигравший", async () => {
+  const telegram = fakeTransport("telegram");
+  const max = fakeTransport("max");
+  const { handler, next } = setup({ transports: [telegram, max] });
+  const pending = handler(request(), next);
+  await tick();
+
+  assert.equal(telegram.sent.length, 1);
+  assert.equal(max.sent.length, 1);
+  const shortId = telegram.sent[0].question.shortId;
+  assert.equal(max.sent[0].question.shortId, shortId, "один shortId на оба канала");
+
+  telegram.answer({ shortId, optionIds: ["o1"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+
+  assert.equal(telegram.closed.length, 1, "победивший канал закрыт");
+  assert.equal(max.closed.length, 1, "проигравший канал закрыт пометкой");
+  assert.match(max.closed[0].summary, /answered-elsewhere|другом канале|Отвечено/i);
+});
+
+test("повторный ответ после решения не переигрывает исход", async () => {
+  const { transport, handler, next } = setup();
+  const pending = handler(request(), next);
+  await tick();
+  const approval = transport.sent[0].question;
+
+  transport.answer({ shortId: approval.shortId, optionIds: ["o1"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+  const closedAfterFirst = transport.closed.length;
+
+  // Второй раз то же подтверждение: исход уже принят, ничего не меняется.
+  transport.answer({ shortId: approval.shortId, optionIds: ["o2"] });
+  await tick();
+  assert.equal(transport.closed.length, closedAfterFirst, "повторно не закрываем и не меняем исход");
+  assert.equal(approval.outcome, APPROVAL_OUTCOME.allowedOnce, "исход остался прежним");
+});
+
+test("мультиканал: текст из второго канала — подсказка туда же, а не в первый", async () => {
+  const telegram = fakeTransport("telegram");
+  const max = fakeTransport("max");
+  const { handler, next } = setup({ transports: [telegram, max] });
+  const pending = handler(request(), next);
+  await tick();
+  const shortId = max.sent[0].question.shortId;
+
+  max.answer({ shortId, optionIds: [], text: "да, разрешаю" });
+  await tick();
+
+  assert.equal(max.sent.length, 2, "подсказка пришла в MAX — туда, где человек писал");
+  assert.match(max.sent[1].question.body, /кнопк/);
+  assert.equal(telegram.sent.length, 1, "в Telegram подсказку не отправляли");
+  assert.equal(telegram.closed.length, 0);
+
+  max.answer({ shortId, optionIds: ["o1"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+});
+
+test("совместимость: ответ с optionId-массивом считается кнопкой", async () => {
+  const { transport, handler, next } = setup();
+  const pending = handler(request(), next);
+  await tick();
+  const shortId = transport.sent[0].question.shortId;
+
+  transport.answer({ shortId, optionId: ["o1"] });
+
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce, "массив optionId решает подтверждение");
+  assert.equal(transport.sent.length, 1, "подсказка не отправлялась");
+});
+
+// --- hybrid-late (028) и очередь/закрытые (027) -----------------------------
+
+function fakeTimers() {
+  const timers = [];
+  return {
+    timers,
+    setTimeout: (callback, delay) => {
+      timers.push({ callback, delay, cleared: false });
+      return timers.length;
+    },
+    clearTimeout: (id) => {
+      const timer = timers[id - 1];
+      if (timer !== undefined) timer.cleared = true;
+    },
+    byDelay: (delay) => timers.filter((timer) => timer.delay === delay),
+  };
+}
+
+function setupHybrid({ waitMs = 20_000, audit = { entries: [], append(entry) { this.entries.push(entry); } } } = {}) {
+  const timers = fakeTimers();
+  const telegram = fakeTransport("telegram");
+  const max = fakeTransport("max");
+  const approvals = createApprovals({
+    transport: null,
+    transports: [telegram, max],
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    policy: createApprovalPolicy({ tools: ["Bash", "Write", "Edit", "read_file"], denyRemote: [] }),
+    hybrid: { enabled: true, waitMs },
+    audit,
+    now: () => 1_700_000_000_000,
+    log: () => {},
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const nextCalls = [];
+  const next = async () => {
+    nextCalls.push(true);
+    return "gui";
+  };
+  return { timers, telegram, max, approvals, ctx, handler: ctx.subscriptions[0].handler, next, nextCalls, audit };
+}
+
+test("hybrid-таймаут, затем поздний клик из второго канала: one audit late, next один раз", async () => {
+  const { timers, telegram, max, handler, next, nextCalls, audit } = setupHybrid();
+  const pending = handler(request(), next);
+  await tick();
+  assert.equal(telegram.sent.length, 1);
+  assert.equal(max.sent.length, 1);
+  const shortId = max.sent[0].question.shortId;
+
+  timers.byDelay(20_000)[0].callback();
+  assert.equal(await pending, "gui");
+  assert.equal(nextCalls.length, 1, "next() ровно один раз");
+  assert.equal(audit.entries.length, 1);
+  assert.equal(audit.entries[0].decision, "gui");
+  assert.equal(audit.entries[0].outcome, APPROVAL_OUTCOME.unavailable);
+
+  // Человек всё-таки нажал кнопку в MAX: решение не переигрывается, но клик
+  // виден в аудите как late с каналом и answeredBy.
+  max.answer({ shortId, optionIds: ["o2"], answeredBy: "user-7" });
+  await tick();
+
+  assert.equal(nextCalls.length, 1, "next() не звали повторно");
+  assert.equal(audit.entries.length, 2, "поздний клик — ровно одна запись");
+  const late = audit.entries[1];
+  assert.equal(late.decision, "late");
+  assert.equal(late.outcome, APPROVAL_OUTCOME.rejected);
+  assert.equal(late.channel, "max", "канал позднего клика — источник");
+  assert.equal(late.answeredBy, "user-7");
+  assert.equal(telegram.closed.length, 1, "stale-пометка закрыла канал");
+});
+
+test("после hybrid-late очередь продолжает нумерацию и не путает подтверждения", async () => {
+  const { timers, max, handler, next, audit } = setupHybrid();
+  const first = handler(request({ toolName: "Write", callId: "call-1" }), next);
+  await tick();
+  timers.byDelay(20_000)[0].callback();
+  assert.equal(await first, "gui");
+  max.answer({ shortId: max.sent[0].question.shortId, optionIds: ["o1"] });
+  await tick();
+
+  const second = handler(request({ toolName: "Edit", callId: "call-2", agent: { id: "session-2" } }), next);
+  await tick();
+
+  const secondApproval = max.sent[1].question;
+  assert.match(secondApproval.title, /#2/, "нумерация продолжается");
+  assert.equal(secondApproval.callId, "call-2");
+  max.answer({ shortId: secondApproval.shortId, optionIds: ["o1"] });
+  assert.equal(await second, APPROVAL_OUTCOME.allowedOnce, "второе решено независимо");
+  assert.equal(audit.entries.at(-1).decision, "remote");
+});
+
+test("обычный аборт: late-клик только логируется, аудит не растёт", async () => {
+  const { timers, telegram, handler, next, audit } = setupHybrid();
+  const controller = new AbortController();
+  const pending = handler(request({ signal: controller.signal }), next);
+  await tick();
+  const shortId = telegram.sent[0].question.shortId;
+
+  controller.abort();
+  assert.equal(await pending, APPROVAL_OUTCOME.cancelled);
+  const afterAbort = audit.entries.length;
+  assert.equal(afterAbort, 1);
+  assert.equal(audit.entries[0].decision, "timeout");
+
+  telegram.answer({ shortId, optionIds: ["o1"] });
+  await tick();
+  assert.equal(audit.entries.length, afterAbort, "обычный поздний ответ не пишет audit-late");
+  assert.equal(telegram.closed.length, 1, "повторно сообщение не закрывается");
+});
+
+// --- очередь + policy-TTL (025) + hybrid (028) -------------------------------
+
+function setupTimed({ ttlMs, waitMs, allowed = ["read_file", "Bash", "Write"] }) {
+  const timers = fakeTimers();
+  const telegram = fakeTransport("telegram");
+  const audit = { entries: [], append(entry) { this.entries.push(entry); } };
+  const approvals = createApprovals({
+    transport: telegram,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    policy: createApprovalPolicy({ tools: allowed, denyRemote: [] }),
+    ttlMs,
+    hybrid: { enabled: true, waitMs },
+    audit,
+    now: () => 1_700_000_000_000,
+    log: () => {},
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const nextCalls = [];
+  const next = async () => {
+    nextCalls.push(true);
+    return "gui";
+  };
+  return { timers, telegram, approvals, ctx, handler: ctx.subscriptions[0].handler, next, nextCalls, audit };
+}
+
+test("TTL раньше hybrid в очереди: отказ, одна запись, гибрид снят, поздний клик не аудитится", async () => {
+  const { timers, telegram, handler, next, nextCalls, audit } = setupTimed({ ttlMs: 60_000, waitMs: 120_000 });
+  const pending = handler(request({ toolName: "read_file" }), next);
+  await tick();
+  const approval = telegram.sent[0].question;
+  assert.match(approval.title, /#1/);
+
+  const ttl = timers.byDelay(60_000)[0];
+  const hybrid = timers.byDelay(120_000)[0];
+  ttl.callback();
+
+  assert.equal(await pending, APPROVAL_OUTCOME.cancelled);
+  assert.equal(nextCalls.length, 0);
+  assert.equal(audit.entries.length, 1);
+  assert.equal(audit.entries[0].decision, "timeout");
+  assert.equal(hybrid.cleared, true, "гибридный таймер снят");
+
+  // Поздний клик после TTL: исход не переигрывается, late-аудита нет.
+  telegram.answer({ shortId: approval.shortId, optionIds: ["o1"] });
+  await tick();
+  assert.equal(audit.entries.length, 1, "поздний клик после TTL не пишет новый аудит");
+  assert.equal(await (async () => approval.outcome)(), APPROVAL_OUTCOME.cancelled);
+});
+
+test("hybrid раньше TTL: next один раз, затем очередь #2 и late-клик в аудит", async () => {
+  const { timers, telegram, handler, next, nextCalls, audit } = setupTimed({ ttlMs: 120_000, waitMs: 20_000 });
+  const first = handler(request({ toolName: "read_file", callId: "call-1" }), next);
+  await tick();
+  assert.match(telegram.sent[0].question.title, /#1/);
+  const shortId = telegram.sent[0].question.shortId;
+
+  timers.byDelay(20_000)[0].callback();
+  assert.equal(await first, "gui");
+  assert.equal(nextCalls.length, 1);
+  assert.equal(audit.entries[0].decision, "gui");
+
+  const second = handler(request({ toolName: "Write", callId: "call-2", agent: { id: "session-2" } }), next);
+  await tick();
+  const secondApproval = telegram.sent[1].question;
+  assert.match(secondApproval.title, /#2/, "нумерация не сбилась после гибрида");
+  telegram.answer({ shortId: secondApproval.shortId, optionIds: ["o1"] });
+  assert.equal(await second, APPROVAL_OUTCOME.allowedOnce);
+  assert.equal(audit.entries[1].decision, "remote");
+
+  telegram.answer({ shortId, optionIds: ["o2"], answeredBy: "user-7" });
+  await tick();
+  assert.equal(audit.entries.length, 3);
+  assert.equal(audit.entries[2].decision, "late");
+  assert.equal(audit.entries[2].outcome, APPROVAL_OUTCOME.rejected);
+  assert.equal(audit.entries[2].answeredBy, "user-7");
+  assert.equal(nextCalls.length, 1, "next() не повторяется");
+});
+
+test("policy-GUI рядом с pending-соседом не съедает номер очереди", async () => {
+  const timers = fakeTimers();
+  const telegram = fakeTransport("telegram");
+  const audit = { entries: [], append(entry) { this.entries.push(entry); } };
+  const approvals = createApprovals({
+    transport: telegram,
+    registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+    // безопасная политика: read_file можно, Bash — всегда GUI
+    policy: createApprovalPolicy(null),
+    audit,
+    now: () => 1_700_000_000_000,
+    log: () => {},
+    setTimeout: timers.setTimeout,
+    clearTimeout: timers.clearTimeout,
+  });
+  const ctx = fakeContext();
+  approvals.attach(ctx);
+  const nextCalls = [];
+  const next = async () => {
+    nextCalls.push(true);
+    return "gui";
+  };
+
+  const first = ctx.subscriptions[0].handler(request({ toolName: "read_file", callId: "call-1" }), next);
+  await tick();
+  assert.match(telegram.sent[0].question.title, /#1/);
+
+  // Сосед по очереди — опасный инструмент: уходит в GUI по политике, номер не тратит.
+  assert.equal(await ctx.subscriptions[0].handler(request({ toolName: "bash", callId: "call-2" }), next), "gui");
+  assert.equal(audit.entries[0].decision, "gui");
+  assert.equal(nextCalls.length, 1);
+
+  const third = ctx.subscriptions[0].handler(request({ toolName: "read_file", callId: "call-3", agent: { id: "session-3" } }), next);
+  await tick();
+  const thirdApproval = telegram.sent[1].question;
+  assert.match(thirdApproval.title, /#2/, "policy-GUI не занял номер: следующий снова #2");
+
+  telegram.answer({ shortId: thirdApproval.shortId, optionIds: ["o1"] });
+  assert.equal(await third, APPROVAL_OUTCOME.allowedOnce);
+
+  telegram.answer({ shortId: telegram.sent[0].question.shortId, optionIds: ["o2"] });
+  assert.equal(await first, APPROVAL_OUTCOME.rejected);
+  assert.equal(audit.entries.length, 3, "policy gui + два remote, без дублей");
+});
