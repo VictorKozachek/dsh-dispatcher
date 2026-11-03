@@ -52,7 +52,7 @@
 |---|---|---|---|
 | `POST /v1/devices` | зарегистрировать устройство | `DeviceCreateRequest` | `201` + `Device` |
 | `DELETE /v1/devices/{id}` | отозвать устройство (токен сразу недействителен) | — | `204` |
-| `POST /v1/pairing` | плагин получает одноразовый `pairCode` (TTL 10 минут) для показа человеку | — (Bearer агента) | `201` + `{pairCode, expiresAt}` |
+| `POST /v1/pairing` | плагин получает одноразовый `pairCode` (TTL 10 минут), чтобы показать человеку; Bearer агента | — | `201` + `PairingCodeResponse` |
 | `POST /v1/pair` | подтвердить привязку по `pairCode` | `PairRequest` | `200` + `PairResponse` |
 | `POST /v1/questions` | опубликовать вопрос (плагин) | `QuestionPublishRequest` | `201` + `QuestionResponse` |
 | `GET /v1/questions?since=<rfc3339>&sinceId=<id>&limit=<n>&wait=<сек>` | вопросы после курсора; `wait` — long-poll до 25 с | — | `200` + `QuestionList` |
@@ -60,19 +60,27 @@
 | `GET /v1/answers?questionId=<id>&wait=<сек>` | ответ на вопрос (плагин); `wait` — long-poll до 25 с | — | `200` + `Answer` |
 | `GET /v1/events` | поток событий: WebSocket upgrade; без upgrade — `426` | — | WS; текстовые кадры — `Event` |
 | `GET /v1/health` | живость релея; счётчики `devices`/`questions`/`answers` — аддитивные поля | — | `200` + `Health` |
-| `GET /healthz` | алиас `/v1/health` для liveness-проб (вне `/v1`, без авторизации) | — | `200` + `Health` |
+| `GET /healthz` | алиас `/v1/health` для liveness/смок-проб (вне `/v1`) | — | `200` + `Health` |
 | `POST /v1/heartbeat` | устройство живо (интервал 30 с) | — | `204` |
 
-**Курсор пагинации:** `QuestionList` содержит `nextSince` (`createdAt` последнего
-вопроса) и аддитивное `nextId` (его id). Следующая страница запрашивается с
-`since=<nextSince>&sinceId=<nextId>` — так страницы не теряются и не дублируются,
-даже если у вопросов одинаковый `createdAt` (пачка из `ask_user_question`).
-`wait` у `questions`/`answers` — long-poll для устройства без WebSocket; сервер
-отвечает сразу, если данные уже есть, иначе держит соединение до `wait` секунд.
+### Пагинация и long-poll
 
-**`version` в теле:** необязательное поле `version` (в `DeviceCreateRequest`,
-`PairRequest`, `Question`, `AnswerRequest`) допускает только значение `1`; иное —
-`400 bad-request`. Заголовок `X-Relay-Version` при этом всё равно обязателен.
+`QuestionList` содержит `nextSince` (`createdAt` последнего вопроса) и
+аддитивное `nextId` (его `id`). Следующая страница:
+`GET /v1/questions?since=<nextSince>&sinceId=<nextId>` — SQL
+`(created_at, id) > (since, sinceId)`, поэтому страницы не теряются и не
+дублируются даже при одинаковом `createdAt` (пачка из `ask_user_question`).
+`sinceId` необязателен; без него отдаются только вопросы со строго большим
+`createdAt` (старое поведение). Повтор с теми же `since`/`sinceId` **идемпотентен**
+и возвращает то же окно.
+
+`wait=<сек>` (0..25, по умолчанию 0) — long-poll: если данных нет, сервер держит
+соединение до `wait` секунд и отвечает пустым списком/`404 not-found` по таймауту;
+если данные появились раньше — отвечает сразу. `wait` — аддитивное расширение
+`/v1`, старые клиенты его просто не передают.
+
+**`version` в теле:** необязательное поле `version` в запросах допускает только
+`1`; иное — `400 bad-request`. Заголовок `X-Relay-Version` при этом обязателен.
 
 **Heartbeat/ping:** в WebSocket — ping-кадр каждые 25 с; если pong не пришёл за 10 с,
 соединение закрывается кодом `1001`, клиент переподключается с экспоненциальной
