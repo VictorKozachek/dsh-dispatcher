@@ -19,6 +19,26 @@ import { createCredentialAccess } from "../store.js";
 import { createMaxTransport, describeError } from "../transport/max.js";
 
 /** Имя сервиса транспорта в контексте плагина. */
+/** 015: чаты проектов из состояния — их тоже принимаем (allowlist). */
+function projectChatIds(deps) {
+  try {
+    const state = deps.get("remoteStore")?.read?.() ?? null;
+    const channels = state?.channels ?? {};
+    // 015: канал проекта хранится по транспортам: {project: {telegram: {chatId}, ...}}.
+    const ids = [];
+    for (const perTransport of Object.values(channels)) {
+      if (perTransport === null || typeof perTransport !== "object") continue;
+      for (const channel of Object.values(perTransport)) {
+        const chatId = channel?.chatId;
+        if (chatId !== undefined && chatId !== null && chatId !== "") ids.push(chatId);
+      }
+    }
+    return ids;
+  } catch {
+    return [];
+  }
+}
+
 export const TRANSPORT_SERVICE = "remoteTransport";
 
 /** Имя ссылки на токен MAX в `ctx.credentials`. */
@@ -108,6 +128,7 @@ export const maxFeature = {
         chatId: settings.chatId,
         userId: settings.userId,
         allowedUserIds: Array.isArray(settings.allowedUserIds) ? settings.allowedUserIds : [],
+        allowedChatIds: () => projectChatIds(deps),
         pollTimeoutSec: settings.pollTimeoutSec,
         marker: savedMarker ?? settings.marker,
         persistMarker: (marker) => writeMarker(markerPath, marker, log),

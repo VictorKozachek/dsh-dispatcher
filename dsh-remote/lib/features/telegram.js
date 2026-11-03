@@ -14,6 +14,26 @@ import { createTelegramTransport } from "../transport/telegram.js";
 import { createCredentialAccess } from "../store.js";
 
 /** Имя сервиса транспорта в контексте плагина. */
+/** 015: чаты проектов из состояния — их тоже принимаем (allowlist). */
+function projectChatIds(deps) {
+  try {
+    const state = deps.get("remoteStore")?.read?.() ?? null;
+    const channels = state?.channels ?? {};
+    // 015: канал проекта хранится по транспортам: {project: {telegram: {chatId}, ...}}.
+    const ids = [];
+    for (const perTransport of Object.values(channels)) {
+      if (perTransport === null || typeof perTransport !== "object") continue;
+      for (const channel of Object.values(perTransport)) {
+        const chatId = channel?.chatId;
+        if (chatId !== undefined && chatId !== null && chatId !== "") ids.push(chatId);
+      }
+    }
+    return ids;
+  } catch {
+    return [];
+  }
+}
+
 export const TRANSPORT_SERVICE = "remoteTransport";
 
 /**
@@ -70,6 +90,7 @@ export const telegramFeature = {
         token,
         chatId: settings.chatId,
         allowedUserIds: Array.isArray(settings.allowedUserIds) ? settings.allowedUserIds : [],
+        allowedChatIds: () => projectChatIds(deps),
         pollTimeoutSec: settings.pollTimeoutSec,
         log: (message) => deps.logger.debug(message),
       });

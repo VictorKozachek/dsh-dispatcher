@@ -42,6 +42,109 @@ export function statePaths({ env = process.env, home = os.homedir() } = {}) {
   return { file, dir, lock: path.join(dir, LOCK_FILE_NAME) };
 }
 
+/** `basename` проекта: ключ канала в `state.channels` (015). */
+function projectKey(name) {
+  const raw = typeof name === "string" ? name.trim() : "";
+  if (raw === "") return "";
+  return raw.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+}
+
+/**
+ * Каналы проектов (015): `channels[project][transportId] = {chatId, threadId?}`.
+ *
+ * Старая плоская форма `channels[project] = {chatId, threadId?}` читается как
+ * канал `default` (он применяется к транспорту привязки или когда транспорт не
+ * указан) — состояние, записанное прошлой версией, не теряется.
+ */
+function normalizeChannels(value) {
+  const base = {};
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return base;
+  for (const [name, entry] of Object.entries(value)) {
+    const key = projectKey(name);
+    if (key === "") continue;
+    if (entry === null || typeof entry !== "object") continue;
+    // Плоская запись (или объект с chatId) — канал default.
+    const isFlat = entry.chatId !== undefined && entry.chatId !== null && entry.chatId !== "";
+    const byTransport = {};
+    if (isFlat) {
+      byTransport.default = channelOfEntry(entry);
+    } else {
+      for (const [transportId, channel] of Object.entries(entry)) {
+        if (typeof transportId !== "string" || transportId === "") continue;
+        if (channel === null || typeof channel !== "object") continue;
+        const normalized = channelOfEntry(channel);
+        if (normalized !== null) byTransport[transportId] = normalized;
+      }
+    }
+    if (Object.keys(byTransport).length > 0) base[key] = byTransport;
+  }
+  return base;
+}
+
+/** Канал из записи: `{chatId, threadId?}` или `null`, если chatId нет. */
+function channelOfEntry(channel) {
+  const chatId = channel?.chatId;
+  if (chatId === undefined || chatId === null || chatId === "") return null;
+  return {
+    chatId,
+    ...(channel.threadId === undefined || channel.threadId === null || channel.threadId === "" ? {} : { threadId: channel.threadId }),
+  };
+}
+
+/**
+ * Канал вопроса по воркспейсу и транспорту (015).
+ *
+ * Порядок: канал проекта для этого транспорта → общий канал проекта
+ * (`default`) для транспорта привязки или без транспорта → общий чат привязки
+ * (только для транспорта привязки). Чистая функция: тесты гоняют её на объекте
+ * состояния.
+ *
+ * @param {object} state — состояние store.
+ * @param {string|null} workspace — cwd сессии/вопроса.
+ * @param {string|null} [transportId] — id транспорта (`telegram`, `max`).
+ * @returns {{chatId: any, threadId: any, transport: string|null, source: "workspace"|"default"|null}}
+ */
+export function resolveChannel(state, workspace, transportId = null) {
+  const channels = normalizeChannels(state?.channels);
+  const name = typeof workspace === "string" && workspace !== ""
+    ? workspace.replace(/[\\/]+$/, "").split(/[\\/]/).pop()
+    : null;
+  const project = name === null ? undefined : channels[name];
+  const bindingTransport = state?.bindings?.transport ?? null;
+  const requested = typeof transportId === "string" && transportId !== "" ? transportId : null;
+
+  if (project !== undefined) {
+    if (requested !== null && project[requested] !== undefined) {
+      return { chatId: project[requested].chatId, threadId: project[requested].threadId ?? null, transport: requested, source: "workspace" };
+    }
+    // Без транспорта показываем канал привязки, если он есть у проекта.
+    if (requested === null && bindingTransport !== null && project[bindingTransport] !== undefined) {
+      return { chatId: project[bindingTransport].chatId, threadId: project[bindingTransport].threadId ?? null, transport: bindingTransport, source: "workspace" };
+    }
+    // `default` — общий канал проекта: применяем только к транспорту привязки
+    // (или когда транспорт не назван), иначе telegram-chatId уедет в MAX.
+    if (project.default !== undefined && (requested === null || requested === bindingTransport)) {
+      return { chatId: project.default.chatId, threadId: project.default.threadId ?? null, transport: requested ?? bindingTransport, source: "workspace" };
+    }
+  }
+
+  const fallback = state?.bindings?.chatId;
+  if (fallback !== undefined && fallback !== null && fallback !== "" && (requested === null || requested === bindingTransport)) {
+    return { chatId: fallback, threadId: null, transport: requested ?? bindingTransport, source: "default" };
+  }
+  return { chatId: null, threadId: null, transport: requested, source: null };
+}
+
+/** Какие транспорты настроены у проекта (для status/list). */
+export function channelTransports(state, workspace) {
+  const channels = normalizeChannels(state?.channels);
+  const name = typeof workspace === "string" && workspace !== ""
+    ? workspace.replace(/[\\/]+$/, "").split(/[\\/]/).pop()
+    : null;
+  if (name === null) return {};
+  return channels[name] ?? {};
+}
+
 /** Состояние по умолчанию: пустая привязка, режим выключен, ничего не ждёт. */
 /** Сколько ждём ответа в мессенджере до показа вопроса в GUI (гибрид, 013). */
 export const DEFAULT_HYBRID_WAIT_MS = 20_000;
@@ -57,6 +160,8 @@ export function defaultState() {
     pending: [],
     /** 014: дедуп уведомлений доски: что уже отправлено и сколько было todo. */
     notify: { seen: [], lastTodo: {}, baseline: {} },
+    /** 015: каналы проектов: `{ "<basename cwd>": { chatId, threadId? } }`. */
+    channels: {},
   };
 }
 
@@ -233,6 +338,59 @@ export function createStore({
   }
 
   /** Включить/выключить режим для scope: `global`, `workspace` (cwd) или `session`. */
+  /**
+   * Канал проекта (015): `chatId` (+ `threadId` для топика форума).
+   *
+   * «Свой/чужой» здесь не проверяем — это делает `/remote channel`; allowlist
+   * транспорта всё равно отклонит чат, куда бота не добавляли.
+   */
+  function setChannel(name, channel, transportId = null) {
+    // Имя проекта — basename: `/remote channel /full/path/alpha 100` должен
+    // совпадать с resolveChannel, который ищет именно basename(cwd).
+    const key = projectKey(name);
+    if (key === "") throw new TypeError("setChannel: нужно имя проекта");
+    if (channel === null || typeof channel !== "object" || channel.chatId === undefined || channel.chatId === null || channel.chatId === "") {
+      throw new TypeError("setChannel: нужен chatId");
+    }
+    const transport = typeof transportId === "string" && transportId !== ""
+      ? transportId
+      : (channel.transport ?? read()?.bindings?.transport ?? "default");
+    return update((state) => {
+      const current = normalizeChannels(state.channels)[key] ?? {};
+      state.channels = normalizeChannels({
+        ...state.channels,
+        [key]: {
+          ...current,
+          [transport]: {
+            chatId: channel.chatId,
+            ...(channel.threadId === undefined || channel.threadId === null || channel.threadId === "" ? {} : { threadId: channel.threadId }),
+          },
+        },
+      });
+      return state;
+    });
+  }
+
+  /** Убрать канал проекта: вопросы снова идут в общий чат. */
+  function removeChannel(name, transportId = null) {
+    // Та же нормализация, что у setChannel: полный путь тоже должен удалять
+    // канал проекта, а не создавать «висячий» ключ.
+    const key = projectKey(name);
+    return update((state) => {
+      const channels = normalizeChannels(state.channels);
+      if (typeof transportId === "string" && transportId !== "") {
+        const project = { ...(channels[key] ?? {}) };
+        delete project[transportId];
+        if (Object.keys(project).length === 0) delete channels[key];
+        else channels[key] = project;
+      } else {
+        delete channels[key];
+      }
+      state.channels = normalizeChannels(channels);
+      return state;
+    });
+  }
+
   function setEnabled(scope, value) {
     const enabled = Boolean(value);
     return update((state) => {
@@ -391,6 +549,8 @@ export function createStore({
     write,
     update,
     setEnabled,
+    setChannel,
+    removeChannel,
     setHybrid,
     setBinding,
     addRecent,
@@ -452,6 +612,8 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
         ? { ...value.notify.baseline }
         : {},
     },
+    // 015: ключи каналов — basename; старый/ручной state с путями чинится здесь.
+    channels: normalizeChannels(value.channels),
   };
 }
 

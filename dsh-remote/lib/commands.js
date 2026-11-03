@@ -52,6 +52,11 @@ const HELP_TEXT = [
   "  /remote test       — отправить тестовый вопрос в мессенджер",
   "  /remote who        — сессия, воркспейс и эффективный режим",
   "  /remote doctor     — проверка привязки, канала и состояния (ok/warn/fail)",
+  "  /remote channel <проект> <chatId> [threadId] — канал проекта (топик форума)",
+  "    --force          — если бот действительно в другом чате (чужой чат иначе отвергается)",
+  "    --transport=<id> — канал для конкретного канала (telegram, max); по умолчанию — транспорт привязки",
+  "  /remote channel list — какие каналы у каких проектов",
+  "  /remote channel remove <проект> — вернуть проект в общий чат",
   "  /remote disconnect — отвязать бота и выключить режим",
 ].join("\n");
 
@@ -272,11 +277,17 @@ export function parseRemoteArgs(rawInput) {
   const text = String(rawInput ?? "").trim();
   if (text === "") return { subcommand: "status", flags: new Set(), rest: [] };
   const parts = text.split(/\s+/);
-  const flags = new Set(parts.slice(1).filter((part) => part.startsWith("--"))
-    .map((part) => part.slice(2).toLowerCase()));
+  const tokens = parts.slice(1).filter((part) => part.startsWith("--"));
+  const flags = new Set(tokens.map((part) => part.slice(2).split("=")[0].toLowerCase()));
+  const flagValues = new Map();
+  for (const token of tokens) {
+    const [name, value] = token.slice(2).split("=");
+    if (value !== undefined && value !== "") flagValues.set(name.toLowerCase(), value);
+  }
   return {
     subcommand: parts[0].toLowerCase(),
     flags,
+    flagValues,
     rest: parts.slice(1).filter((part) => !part.startsWith("--")),
   };
 }
@@ -662,6 +673,17 @@ export function createRemoteCommands({
     lines.push(`режим: глобально ${state.enabled.global ? "вкл" : "выкл"}; проект ${cwd === null ? "?" : cwd} ${cwd !== null && state.enabled.workspaces[cwd] === true ? "вкл" : "выкл"}; сессия ${sessionId === null ? "?" : sessionId} ${sessionId !== null && state.enabled.sessions[sessionId] === true ? "вкл" : "выкл"}`);
     lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
 
+    const channels = Object.entries(state.channels ?? {});
+    if (channels.length === 0) {
+      lines.push("каналы проектов: нет — все вопросы идут в общий чат");
+    } else {
+      for (const [name, perTransport] of channels) {
+        for (const [transportId, channel] of Object.entries(perTransport)) {
+          lines.push(`канал ${name} (${transportId}): чат ${channel.chatId}${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
+        }
+      }
+    }
+
     const lock = store.lockState();
     lines.push(lock.held ? `поллер: занят (pid ${lock.holder?.pid ?? "?"})` : "поллер: свободен");
 
@@ -730,6 +752,71 @@ export function createRemoteCommands({
   }
 
   /** `/remote disconnect` — отвязать бота и выключить режим. */
+  /** `/remote channel ...` — каналы проектов (015). */
+  function channelCommand(invocation, flags, rest, flagValues = null) {
+    // rest — аргументы после подкоманды: `list` | `remove <проект>` |
+    // `<проект> <chatId> [threadId]`.
+    const args = Array.isArray(rest) ? rest : [];
+    const [action, target, threadIdRaw] = args;
+
+    if (action === "list" || action === undefined) {
+      const channels = Object.entries(store.read().channels ?? {});
+      if (channels.length === 0) return success("каналы проектов не заданы: все вопросы идут в общий чат");
+      const lines = [];
+      for (const [name, perTransport] of channels) {
+        for (const [transportId, channel] of Object.entries(perTransport)) {
+          lines.push(`${name} (${transportId}) → чат ${channel.chatId}${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
+        }
+      }
+      return success(lines.join("\n"));
+    }
+
+    if (action === "remove") {
+      if (typeof target !== "string" || target === "") return failure("укажите проект: /remote channel remove <проект>");
+      const key = target.trim().replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+      if (!(key in (store.read().channels ?? {}))) return failure(`у проекта ${key} нет своего канала — он и так в общем чате`);
+      const transport = flagValues?.get("transport") ?? null;
+      store.removeChannel(target, transport);
+      return success(transport === null
+        ? `проект ${key} снова идёт в общий чат`
+        : `у проекта ${key} убран канал транспорта ${transport}`);
+    }
+
+    // set: `/remote channel <проект> <chatId> [threadId]`
+    const name = action;
+    const numericChat = Number(target);
+    // У групп и супергрупп Telegram chat_id отрицательный (форумы с топиками тоже),
+    // поэтому требуем лишь целое ненулевое число.
+    if (!Number.isInteger(numericChat) || numericChat === 0) {
+      return failure("chatId должен быть целым ненулевым числом (у групп и супергрупп он отрицательный): "
+        + "/remote channel <проект> <chatId>");
+    }
+    const bindingChat = store.read().bindings?.chatId;
+    // Чужой чат: бот может быть в нём не участником, и тогда ответы не придут.
+    // Осознанный обход — --force (человек знает, что бот добавлен в чат).
+    if (bindingChat !== undefined && bindingChat !== null && String(bindingChat) !== String(numericChat) && !flags.has("force")) {
+      return failure(`чат ${numericChat} не совпадает с привязанным (${bindingChat}): это чужой чат. `
+        + "Если бот действительно добавлен туда, повторите с --force");
+    }
+    const transport = flagValues?.get("transport") ?? null;
+    let channel = { chatId: numericChat };
+    if (threadIdRaw !== undefined && threadIdRaw !== "") {
+      const numericThread = Number(threadIdRaw);
+      if (!Number.isInteger(numericThread) || numericThread <= 0) {
+        return failure("threadId (топик форума) должен быть целым положительным числом");
+      }
+      channel = { chatId: numericChat, threadId: numericThread };
+    }
+    if (transport !== null && transport !== "") channel.transport = transport;
+    try {
+      store.setChannel(name, channel, transport);
+    } catch (error) {
+      return failure(`канал не сохранён: ${humanError(error)}`);
+    }
+    return success(`проект ${name} (${channel.transport ?? store.read().bindings?.transport ?? "default"}) → чат ${channel.chatId}`
+      + `${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
+  }
+
   /** `/remote doctor` — диагностика: токен, getMe, поллеры, канал, состояние. */
   async function doctor() {
     const checks = await runDoctorChecks({
@@ -816,7 +903,7 @@ export function createRemoteCommands({
 
   /** Обработчик `/remote`: разбор и диспетчеризация. */
   async function handler(invocation) {
-    const { subcommand, flags } = parseRemoteArgs(invocation?.rawInput);
+    const { subcommand, flags, rest, flagValues } = parseRemoteArgs(invocation?.rawInput);
     try {
       switch (subcommand) {
         case "connect":
@@ -833,6 +920,8 @@ export function createRemoteCommands({
           return who(invocation);
         case "doctor":
           return await doctor();
+        case "channel":
+          return channelCommand(invocation, flags, rest, flagValues);
         case "disconnect":
           return await disconnect(invocation);
         case "help":

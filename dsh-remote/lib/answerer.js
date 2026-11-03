@@ -140,11 +140,13 @@ export function createAnswerer({
   deliver = null,
   deliverFor = null,
   reliability = null,
+  /** 015: канал проекта: `(workspace, transportId) => {chatId, threadId, source}`. */
+  channelOf = null,
   /** Гибридный режим (013): `{enabled, waitMs}` или функция, отдающая его. */
   hybrid = null,
-  /** Доставка позднего ответа в сессию; по умолчанию `sessionController.prompt`. */
+  /** 013: доставка позднего ответа; по умолчанию `sessionController.prompt`. */
   steer = null,
-  /** Таймеры инжектируются: тесты не ждут реальные 20 секунд. */
+  /** 013: таймеры инжектируются, тесты не ждут реальные 20 секунд. */
   setTimeout: setTimeoutImpl = setTimeout,
   clearTimeout: clearTimeoutImpl = clearTimeout,
 } = {}) {
@@ -207,16 +209,30 @@ export function createAnswerer({
    * `reliability.deliver` с повторами. Сигнал `'give-up'` означает «за
    * `connectTimeoutMs` не доставили» — тогда вопрос достаётся GUI через `next()`.
    */
+  /** Параметры отправки с учётом канала проекта (015). */
+  const sendOptionsFor = (question) => ({
+    ...(question.chatId === null || question.chatId === undefined ? {} : { chatId: question.chatId }),
+    ...(question.threadId === null || question.threadId === undefined ? {} : { threadId: question.threadId }),
+  });
+
   const sendOne = typeof deliver === "function"
-    ? async (question, signal) => deliver({ question, signal })
-    : async (question, signal) => primary.sendQuestion(question, signal);
+    // У доставки через reliability сигнал есть (она умеет отменять отправку).
+    ? async (question, signal) => deliver({ question, signal, ...sendOptionsFor(question) })
+    // Прямой транспорт исторически сигнал не отменяет: аборт ждёт завершения
+    // sendMessage и закрывает сообщение по факту (тест 004).
+    : async (question) => primary.sendQuestion(question, sendOptionsFor(question));
 
   /**
    * Доставить вопрос во все каналы (012). Возвращает `true`, если доставили
    * хотя бы в один: ошибка одного канала не должна блокировать второй.
    */
-  async function publishAll(question, signal) {
-    const publication = await broker.publish(question, { signal });
+  async function publishAll(question, signal, channelFor = null) {
+    const publication = await broker.publish(question, {
+      signal,
+      chatId: question.chatId ?? undefined,
+      threadId: question.threadId ?? undefined,
+      ...(channelFor === null ? {} : { channelFor }),
+    });
     return publication;
   }
   /** Открытые вопросы по короткому id: ждём ответа транспорта. */
@@ -449,14 +465,31 @@ export function createAnswerer({
       return next();
     }
 
+    // 015: канал проекта — свой для каждого транспорта; нет канала —
+    // общий чат этого транспорта.
+    const channelFor = (transportId) => {
+      if (typeof channelOf !== "function") return { chatId: null, threadId: null };
+      try {
+        const resolved = channelOf(workspace, transportId) ?? {};
+        return { chatId: resolved.chatId ?? null, threadId: resolved.threadId ?? null, source: resolved.source ?? null };
+      } catch (error) {
+        log(`вопрос: канал проекта не определён (${error?.message ?? error})`);
+        return { chatId: null, threadId: null };
+      }
+    };
+
     const questions = [];
     try {
       for (const item of items) {
+        const primaryChannel = channelFor(primary?.id ?? null);
+        const questionChannel = { chatId: primaryChannel.chatId, threadId: primaryChannel.threadId };
         const created = createQuestion(item, {
           sessionId,
           workspace,
           role: questionContext.role,
           taskId: questionContext.taskId,
+          chatId: questionChannel.chatId,
+          threadId: questionChannel.threadId,
           now: now(),
           log,
         });
@@ -587,7 +620,7 @@ export function createAnswerer({
         for (const question of questions) {
           attempted.add(question);
           if (useBroker) {
-            const publication = await Promise.race([publishAll(question, request?.signal), aborted]);
+            const publication = await Promise.race([publishAll(question, request?.signal, channelFor), aborted]);
             if (!publication.anyDelivered) {
               // Ни один канал не принял вопрос — он достаётся GUI, как в 008.
               log(`вопрос ${question.shortId}: ни один канал не доставил — отдаю GUI (next)`);

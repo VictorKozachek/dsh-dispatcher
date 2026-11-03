@@ -10,6 +10,7 @@
  */
 
 import { createAnswerer } from "../answerer.js";
+import { resolveChannel } from "../store.js";
 import { createRegistry } from "../domain/registry.js";
 
 /** Имя сервиса транспорта: его объявит задача 003 (`dsh-remote/lib/transport`). */
@@ -63,6 +64,8 @@ export const answererFeature = {
     const answerer = createAnswerer({
       transport: deps.get(TRANSPORT_SERVICE),
       deliverFor,
+      // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
+      channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
       transports,
       hybrid: () => (store?.read?.().hybrid ?? { enabled: false }),
       registry,
