@@ -25,7 +25,8 @@
 | **DeviceCreateRequest** | **platform**, **publicKey**; `pushToken?`, `label?` | Регистрация устройства. `publicKey` — публичный ключ устройства для e2e (base64; X25519/Ed25519), приватный ключ на сервер не попадает. |
 | **Pairing** | **pairCode** (6 цифр), **deviceId**, **expiresAt**, **confirmed**; `confirmedAt?` | Привязка: плагин показывает код, человек вводит его на устройстве. Код живёт 10 минут и одноразовый. |
 | **PairRequest / PairResponse** | request: **pairCode**, **deviceId**; response: **deviceToken**, **device**, **confirmedAt** | Подтверждение привязки: `deviceToken` — Bearer для устройства. |
-| **Question** | **id** (uuid), **shortId** (8 hex), **createdAt**, **expiresAt**; открытый режим — **body**, **options** (`[{id,label}]`); e2e — **enc**; `workspace?`, `taskId?`, `role?`, `multiSelect?`, `allowFreeText?`, `optionCount?` | Вопрос агента. В e2e `body`/`title`/`detail`/`options` **не передаются**; `optionCount` даёт серверу число вариантов для лимитов. |
+| **Question** (запрос) | **id** (uuid), **shortId** (8 hex), **createdAt**, **expiresAt**; открытый режим — **body**, **options** (`[{id,label}]`); e2e — **enc**; `workspace?`, `taskId?`, `role?`, **title?**, **detail?**, `multiSelect?`, `allowFreeText?`, `optionCount?` | Вопрос агента, публикуется плагином. В e2e `title`/`detail`/`body`/`options` **не передаются**; `optionCount` даёт серверу число вариантов для лимитов. |
+| **QuestionResponse** | те же поля; `additionalProperties: true` | Ответ релея: аддитивный — новые поля минорной версии клиент игнорирует. |
 | **AnswerRequest / Answer** | **questionId**, **answeredAt**, **idempotencyKey**; открытый режим — **selected** (`string[]` — **id вариантов**, не подписи), `custom?`; e2e — **enc** | Ответ человека. `answeredBy` на проводе **нет**: устройство идентифицируется `deviceToken`; ответ аддитивный. `idempotencyKey` — uuid запроса. |
 | **Event** | **type**, **at**; `questionId?`, `payload?` | Событие потока: `question.created`, `question.answered`, `question.expired`, `pairing.confirmed`, `device.revoked`, `heartbeat`. `type` — открытый набор: незнакомый тип клиент игнорирует. |
 | **EncEnvelope** | **enc**, **nonce**, **keyId**, **alg**, **plainSize** | Конверт e2e: `enc` — base64(ciphertext), `nonce` — base64(12 байт), `keyId` — id ключа, `alg` — `xchacha20poly1305`/`aes256gcm`, `plainSize` — длина открытого текста. Сервер не имеет ключа. |
@@ -33,9 +34,9 @@
 
 **Строгость:** запросы (`DeviceCreateRequest`, `PairRequest`, `Question`,
 `QuestionPublishRequest`, `AnswerRequest`) — `additionalProperties: false`: лишнее
-поле = `400 bad-request`. Ответы (`Device`, `PairResponse`, `QuestionList`,
-`Answer`, `Event`, `Health`, `Error`) — `additionalProperties: true`: незнакомые
-поля клиент игнорирует (см. COMPATIBILITY §4).
+поле = `400 bad-request`. Ответы (`Device`, `PairResponse`, `QuestionResponse`,
+`QuestionList`, `Answer`, `Event`, `Health`, `Error`) — `additionalProperties: true`:
+незнакомые поля клиент игнорирует (см. COMPATIBILITY §4).
 
 ## 2. Версия
 
@@ -52,7 +53,7 @@
 | `POST /v1/devices` | зарегистрировать устройство | `DeviceCreateRequest` | `201` + `Device` |
 | `DELETE /v1/devices/{id}` | отозвать устройство (токен сразу недействителен) | — | `204` |
 | `POST /v1/pair` | подтвердить привязку по `pairCode` | `PairRequest` | `200` + `PairResponse` |
-| `POST /v1/questions` | опубликовать вопрос (плагин) | `QuestionPublishRequest` | `201` + `Question` |
+| `POST /v1/questions` | опубликовать вопрос (плагин) | `QuestionPublishRequest` | `201` + `QuestionResponse` |
 | `GET /v1/questions?since=<rfc3339>&limit=<n>` | вопросы после `since` (курсор — `nextSince`) | — | `200` + `QuestionList` |
 | `POST /v1/answers` | ответ человека; идемпотентно по `idempotencyKey` | `AnswerRequest` | `201` + `Answer`; повтор — `200` + тот же `Answer` |
 | `GET /v1/answers?questionId=<id>` | ответ на вопрос (плагин) | — | `200` + `Answer` |

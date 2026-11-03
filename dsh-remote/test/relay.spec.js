@@ -29,6 +29,7 @@ const VALID = {
   "pair.response.json": "PairResponse",
   "question.publish.request.json": "QuestionPublishRequest",
   "question.encrypted.json": "Question",
+  "question.response.json": "QuestionResponse",
   "questions.list.response.json": "QuestionList",
   "answer.request.json": "AnswerRequest",
   "answer.encrypted.request.json": "AnswerRequest",
@@ -164,6 +165,7 @@ test("обязательные поля сущностей совпадают с
     PairRequest: ["pairCode", "deviceId"],
     PairResponse: ["deviceToken", "device", "confirmedAt"],
     Question: ["id", "shortId", "createdAt", "expiresAt"],
+    QuestionResponse: ["id", "shortId", "createdAt", "expiresAt"],
     AnswerRequest: ["questionId", "answeredAt", "idempotencyKey"],
     Answer: ["questionId", "answeredAt", "idempotencyKey"],
     Event: ["type", "at"],
@@ -246,4 +248,45 @@ test("каждая схема из paths покрыта хотя бы одним
       }
     }
   }
+});
+
+test("event payload без answeredBy: идентификация устройства — токеном", () => {
+  const schema = loadSchema();
+  const event = readJson("event.message.json");
+  const payload = event.payload ?? {};
+
+  assert.equal("answeredBy" in payload, false, "в payload нет answeredBy");
+  assert.equal(validate(schema.components.schemas.Event, event, { root: schema }).ok, true);
+  // §6 обещает, что answeredBy на проводе нет вообще.
+  assert.match(readText("PROTOCOL.md"), /answeredBy[^.]*нет/);
+});
+
+test("Question-response аддитивен, Question-запрос строгий", () => {
+  const schema = loadSchema();
+  const response = readJson("question.response.json");
+
+  assert.ok("serverTags" in response, "в ответе есть поле минорной версии");
+  assert.equal(validate(schema.components.schemas.QuestionResponse, response, { root: schema }).ok, true, "ответ: лишнее поле ок");
+
+  const asRequest = validate(schema.components.schemas.Question, response, { root: schema });
+  assert.equal(asRequest.ok, false, "запрос: лишнее поле отвергается");
+  assert.match(asRequest.errors.join("; "), /лишнее поле serverTags/);
+
+  // И зашифрованный вопрос в ответе тоже аддитивен.
+  const encrypted = readJson("question.encrypted.json");
+  const encryptedResponse = { ...encrypted, serverTags: ["x"] };
+  assert.equal(validate(schema.components.schemas.QuestionResponse, encryptedResponse, { root: schema }).ok, true);
+});
+
+test("title/detail задокументированы и есть в схеме открытого режима", () => {
+  const schema = loadSchema();
+  const protocol = readText("PROTOCOL.md");
+  const question = schema.components.schemas.Question;
+
+  for (const field of ["title", "detail"]) {
+    assert.ok(field in question.properties, `схема знает ${field}`);
+    assert.match(protocol, new RegExp(`${field}\\\\?`), `PROTOCOL.md документирует ${field}?`);
+  }
+  assert.equal(question.required.includes("title"), false, "title необязателен");
+  assert.equal(question.required.includes("detail"), false, "detail необязателен");
 });
