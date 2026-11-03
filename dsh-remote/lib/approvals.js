@@ -266,7 +266,6 @@ export function createApprovals({
       log("подтверждение без toolName — не наш запрос, отдаю GUI (next)");
       return next();
     }
-    if (request?.signal?.aborted === true) return APPROVAL_OUTCOME.cancelled;
 
     const sessionId = typeof request?.agent?.id === "string" ? request.agent.id : null;
     const workspace = workspaceOf(sessionId);
@@ -277,18 +276,14 @@ export function createApprovals({
       log(`реестр режима: ${error?.message ?? error} — считаю режим выключенным`);
     }
     if (!decision.enabled) {
+      // Выключенный режим не логируем: плагин не забирает запрос, и журнал не
+      // должен собирать инструменты действий, которые удалённо не подтверждали.
       log(`подтверждение ${toolName} (${sessionId ?? "без агента"}): режим выключен — отдаю GUI (next)`);
       return next();
     }
-    if (typeof deliver !== "function" && !useBroker && typeof primary?.sendQuestion !== "function") {
-      log("подтверждение: транспорт не умеет sendQuestion — отдаю GUI (next)");
-      return next();
-    }
-    if (subscribable.length === 0) {
-      log("подтверждение: транспорт не умеет onAnswer — отдаю GUI (next)");
-      return next();
-    }
 
+    // Модель создаём ДО проверок транспорта: иначе «отдано GUI» и «снято по
+    // аборту» не попадали бы в журнал (а карточка 026 требует каждое решение).
     const marks = marksOf(sessionId);
     const channel = channelFor(workspace, primary?.id ?? null);
     const approval = new RemoteApproval(request, {
@@ -302,6 +297,25 @@ export function createApprovals({
       ...(Number.isFinite(ttlMs) ? { ttlMs } : {}),
       log,
     });
+
+    if (request?.signal?.aborted === true) {
+      approval.cancel("aborted", now());
+      stats.cancelled += 1;
+      record(approval, { outcome: APPROVAL_OUTCOME.cancelled, decision: "timeout" });
+      return APPROVAL_OUTCOME.cancelled;
+    }
+    if (typeof deliver !== "function" && !useBroker && typeof primary?.sendQuestion !== "function") {
+      approval.cancel("no-transport", now());
+      record(approval, { outcome: APPROVAL_OUTCOME.unavailable, decision: "gui" });
+      log("подтверждение: транспорт не умеет sendQuestion — отдаю GUI (next)");
+      return next();
+    }
+    if (subscribable.length === 0) {
+      approval.cancel("no-onanswer", now());
+      record(approval, { outcome: APPROVAL_OUTCOME.unavailable, decision: "gui" });
+      log("подтверждение: транспорт не умеет onAnswer — отдаю GUI (next)");
+      return next();
+    }
 
     /** Ожидание решения + гонка с абортом запроса. */
     const outcome = await new Promise((resolve) => {

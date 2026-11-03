@@ -160,6 +160,13 @@ export function createAudit({
       fsImpl.mkdirSync(paths.dir, { recursive: true, mode: 0o700 });
       rotateIfNeeded(line.length);
       fsImpl.appendFileSync(paths.file, line, { mode: 0o600 });
+      // `mode` у appendFileSync действует только при создании: существующий файл
+      // с 644 нужно починить, иначе журнал остаётся читаемым для всех.
+      try {
+        fsImpl.chmodSync(paths.file, 0o600);
+      } catch (error) {
+        log(`аудит: chmod 600 не удался (${error?.message ?? error})`);
+      }
       return true;
     } catch (error) {
       log(`аудит: записать решение не удалось (${error?.message ?? error})`);

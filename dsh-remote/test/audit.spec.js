@@ -144,3 +144,16 @@ test("путь журнала: рядом со state.json, DSH_REMOTE_AUDIT гл
     "/tmp/audit.jsonl",
   );
 });
+
+test("существующий файл с 644 чинится до 600 при записи", (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, AUDIT_FILE_NAME);
+  fs.writeFileSync(file, '{"ts":"t","kind":"approval","decision":"remote"}\n', { mode: 0o644 });
+  fs.chmodSync(file, 0o644);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o644);
+
+  const audit = createAudit({ file });
+  audit.append(entry({ questionId: "approval-2" }));
+
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600, "журнал должен быть доступен только владельцу");
+});

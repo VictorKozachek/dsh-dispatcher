@@ -488,3 +488,56 @@ test("аудит: dispose снимает открытые подтвержден
   assert.equal(records[0].decision, "timeout");
   assert.equal(records[0].outcome, "cancelled");
 });
+
+test("аудит: транспорт без sendQuestion — decision=gui, запрос не отправлен", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const transport = { id: "no-send", onAnswer: () => () => {} };
+  const { approvals, next, nextCalls } = setup({ transport, audit });
+
+  const outcome = await approvals.handler(request(), next);
+
+  assert.equal(outcome, "gui");
+  assert.equal(nextCalls.length, 1);
+  const [record] = read();
+  assert.equal(record.decision, "gui");
+  assert.equal(record.outcome, "unavailable");
+  assert.equal(record.toolName, "Bash");
+  assert.equal(record.sessionId, "session-1", "синтетическая запись несёт маркировку сессии");
+});
+
+test("аудит: транспорт без onAnswer — decision=gui, в журнале и в статусе", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const transport = {
+    id: "no-answers",
+    sent: [],
+    async sendQuestion(question) {
+      transport.sent.push(question);
+    },
+    async closeQuestion() {},
+  };
+  const { approvals, next } = setup({ transport, audit });
+
+  const outcome = await approvals.handler(request(), next);
+
+  assert.equal(outcome, "gui");
+  assert.equal(transport.sent.length, 0, "подтверждение без канала ответа не отправляем");
+  const [record] = read();
+  assert.equal(record.decision, "gui");
+  assert.equal(record.outcome, "unavailable");
+  assert.equal(record.callId, "call-42");
+});
+
+test("аудит: аборт на входе — decision=timeout, outcome=cancelled", async (t) => {
+  const { audit, read } = auditInTemp(t);
+  const { approvals, next } = setup({ audit });
+  const controller = new AbortController();
+  controller.abort();
+
+  const outcome = await approvals.handler(request({ signal: controller.signal }), next);
+
+  assert.equal(outcome, "cancelled");
+  const [record] = read();
+  assert.equal(record.decision, "timeout");
+  assert.equal(record.outcome, "cancelled");
+  assert.equal(record.toolName, "Bash");
+});
