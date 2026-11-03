@@ -128,7 +128,63 @@ function answerSummary(question) {
  * @param {() => number} [options.now] — часы (мс epoch), в тестах подменяются.
  * @returns {{attach: (ctx: object) => () => void, handler: Function, dispose: (reason?: string) => void}}
  */
-export function createAnswerer({ transport, registry, log = noopLog, now = Date.now, deliver = null, reliability = null } = {}) {
+export function createAnswerer({
+  transport,
+  registry,
+  log = noopLog,
+  now = Date.now,
+  deliver = null,
+  reliability = null,
+  /** Гибридный режим (013): `{enabled, waitMs}` или функция, отдающая его. */
+  hybrid = null,
+  /** Доставка позднего ответа в сессию; по умолчанию `sessionController.prompt`. */
+  steer = null,
+  /** Таймеры инжектируются: тесты не ждут реальные 20 секунд. */
+  setTimeout: setTimeoutImpl = setTimeout,
+  clearTimeout: clearTimeoutImpl = clearTimeout,
+} = {}) {
+  /** Счётчики гибрида для журнала/`/remote status`. */
+  const stats = { hybridHanded: 0, hybridPhoneAnswers: 0 };
+
+  /** Текущая конфигурация гибрида: функция вызывается на каждый вопрос. */
+  function hybridConfig() {
+    let value = hybrid;
+    if (typeof value === "function") {
+      try {
+        value = value();
+      } catch (error) {
+        log(`гибрид: конфиг не прочитан (${error?.message ?? error})`);
+        value = null;
+      }
+    }
+    if (value === null || typeof value !== "object") return { enabled: false, waitMs: 20_000 };
+    return {
+      enabled: value.enabled === true,
+      waitMs: Number.isFinite(value.waitMs) && value.waitMs > 0 ? Math.floor(value.waitMs) : 20_000,
+    };
+  }
+
+  /** Отправить поздний ответ в сессию как уточнение (`steer`). */
+  async function steerLateAnswer(question, normalized) {
+    const text = normalized.text !== undefined && normalized.text !== ""
+      ? normalized.text
+      : (question.answer?.selected ?? []).join(", ");
+    const body = `ответ человека на вопрос ${question.questionId ?? question.shortId} из мессенджера: ${text}`;
+    if (typeof steer === "function") {
+      await steer({ question, text: body, sessionId: question.sessionId });
+      return;
+    }
+    const controller = context?.get?.("sessionController");
+    if (controller === null || controller === undefined || typeof controller.prompt !== "function") {
+      log(`гибрид: sessionController недоступен — поздний ответ ${question.shortId} не доставлен`);
+      return;
+    }
+    await controller.prompt({
+      sessionId: question.sessionId,
+      mode: "steer",
+      content: [{ type: "text", text: body }],
+    });
+  }
   /**
    * Доставка вопроса: по умолчанию — транспорт, но 008 подставляет сюда
    * `reliability.deliver` с повторами. Сигнал `'give-up'` означает «за
@@ -139,6 +195,8 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     : async (question, signal) => transport.sendQuestion(question, signal);
   /** Открытые вопросы по короткому id: ждём ответа транспорта. */
   const pending = new Map();
+  /** Метка «вопрос ушёл в GUI»: гонка ожиданий завершается этим значением. */
+  const HYBRID_GUI = Symbol("hybrid-gui");
   /** Контекст плагина: из него берём cwd сессии для scope воркспейса. */
   let context = null;
   let disposed = false;
@@ -219,6 +277,22 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
       return;
     }
     const entry = pending.get(normalized.shortId);
+    if (entry !== undefined && entry.hybridGui === true) {
+      // Вопрос уже показан в GUI: ответ из мессенджера не результат инструмента,
+      // а уточнение к сессии. Принимаем один раз, закрываем сообщение.
+      const lateParsed = choiceFor(entry.question, normalized);
+      if (lateParsed.error !== undefined || lateParsed.awaitingText === true || lateParsed.showMore === true) return;
+      if (!entry.question.accept(lateParsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
+      pending.delete(normalized.shortId);
+      reliability?.unwatch?.(normalized.shortId);
+      stats.hybridPhoneAnswers += 1;
+      log(`гибрид: ответ на ${normalized.shortId} пришёл из мессенджера после ухода в GUI — отправляю steer`);
+      void closeMessage(entry.question);
+      void steerLateAnswer(entry.question, normalized).catch((error) => {
+        log(`гибрид: steer не доставлен (${error?.message ?? error})`);
+      });
+      return;
+    }
     if (entry === undefined) {
       // Поздний ответ: вопрос уже снят (TTL/аборт/перезапуск). Это не игнор —
       // карточка требует, чтобы ответ дошёл до сессии через `steer`.
@@ -252,6 +326,14 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     pending.delete(normalized.shortId);
     reliability?.unwatch?.(normalized.shortId);
     entry.resolve(entry.question);
+    if (entry.hybridTimer !== null && entry.hybridTimer !== undefined) {
+      try {
+        clearTimeoutImpl(entry.hybridTimer);
+      } catch {
+        /* таймер уже сработал */
+      }
+      entry.hybridTimer = null;
+    }
     void closeMessage(entry.question);
   }
 
@@ -367,6 +449,55 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     /** Для каких вопросов отправка началась: у неотправленного закрывать нечего. */
     const attempted = new Set();
 
+    /**
+     * Гибрид (013): если ответа нет `waitMs`, отдаём вопрос в GUI через `next()`.
+     * Один вызов на пачку: `next()` вызывается ровно один раз и только когда ни
+     * один вопрос ещё не отвечен.
+     */
+    const hybridState = hybridConfig();
+    let hybridTimer = null;
+    let guiResolver = null;
+    let guiRequested = false;
+    const guiRace = new Promise((resolve) => {
+      guiResolver = resolve;
+    });
+    const cleanupHybrid = () => {
+      if (hybridTimer !== null) {
+        try {
+          clearTimeoutImpl(hybridTimer);
+        } catch {
+          /* таймер уже сработал */
+        }
+        hybridTimer = null;
+      }
+    };
+
+    function armHybrid() {
+      if (hybridState.enabled !== true) return;
+      hybridTimer = setTimeoutImpl(() => {
+        hybridTimer = null;
+        const stillOpen = questions.filter((question) => pending.has(question.shortId));
+        if (stillOpen.length === 0) return; // уже ответили — GUI не нужен
+        guiRequested = true;
+        stats.hybridHanded += stillOpen.length;
+        for (const question of stillOpen) {
+          const waitingEntry = pending.get(question.shortId);
+          if (waitingEntry !== undefined) {
+            waitingEntry.hybridGui = true;
+            waitingEntry.hybridTimer = null;
+          }
+        }
+        log(`гибрид: ответа нет ${hybridState.waitMs} мс — отдаю вопросы в GUI (${stillOpen.length})`);
+        guiResolver?.(HYBRID_GUI);
+      }, hybridState.waitMs);
+      hybridTimer?.unref?.();
+      // Таймер помним и на ожиданиях: обычный ответ должен его снять.
+      for (const question of questions) {
+        const waitingEntry = pending.get(question.shortId);
+        if (waitingEntry !== undefined) waitingEntry.hybridTimer = hybridTimer;
+      }
+    }
+
     try {
       try {
         for (const question of questions) {
@@ -389,9 +520,15 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
         return next();
       }
 
+      armHybrid();
       try {
-        await Promise.race([Promise.all(waiting), aborted]);
+        const outcome = await Promise.race([Promise.all(waiting), aborted, guiRace]);
+        if (outcome === HYBRID_GUI || guiRequested) {
+          cleanupHybrid();
+          return next();
+        }
       } catch (error) {
+        cleanupHybrid();
         if (error?.name === "AbortError") {
           await closeQuestions(questions, "aborted", attempted);
           throw error;
@@ -482,5 +619,5 @@ export function createAnswerer({ transport, registry, log = noopLog, now = Date.
     pending.clear();
   }
 
-  return { attach, handler, dispose };
+  return { attach, handler, dispose, stats };
 }

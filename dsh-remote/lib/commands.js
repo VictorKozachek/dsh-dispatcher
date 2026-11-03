@@ -46,6 +46,8 @@ const HELP_TEXT = [
   "  /remote connect    — привязать бота (пошагово, локальными вопросами)",
   "  /remote on|off     — включить/выключить для этого проекта",
   "    --all            — для всех проектов, --session — только для этой сессии",
+  "    --hybrid         — гибрид: вопрос уходит в GUI, если в мессенджере молчат N секунд",
+  "    --no-hybrid      — выключить гибридный режим",
   "  /remote status     — привязка, режим, источник токена",
   "  /remote test       — отправить тестовый вопрос в мессенджер",
   "  /remote who        — сессия, воркспейс и эффективный режим",
@@ -599,6 +601,8 @@ export function createRemoteCommands({
       if (channel === null) return failure("канал не поднят: проверьте токен и /remote status");
     }
     try {
+      if (flags.has("hybrid")) store.setHybrid({ enabled });
+      if (flags.has("no-hybrid")) store.setHybrid({ enabled: false });
       if (flags.has("all")) {
         store.setEnabled({ kind: "global" }, enabled);
         const decision = registry.resolve({ sessionId, workspace: cwd });
@@ -650,6 +654,7 @@ export function createRemoteCommands({
       lines.push(`секрет: ${TELEGRAM_TOKEN_REF} — источник ${described.source}${described.writable ? " (запись разрешена)" : " (только чтение)"}`);
     }
 
+    lines.push(`гибрид: ${state.hybrid.enabled ? `вкл, ждём ${Math.round(state.hybrid.waitMs / 1000)} с` : "выкл"}`);
     lines.push(`режим: глобально ${state.enabled.global ? "вкл" : "выкл"}; проект ${cwd === null ? "?" : cwd} ${cwd !== null && state.enabled.workspaces[cwd] === true ? "вкл" : "выкл"}; сессия ${sessionId === null ? "?" : sessionId} ${sessionId !== null && state.enabled.sessions[sessionId] === true ? "вкл" : "выкл"}`);
     lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
 
