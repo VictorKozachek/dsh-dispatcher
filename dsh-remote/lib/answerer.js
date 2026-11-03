@@ -31,6 +31,8 @@
  * прислать один `optionId` или `custom` вместо `text`, не ломая ответчик.
  */
 
+import { randomUUID } from "node:crypto";
+
 import { ANSWERED_ELSEWHERE, createBroker } from "./broker.js";
 import { createQuestion } from "./domain/question.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, resolveContext } from "./present.js";
@@ -140,7 +142,59 @@ export function createAnswerer({
   reliability = null,
   /** 015: канал проекта по воркспейсу: `(workspace) => {chatId, threadId, source}`. */
   channelOf = null,
+  /** Гибридный режим (013): `{enabled, waitMs}` или функция, отдающая его. */
+  hybrid = null,
+  /** 013: доставка позднего ответа; по умолчанию `sessionController.prompt`. */
+  steer = null,
+  /** 013: таймеры инжектируются, тесты не ждут реальные 20 секунд. */
+  setTimeout: setTimeoutImpl = setTimeout,
+  clearTimeout: clearTimeoutImpl = clearTimeout,
 } = {}) {
+  /** Счётчики гибрида для журнала и `/remote status`. */
+  const stats = { hybridHanded: 0, hybridPhoneAnswers: 0 };
+
+  /** Текущая конфигурация гибрида: функция вызывается на каждый вопрос. */
+  function hybridConfig() {
+    let value = hybrid;
+    if (typeof value === "function") {
+      try {
+        value = value();
+      } catch (error) {
+        log(`гибрид: конфиг не прочитан (${error?.message ?? error})`);
+        value = null;
+      }
+    }
+    if (value === null || typeof value !== "object") return { enabled: false, waitMs: 20_000 };
+    return {
+      enabled: value.enabled === true,
+      waitMs: Number.isFinite(value.waitMs) && value.waitMs > 0 ? Math.floor(value.waitMs) : 20_000,
+    };
+  }
+
+  /** Отправить поздний ответ в сессию как уточнение (`steer`). */
+  async function steerLateAnswer(question, normalized, signal) {
+    const text = normalized.text !== undefined && normalized.text !== ""
+      ? normalized.text
+      : (question.answer?.selected ?? []).join(", ");
+    const body = `ответ человека на вопрос ${question.questionId ?? question.shortId} из мессенджера: ${text}`;
+    if (typeof steer === "function") {
+      await steer({ question, text: body, sessionId: question.sessionId, signal });
+      return;
+    }
+    const controller = context?.get?.("sessionController");
+    if (controller === null || controller === undefined || typeof controller.prompt !== "function") {
+      throw new Error("sessionController недоступен");
+    }
+    // Контракт DSH: prompt(request, signal); requestId — новый uuid, signal —
+    // свежий контроллер (сигнал исходного запроса после next() уже может быть
+    // aborted, как в 008 applyLateAnswer).
+    await controller.prompt({
+      requestId: randomUUID(),
+      sessionId: question.sessionId,
+      mode: "steer",
+      content: [{ type: "text", text: body }],
+    }, new AbortController().signal);
+  }
   /**
    * Каналы (012): один транспорт — прежний путь, несколько — брокер с гонкой.
    * Ответчик не знает платформ: только список реализаций контракта.
@@ -182,6 +236,10 @@ export function createAnswerer({
   }
   /** Открытые вопросы по короткому id: ждём ответа транспорта. */
   const pending = new Map();
+  /** Метка «вопрос ушёл в GUI»: гонка ожиданий завершается этим значением. */
+  const HYBRID_GUI = Symbol("hybrid-gui");
+  /** Таймеры гибрида по shortId: ответ на один вопрос не снимает чужие. */
+  const hybridTimers = new Map();
   /** Все вопросы этой пачки: поздний ответ проигравшего канала ищем здесь. */
   const known = new Map();
   /** Контекст плагина: из него берём cwd сессии для scope воркспейса. */
@@ -268,6 +326,22 @@ export function createAnswerer({
    * Слушатель будим **до** правки: медленный (или зависший) editMessageText не
    * должен задерживать ответ сессии. Правка — украшение, ответ — смысл.
    */
+  /** Доставить поздний (гибридный) ответ; при сбое — пометить и не закрывать. */
+  async function settleLate(entry, normalized) {
+    try {
+      await steerLateAnswer(entry.question, normalized, entry.signal);
+    } catch (error) {
+      entry.steerFailed = true;
+      log(`гибрид: поздний ответ ${entry.question.shortId} не доставлен в сессию (${error?.message ?? error}) — сообщение не закрываю`);
+      return;
+    }
+    pending.delete(entry.question.shortId);
+    reliability?.unwatch?.(entry.question.shortId);
+    stats.hybridPhoneAnswers += 1;
+    log(`гибрид: ответ на ${entry.question.shortId} из мессенджера доставлен steer-ом`);
+    void closeMessage(entry.question);
+  }
+
   function onTransportAnswer(event, sourceTransport = null) {
     const normalized = normalizeAnswerEvent(event);
     if (normalized === null) {
@@ -275,6 +349,26 @@ export function createAnswerer({
       return;
     }
     const entry = pending.get(normalized.shortId);
+    if (entry !== undefined && entry.hybridGui === true) {
+      // Вопрос уже показан в GUI: ответ из мессенджера — не результат
+      // инструмента, а уточнение к сессии. Принимаем один раз и шлём steer.
+      if (entry.steerFailed === true && entry.lateAnswer !== undefined) {
+        void settleLate(entry, entry.lateAnswer);
+        return;
+      }
+      const lateParsed = choiceFor(entry.question, normalized);
+      if (lateParsed.error !== undefined || lateParsed.awaitingText === true || lateParsed.showMore === true) return;
+      if (!entry.question.accept(lateParsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
+      // Гибридный поздний ответ тоже знает свой канал: по нему closeAll
+      // определяет победителя и закрывает остальные пометкой.
+      entry.question.answeredVia = sourceTransport?.id ?? entry.question.answeredVia ?? null;
+      entry.lateAnswer = normalized;
+      log(`гибрид: ответ на ${normalized.shortId} пришёл из мессенджера после ухода в GUI — отправляю steer`);
+      // Сначала доставляем steer, и только потом закрываем сообщение: если
+      // доставка упала, вопрос не должен выглядеть отвеченным/потерянным.
+      void settleLate(entry, normalized);
+      return;
+    }
     if (entry === undefined) {
       const knownQuestion = known.get(normalized.shortId);
       if (knownQuestion !== undefined && knownQuestion.status === "answered") {
@@ -315,6 +409,15 @@ export function createAnswerer({
     entry.question.answeredVia = sourceTransport?.id ?? entry.question.answeredVia ?? null;
     pending.delete(normalized.shortId);
     reliability?.unwatch?.(normalized.shortId);
+    if (entry.hybridTimer !== null && entry.hybridTimer !== undefined) {
+      try {
+        clearTimeoutImpl(entry.hybridTimer);
+      } catch {
+        /* таймер уже сработал */
+      }
+      hybridTimers.delete(normalized.shortId);
+      entry.hybridTimer = null;
+    }
     entry.resolve(entry.question);
     void closeMessage(entry.question);
   }
@@ -410,7 +513,7 @@ export function createAnswerer({
     for (const question of questions) {
       question.markOpen(now());
       const waited = new Promise((resolve, reject) => {
-        pending.set(question.shortId, { question, resolve, reject });
+        pending.set(question.shortId, { question, resolve, reject, signal: request?.signal ?? null });
       });
       waited.catch(() => {});
       waiting.push(waited);
@@ -456,6 +559,62 @@ export function createAnswerer({
     /** Для каких вопросов отправка началась: у неотправленного закрывать нечего. */
     const attempted = new Set();
 
+    /**
+     * Гибрид (013): если ответа нет `waitMs`, отдаём вопрос в GUI через `next()`.
+     * Таймер на каждый вопрос: ответ на один не снимает чужие.
+     */
+    const hybridState = hybridConfig();
+    let guiResolver = null;
+    let guiRequested = false;
+    const guiRace = new Promise((resolve) => {
+      guiResolver = resolve;
+    });
+    const cleanupHybrid = () => {
+      for (const [shortId, timer] of hybridTimers.entries()) {
+        try {
+          clearTimeoutImpl(timer);
+        } catch {
+          /* таймер уже сработал */
+        }
+        hybridTimers.delete(shortId);
+      }
+    };
+
+    function armHybrid() {
+      if (hybridState.enabled !== true) return;
+      for (const question of questions) {
+        const timer = setTimeoutImpl(() => {
+          hybridTimers.delete(question.shortId);
+          const waitingEntry = pending.get(question.shortId);
+          if (waitingEntry === undefined) return; // уже ответили
+          waitingEntry.hybridTimer = null;
+          const stillOpen = questions.filter((item) => pending.has(item.shortId));
+          const anyAnswered = questions.some((item) => item.status === "answered");
+          if (anyAnswered) {
+            // Пачка уже частично отвечена: DSH вернул бы GUI весь запрос вместе
+            // с отвеченным вопросом, поэтому GUI не зовём — вопрос остаётся
+            // обычным ожиданием, его ответ идёт в результат, не в steer.
+            log(`гибрид: вопрос ${question.shortId} остался в мессенджере — пачка уже частично отвечена, GUI не зовём`);
+            return;
+          }
+          if (guiRequested) return; // next() уже звали
+          waitingEntry.hybridGui = true;
+          // Метрика — по числу вопросов, отданных в GUI, а не по числу таймеров.
+          stats.hybridHanded += stillOpen.length;
+          for (const item of stillOpen) {
+            const itemEntry = pending.get(item.shortId);
+            if (itemEntry !== undefined) itemEntry.hybridGui = true;
+          }
+          log(`гибрид: ответа нет ${hybridState.waitMs} мс — отдаю вопросы в GUI (${stillOpen.length})`);
+          guiResolver?.(HYBRID_GUI);
+        }, hybridState.waitMs);
+        timer?.unref?.();
+        hybridTimers.set(question.shortId, timer);
+        const waitingEntry = pending.get(question.shortId);
+        if (waitingEntry !== undefined) waitingEntry.hybridTimer = timer;
+      }
+    }
+
     try {
       try {
         for (const question of questions) {
@@ -490,9 +649,15 @@ export function createAnswerer({
         return next();
       }
 
+      armHybrid();
       try {
-        await Promise.race([Promise.all(waiting), aborted]);
+        const outcome = await Promise.race([Promise.all(waiting), aborted, guiRace]);
+        if (outcome === HYBRID_GUI || guiRequested) {
+          cleanupHybrid();
+          return next();
+        }
       } catch (error) {
+        cleanupHybrid();
         if (error?.name === "AbortError") {
           await closeQuestions(questions, "aborted", attempted);
           throw error;
@@ -511,6 +676,7 @@ export function createAnswerer({
       }
     }
 
+    cleanupHybrid();
     for (const question of questions) pending.delete(question.shortId);
     reliability?.unwatch?.(questions.map((question) => question.shortId));
     log(`вопросов ${questions.length}: ответ получен (${decision.scope})`);
@@ -598,5 +764,5 @@ export function createAnswerer({
     pending.clear();
   }
 
-  return { attach, handler, dispose };
+  return { attach, handler, dispose, stats };
 }

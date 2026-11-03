@@ -46,6 +46,8 @@ const HELP_TEXT = [
   "  /remote connect    — привязать бота (пошагово, локальными вопросами)",
   "  /remote on|off     — включить/выключить для этого проекта",
   "    --all            — для всех проектов, --session — только для этой сессии",
+  "    --hybrid         — гибрид: вопрос уходит в GUI, если в мессенджере молчат N секунд",
+  "    --no-hybrid      — выключить гибридный режим",
   "  /remote status     — привязка, режим, источник токена",
   "  /remote test       — отправить тестовый вопрос в мессенджер",
   "  /remote who        — сессия, воркспейс и эффективный режим",
@@ -603,6 +605,8 @@ export function createRemoteCommands({
       if (channel === null) return failure("канал не поднят: проверьте токен и /remote status");
     }
     try {
+      if (flags.has("hybrid")) store.setHybrid({ enabled });
+      if (flags.has("no-hybrid")) store.setHybrid({ enabled: false });
       if (flags.has("all")) {
         store.setEnabled({ kind: "global" }, enabled);
         const decision = registry.resolve({ sessionId, workspace: cwd });
@@ -654,6 +658,11 @@ export function createRemoteCommands({
       lines.push(`секрет: ${TELEGRAM_TOKEN_REF} — источник ${described.source}${described.writable ? " (запись разрешена)" : " (только чтение)"}`);
     }
 
+    lines.push(`гибрид: ${state.hybrid.enabled ? `вкл, ждём ${Math.round(state.hybrid.waitMs / 1000)} с` : "выкл"}`);
+    const hybridStats = ctx?.get?.("remoteAnswerer")?.stats ?? null;
+    if (hybridStats !== null && (hybridStats.hybridHanded > 0 || hybridStats.hybridPhoneAnswers > 0)) {
+      lines.push(`гибрид-метрика: в GUI ${hybridStats.hybridHanded}, ответов из телефона после GUI ${hybridStats.hybridPhoneAnswers}`);
+    }
     lines.push(`режим: глобально ${state.enabled.global ? "вкл" : "выкл"}; проект ${cwd === null ? "?" : cwd} ${cwd !== null && state.enabled.workspaces[cwd] === true ? "вкл" : "выкл"}; сессия ${sessionId === null ? "?" : sessionId} ${sessionId !== null && state.enabled.sessions[sessionId] === true ? "вкл" : "выкл"}`);
     lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
 
@@ -749,8 +758,10 @@ export function createRemoteCommands({
 
     if (action === "remove") {
       if (typeof target !== "string" || target === "") return failure("укажите проект: /remote channel remove <проект>");
+      const key = target.trim().replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+      if (!(key in (store.read().channels ?? {}))) return failure(`у проекта ${key} нет своего канала — он и так в общем чате`);
       store.removeChannel(target);
-      return success(`проект ${target} снова идёт в общий чат`);
+      return success(`проект ${key} снова идёт в общий чат`);
     }
 
     // set: `/remote channel <проект> <chatId> [threadId]`
@@ -769,11 +780,14 @@ export function createRemoteCommands({
       return failure(`чат ${numericChat} не совпадает с привязанным (${bindingChat}): это чужой чат. `
         + "Если бот действительно добавлен туда, повторите с --force");
     }
-    const numericThread = Number(threadIdRaw);
-    const channel = {
-      chatId: numericChat,
-      ...(Number.isInteger(numericThread) && numericThread > 0 ? { threadId: numericThread } : {}),
-    };
+    let channel = { chatId: numericChat };
+    if (threadIdRaw !== undefined && threadIdRaw !== "") {
+      const numericThread = Number(threadIdRaw);
+      if (!Number.isInteger(numericThread) || numericThread <= 0) {
+        return failure("threadId (топик форума) должен быть целым положительным числом");
+      }
+      channel = { chatId: numericChat, threadId: numericThread };
+    }
     try {
       store.setChannel(name, channel);
     } catch (error) {

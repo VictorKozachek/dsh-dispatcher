@@ -60,12 +60,14 @@ export const answererFeature = {
 
     // 012: у каждого канала — своя доставка reliability (повторы/backoff/give-up).
     const deliverFor = deps.get("remoteReliabilityDeliver");
+    // Гибрид (013): ждём ответ в мессенджере `hybrid.waitMs`, потом отдаём в GUI.
     const answerer = createAnswerer({
       transport: deps.get(TRANSPORT_SERVICE),
       deliverFor,
       // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
       channelOf: (workspace) => resolveChannel(store?.read?.() ?? {}, workspace),
       transports,
+      hybrid: () => (store?.read?.().hybrid ?? { enabled: false }),
       registry,
       reliability,
       deliver: reliability === null ? null : (argument) => reliability.deliver(argument),
@@ -73,5 +75,19 @@ export const answererFeature = {
     });
 
     deps.onDispose(answerer.attach(ctx));
+    // Метрика гибрида доступна командам (`/remote status`) как сервис.
+    try {
+      ctx.provide?.("remoteAnswerer", { stats: answerer.stats });
+    } catch (error) {
+      deps.logger.debug(`answerer: сервис статистики не зарегистрирован (${error?.message ?? error})`);
+    }
+    // Метрика режима видна в логе при выгрузке: сколько ушло в GUI и сколько
+    // потом ответили из телефона.
+    deps.onDispose(() => {
+      const stats = answerer.stats ?? {};
+      if (stats.hybridHanded > 0 || stats.hybridPhoneAnswers > 0) {
+        deps.logger.info(`гибрид: в GUI отдано ${stats.hybridHanded}, ответов из мессенджера после GUI ${stats.hybridPhoneAnswers}`);
+      }
+    });
   },
 };

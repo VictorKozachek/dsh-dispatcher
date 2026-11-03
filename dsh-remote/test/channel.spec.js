@@ -388,3 +388,16 @@ test("normalizeState нормализует ключи channels (старый/м
   assert.deepEqual(Object.keys(channels).sort(), ["alpha", "beta"], "ключи — basename, мусор выброшен");
   assert.deepEqual(channels.beta, { chatId: 200, threadId: 5 });
 });
+
+test("/remote channel: remove неизвестного проекта и битый threadId отвергаются", async (t) => {
+  const { store, remote, invoke } = makeCommands(t);
+
+  const missing = await remote.handler(invoke("channel remove nope"));
+  assert.equal(missing.kind, "error");
+  assert.match(missing.text, /нет своего канала/);
+
+  const badThread = await remote.handler(invoke("channel alpha 42 seven"));
+  assert.equal(badThread.kind, "error");
+  assert.match(badThread.text, /threadId .* положительным/);
+  assert.equal(store.read().channels.alpha, undefined, "канал не сохранён");
+});
