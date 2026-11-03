@@ -230,3 +230,123 @@ test("ответчик: оба канала молчат/падают — воп
   assert.equal(nextCalls, 1, "ни один канал не доставил — GUI");
   assert.deepEqual(result, { answers: [] });
 });
+
+// --- регрессии по ревью 012 -------------------------------------------------
+
+test("publish: зависший канал обрезается таймаутом и не блокирует второй", async () => {
+  const hung = fakeTransport("max");
+  hung.sendQuestion = () => new Promise(() => {});
+  const telegram = fakeTransport("telegram");
+  const timers = [];
+  const broker = createBroker({
+    transports: [telegram, hung],
+    deliverTimeoutMs: 30_000,
+    setTimeout: (callback) => {
+      timers.push(callback);
+      return 1;
+    },
+    clearTimeout: () => {},
+  });
+  const question = makeQuestion();
+
+  const pending = broker.publish(question);
+  await tick();
+  assert.equal(telegram.sent.length, 1, "быстрый канал доставлен");
+  for (const callback of timers) callback();
+  const publication = await pending;
+
+  assert.deepEqual(publication.delivered.map((item) => item.id), ["telegram"]);
+  assert.equal(publication.failed[0].transport.id, "max");
+  assert.equal(publication.failed[0].reason, "timeout");
+});
+
+test("closeAll: сбой editQuestion не оставляет кнопки в проигравшем канале", async () => {
+  const telegram = fakeTransport("telegram");
+  const max = fakeTransport("max");
+  max.editQuestion = async () => {
+    throw new Error("правка не удалась");
+  };
+  const broker = createBroker({ transports: [telegram, max], log: () => {} });
+  const question = makeQuestion();
+  await broker.publish(question);
+
+  await broker.closeAll(question, { winner: telegram, summary: "Да" });
+
+  assert.deepEqual(max.closed.map((item) => item.summary), [ANSWERED_ELSEWHERE], "кнопки всё равно сняты");
+});
+
+test("reliability.noteDeliveries сохраняет список каналов в состоянии", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { createJsonState, createReliability } = await import("../lib/reliability.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-012-state-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const state = createJsonState({ file: path.join(dir, "state.json") });
+  const reliability = createReliability({
+    transport: fakeTransport("telegram"),
+    state,
+    logFile: path.join(dir, "log.jsonl"),
+    log: () => {},
+  });
+  const question = makeQuestion();
+  reliability.watch(question);
+  await brokerPublish(question);
+
+  reliability.noteDeliveries(question);
+
+  const [saved] = state.read().questions;
+  assert.deepEqual(saved.deliveries, [
+    { transport: "telegram", messageId: "telegram-mid", chatId: null },
+    { transport: "max", messageId: "max-mid", chatId: null },
+  ], "deliveries переживут рестарт");
+
+  async function brokerPublish(target) {
+    const broker = createBroker({ transports: [fakeTransport("telegram"), fakeTransport("max")] });
+    await broker.publish(target);
+  }
+});
+
+test("answererFeature: config.transports берёт каналы из реестра и публикует в оба", async () => {
+  const { answererFeature } = await import("../lib/features/answerer.js");
+  const telegram = fakeTransport("telegram");
+  const max = fakeTransport("max");
+  const registry = new Map([["telegram", telegram], ["max", max]]);
+  const services = new Map([
+    ["remoteTransport", telegram],
+    ["remoteTransports", registry],
+    ["remoteStore", { read: () => ({ enabled: { global: true }, hybrid: { enabled: false } }) }],
+  ]);
+  const hooks = new Map();
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => services.get(name) ?? null,
+    onDispose: () => {},
+  };
+  const ctx = {
+    get: (name) => services.get(name) ?? null,
+    on: (event, handler, options) => {
+      hooks.set(event, { handler, options });
+      return () => {};
+    },
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+  };
+
+  answererFeature.apply(ctx, { transports: ["telegram", "max"] }, deps);
+
+  const listener = hooks.get("user-questions/request")?.handler;
+  assert.equal(typeof listener, "function", "answerer подписан каркасом");
+  const pending = listener(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: "s1" } },
+    () => assert.fail("next()"),
+  );
+  await tick();
+  assert.equal(telegram.sent.length, 1, "канал telegram из реестра");
+  assert.equal(max.sent.length, 1, "канал max из реестра");
+
+  telegram.answer({ shortId: telegram.sent[0].shortId, optionId: "o1" });
+  await pending;
+});

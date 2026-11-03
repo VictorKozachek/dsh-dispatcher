@@ -34,7 +34,15 @@ export const ANSWERED_ELSEWHERE_TEXT = "Отвечено в другом кан�
  * @param {(message: string) => void} [options.log]
  * @returns {{transports: object[], publish: Function, closeAll: Function, transportOf: Function}}
  */
-export function createBroker({ transports = [], deliverFor = null, log = () => {} } = {}) {
+export function createBroker({
+  transports = [],
+  deliverFor = null,
+  log = () => {},
+  /** Сколько ждём один канал, прежде чем считать его недоставившим. */
+  deliverTimeoutMs = 30_000,
+  setTimeout: setTimeoutImpl = setTimeout,
+  clearTimeout: clearTimeoutImpl = clearTimeout,
+} = {}) {
   const channels = (Array.isArray(transports) ? transports : [])
     .filter((transport) => transport !== null && typeof transport === "object" && typeof transport.id === "string");
 
@@ -47,11 +55,32 @@ export function createBroker({ transports = [], deliverFor = null, log = () => {
   /** Доставка в один канал: результат нормализуем к `{ok, messageId, chatId}`. */
   async function deliverOne(transport, question, { signal } = {}) {
     const deliver = typeof deliverFor === "function" ? deliverFor(transport) : null;
+    // Свой контроллер на канал: зависший транспорт не должен держать Promise.all.
+    const controller = new AbortController();
+    let settled = false;
+    const aborted = new Promise((_, reject) => {
+      const fail = () => {
+        if (settled) return;
+        const error = new Error(`канал ${transport.id}: отмена доставки`);
+        error.name = "AbortError";
+        reject(error);
+      };
+      if (signal?.aborted === true) {
+        fail();
+        return;
+      }
+      if (typeof signal?.addEventListener === "function") signal.addEventListener("abort", fail, { once: true });
+      controller.signal.addEventListener("abort", fail, { once: true });
+    });
+    aborted.catch(() => {});
+    const timer = setTimeoutImpl(() => controller.abort(), deliverTimeoutMs);
+    timer?.unref?.();
     let token;
     try {
-      const outcome = typeof deliver === "function"
-        ? await deliver({ question, signal })
-        : await transport.sendQuestion(question);
+      const send = typeof deliver === "function"
+        ? deliver({ question, signal: controller.signal })
+        : transport.sendQuestion(question, controller.signal === undefined ? undefined : { signal: controller.signal });
+      const outcome = await Promise.race([send, aborted]);
       // `deliver` из 008 возвращает строку; прямой sendQuestion — `{messageId}`,
       // `undefined` или `"give-up"`.
       if (outcome === "give-up" || outcome === "aborted" || outcome === false) {
@@ -60,7 +89,15 @@ export function createBroker({ transports = [], deliverFor = null, log = () => {
       token = typeof outcome === "object" && outcome !== null ? outcome : {};
       return { ok: true, messageId: token.messageId ?? null, chatId: transport.chatId ?? null };
     } catch (error) {
-      return { ok: false, error };
+      const timeout = controller.signal.aborted && error?.name === "AbortError";
+      return { ok: false, error, reason: timeout ? "timeout" : "error" };
+    } finally {
+      settled = true;
+      try {
+        clearTimeoutImpl(timer);
+      } catch {
+        /* таймер уже сработал */
+      }
     }
   }
 
@@ -114,7 +151,12 @@ export function createBroker({ transports = [], deliverFor = null, log = () => {
           continue;
         }
         // Проигравший: сначала текст пометки, потом снятие кнопок тихой причиной.
-        await transport.editQuestion?.(question, ANSWERED_ELSEWHERE_TEXT);
+        // Сбой правки не должен оставить сообщение с кнопками.
+        try {
+          await transport.editQuestion?.(question, ANSWERED_ELSEWHERE_TEXT);
+        } catch (error) {
+          log(`broker: пометка в ${delivery.transport} не удалась (${error?.message ?? error})`);
+        }
         await transport.closeQuestion?.(question, ANSWERED_ELSEWHERE);
         log(`broker: канал ${delivery.transport} закрыт — ответ пришёл в ${winner?.id ?? "другой канал"}`);
       } catch (error) {

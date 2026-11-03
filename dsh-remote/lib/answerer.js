@@ -429,6 +429,8 @@ export function createAnswerer({
               await closeQuestions(questions, "undelivered", attempted);
               return next();
             }
+            // 012: доставки переживают рестарт (state.questions[].deliveries).
+            reliability?.noteDeliveries?.(question);
             continue;
           }
           const outcome = await Promise.race([sendOne(question, request?.signal), aborted]);

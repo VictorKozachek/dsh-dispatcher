@@ -48,6 +48,11 @@ export const answererFeature = {
     const transportRegistry = deps.get("remoteTransports");
     let transports = null;
     if (requested !== null && requested.length > 1 && transportRegistry !== null) {
+      const missing = requested.filter((id) => transportRegistry.get(id) === undefined);
+      if (missing.length > 0) {
+        // Не молчим: иначе два канала в конфиге тихо превратятся в один.
+        deps.logger.warn(`answerer: каналы из config.transports не найдены: ${missing.join(", ")} — работаю с тем, что есть`);
+      }
       transports = requested.map((id) => transportRegistry.get(id) ?? null).filter((transport) => transport !== null);
       if (transports.length <= 1) transports = null;
     }

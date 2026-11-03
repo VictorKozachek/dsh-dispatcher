@@ -496,6 +496,8 @@ export function createReliability({
             sessionId: sessionId ?? question.sessionId ?? null,
             chatId: chatId ?? question.chatId ?? null,
             messageId: messageId ?? null,
+            // 012: каналы, куда вопрос доставлен (список переживает рестарт).
+            deliveries: Array.isArray(question.deliveries) ? question.deliveries.map((item) => ({ ...item })) : [],
             createdAt: now(),
           });
         } else {
@@ -503,6 +505,9 @@ export function createReliability({
           if (entry !== undefined) {
             if (messageId !== undefined && entry.messageId === null) entry.messageId = messageId;
             if (chatId !== undefined && chatId !== null && entry.chatId === null) entry.chatId = chatId;
+            if (Array.isArray(question.deliveries) && question.deliveries.length > 0) {
+              entry.deliveries = question.deliveries.map((item) => ({ ...item }));
+            }
           }
         }
         return current;
@@ -510,6 +515,12 @@ export function createReliability({
     } catch (error) {
       logger(`состояние: открытый вопрос ${question.shortId} не сохранён (${error?.message ?? error})`);
     }
+  }
+
+  /** Запомнить доставки вопроса в состоянии (012: несколько каналов). */
+  function noteDeliveries(question) {
+    if (question === null || typeof question !== "object") return;
+    rememberOpen(question);
   }
 
   /** Убрать вопрос из открытых (ответили/сняли). */
@@ -868,6 +879,7 @@ export function createReliability({
     notify,
     watch,
     unwatch,
+    noteDeliveries,
     tick,
     start,
     stop,
