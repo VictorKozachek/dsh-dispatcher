@@ -798,6 +798,18 @@ export function createRemoteCommands({
     lines.push(`режим: глобально ${state.enabled.global ? "вкл" : "выкл"}; проект ${cwd === null ? "?" : cwd} ${cwd !== null && state.enabled.workspaces[cwd] === true ? "вкл" : "выкл"}; сессия ${sessionId === null ? "?" : sessionId} ${sessionId !== null && state.enabled.sessions[sessionId] === true ? "вкл" : "выкл"}`);
     lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
 
+    // 025: действующая политика подтверждений (публикует ответчик approvals 024).
+    try {
+      const policy = ctx?.get?.("remoteApprovalPolicy") ?? null;
+      if (policy !== null && typeof policy?.describe === "function") {
+        for (const line of policy.describe()) lines.push(line);
+      } else {
+        lines.push("approvals: политика не загружена — удалённые подтверждения только в GUI");
+      }
+    } catch (error) {
+      lines.push(`approvals: политика не прочитана (${humanError(error)})`);
+    }
+
     const channels = Object.entries(state.channels ?? {});
     if (channels.length === 0) {
       lines.push("каналы проектов: нет — все вопросы идут в общий чат");
