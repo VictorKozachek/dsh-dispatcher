@@ -26,6 +26,9 @@ export const reliabilityFeature = {
 
     const reliability = createReliability({
       transport: deps.get("remoteTransport"),
+      // 012: TTL/напоминания/recover идут во все каналы вопроса, которые
+      // находятся по id в реестре (в мультиканальном режиме фасад пуст).
+      transportFor: (transportId) => deps.get("remoteTransports")?.get?.(transportId) ?? null,
       state: store,
       ...(store === null ? { stateFile: paths.state } : {}),
       logFile: typeof config?.logFile === "string" ? config.logFile : paths.log,

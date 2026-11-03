@@ -702,7 +702,11 @@ test("features: при config.transports два канала не гасят д�
       return () => disposable?.();
     },
   };
-  const config = { transports: ["telegram", "max"], telegram: { tokenRef: "TG", chatId: 42 }, max: { chatId: 42 } };
+  const config = {
+    transports: ["telegram", "max"],
+    telegram: { tokenRef: "TG", chatId: 42, allowedUserIds: [7] },
+    max: { chatId: 42, allowedUserIds: [7] },
+  };
 
   await maxFeature.apply(ctx, config, deps);
   await telegramFeature.apply(ctx, config, deps);
@@ -825,4 +829,220 @@ test("recover после рестарта закрывает обе достав
   assert.match(edited.max[0].text, /сессия перезапущена/);
   assert.deepEqual(cleared.telegram[0], { chatId: 42, messageId: "tg-1" });
   assert.deepEqual(cleared.max[0], { chatId: 42, messageId: "max-1" });
+});
+
+// --- регрессии по четвёртому ревью 012 --------------------------------------
+
+test("reliabilityFeature передаёт transportFor: TTL и recover идут в оба канала", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { reliabilityFeature } = await import("../lib/features/reliability.js");
+  const { createStore } = await import("../lib/store.js");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-012-relfeat-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json") });
+  const edited = { telegram: [], max: [] };
+  const closed = { telegram: [], max: [] };
+  const makeChannel = (id) => ({
+    id,
+    caps: {},
+    async editQuestion(question, text) {
+      edited[id].push({ question, text });
+      return true;
+    },
+    async closeQuestion(question, summary) {
+      closed[id].push({ question, summary });
+    },
+    async sendQuestion() {
+      return { messageId: "x" };
+    },
+  });
+  const registry = new Map([["telegram", makeChannel("telegram")], ["max", makeChannel("max")]]);
+  const provided = new Map();
+  const services = new Map([
+    ["remoteTransport", null],
+    ["remoteTransports", registry],
+    ["remoteStore", store],
+  ]);
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => services.get(name) ?? null,
+    onDispose: () => {},
+  };
+  const ctx = {
+    get: (name) => services.get(name) ?? null,
+    provide: (name, service) => provided.set(name, service),
+  };
+
+  await reliabilityFeature.apply(ctx, { logFile: path.join(dir, "log.jsonl") }, deps);
+  const reliability = provided.get("remoteReliability");
+  assert.ok(reliability, "сервис устойчивости зарегистрирован");
+
+  const question = makeQuestion();
+  question.expiresAt = 0; // уже истёк: tick сразу закроет
+  question.deliveries = [
+    { transport: "telegram", messageId: "tg-1", chatId: 42 },
+    { transport: "max", messageId: "max-1", chatId: 42 },
+  ];
+  reliability.watch(question, { onExpire: () => {} });
+  await reliability.tick();
+
+  assert.equal(edited.telegram.length, 1, "пометка в telegram");
+  assert.equal(edited.max.length, 1, "пометка в max");
+  assert.deepEqual(closed.telegram.map((item) => item.summary), ["expired"]);
+  assert.deepEqual(closed.max.map((item) => item.summary), ["expired"]);
+
+  reliability.stop();
+});
+
+test("disconnect останавливает все каналы реестра в мультиканальном режиме", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { createRemoteCommands } = await import("../lib/commands.js");
+  const { createStore } = await import("../lib/store.js");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-012-disconnect-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json") });
+  store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+
+  const stopped = [];
+  const registry = new Map([
+    ["telegram", { id: "telegram", async stop() { stopped.push("telegram"); } }],
+    ["max", { id: "max", async stop() { stopped.push("max"); } }],
+  ]);
+  const ctx = {
+    get: (name) => {
+      if (name === "remoteTransports") return registry;
+      if (name === "remoteTransport") return null; // в multi фасад пуст
+      if (name === "credentials") return { describe: async () => ({ present: false, writable: false }), unset: async () => true };
+      return null;
+    },
+    userQuestions: { ask: async () => ({ answers: [{ id: "remote-disconnect-confirm", selected: ["Да, отвязать"] }] }) },
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+  };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => 0 });
+
+  const result = await remote.handler({
+    commandId: "c1",
+    agent: { id: "s1", session: { id: "s1" } },
+    rawInput: "disconnect",
+    signal: new AbortController().signal,
+  });
+
+  assert.equal(result.kind, "success", result.text);
+  assert.deepEqual(stopped.sort(), ["max", "telegram"], "оба канала остановлены");
+  assert.equal(registry.size, 0, "реестр очищен");
+  assert.equal(store.read().bindings, null);
+});
+
+test("фичевая сборка max+telegram+reliability+answerer: два канала, ответ и TTL-покрытие", async (t) => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { telegramFeature } = await import("../lib/features/telegram.js");
+  const { maxFeature } = await import("../lib/features/max.js");
+  const { reliabilityFeature } = await import("../lib/features/reliability.js");
+  const { answererFeature } = await import("../lib/features/answerer.js");
+  const { createStore } = await import("../lib/store.js");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-012-e2e-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json") });
+  store.setEnabled({ kind: "global" }, true); // режим включён: вопрос идёт в мессенджеры
+  store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+
+  const originalFetch = globalThis.fetch;
+  const api = dualFetch();
+  globalThis.fetch = api.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const registry = new Map();
+  const provided = new Map();
+  const facade = { __isTransportFacade: true, current: null, set(transport) { this.current = transport; }, async stop() { this.current = null; } };
+  const services = new Map([
+    ["credentials", { resolve: async () => ({ value: "token", source: "file" }), availableFor: () => true, describe: async () => ({ source: "file", writable: true }) }],
+    ["remoteTransport", facade],
+    ["remoteTransports", registry],
+    ["remoteStore", store],
+  ]);
+  const logs = [];
+  const disposers = [];
+  const deps = {
+    logger: { debug: (m) => logs.push(m), info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m) },
+    get: (name) => services.get(name) ?? null,
+    onDispose: (disposer) => disposers.push(disposer),
+  };
+  const hooks = new Map();
+  const ctx = {
+    get: (name) => services.get(name) ?? null,
+    provide: (name, service) => {
+      provided.set(name, service);
+      services.set(name, service);
+    },
+    on: (event, handler) => {
+      hooks.set(event, { handler });
+      return () => {};
+    },
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+  };
+  const config = {
+    transports: ["telegram", "max"],
+    telegram: { tokenRef: "TG", chatId: 42, allowedUserIds: [7] },
+    max: { chatId: 42, allowedUserIds: [7] },
+    logFile: path.join(dir, "log.jsonl"),
+  };
+
+  await maxFeature.apply(ctx, config, deps);
+  await telegramFeature.apply(ctx, config, deps);
+  await reliabilityFeature.apply(ctx, config, deps);
+  answererFeature.apply(ctx, config, deps);
+
+  assert.deepEqual([...registry.keys()].sort(), ["max", "telegram"]);
+  assert.equal(facade.current, null, "мультиканальный режим не трогает фасад");
+  assert.ok(provided.get("remoteReliability"), "reliability доступен");
+  assert.ok(hooks.get("user-questions/request"), "ответчик подписан");
+
+  const listener = hooks.get("user-questions/request").handler;
+  const pending = listener(
+    { questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }], agent: { id: "s1" } },
+    () => assert.fail("next() нельзя"),
+  );
+  await tick();
+
+  assert.equal(api.state.tgSent.length, 1, "вопрос в telegram");
+  assert.equal(api.state.maxSent.length, 1, "вопрос в max");
+  const shortId = api.state.maxSent[0].attachments[0].payload.buttons[0][0].payload.split(":")[1];
+
+  const tgWaiter = api.state.tg.pop();
+  tgWaiter.resolve(apiResponse({
+    ok: true,
+    result: [{
+      update_id: 1,
+      callback_query: { id: "cb1", from: { id: 7 }, data: `q:${shortId}:o1`, message: { message_id: 501, chat: { id: 42 } } },
+    }],
+  }));
+  const result = await pending;
+  await tick();
+  await tick();
+
+  assert.deepEqual(result.answers, [{ id: "q1", selected: ["Да"] }]);
+  // Правки транспорта идут через троттлинг (500 мс на канал) — дождёмся его.
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  const maxClose = api.state.maxPuts.filter((put) => Array.isArray(put.attachments) && put.attachments.length === 0);
+  assert.equal(maxClose.length, 1, "MAX закрыт пометкой после ответа в Telegram");
+
+  for (const dispose of [...disposers].reverse()) await dispose?.();
 });
