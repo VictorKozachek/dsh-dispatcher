@@ -43,11 +43,16 @@ export function statePaths({ env = process.env, home = os.homedir() } = {}) {
 }
 
 /** Состояние по умолчанию: пустая привязка, режим выключен, ничего не ждёт. */
+/** Сколько ждём ответа в мессенджере до показа вопроса в GUI (гибрид, 013). */
+export const DEFAULT_HYBRID_WAIT_MS = 20_000;
+
 export function defaultState() {
   return {
     version: STATE_VERSION,
     bindings: null,
     enabled: { global: false, workspaces: {}, sessions: {} },
+    /** Гибридный режим: мессенджер → GUI через `waitMs` (задача 013). */
+    hybrid: { enabled: false, waitMs: DEFAULT_HYBRID_WAIT_MS },
     recent: [],
     pending: [],
   };
@@ -241,6 +246,22 @@ export function createStore({
     });
   }
 
+  /**
+   * Гибридный режим (013): включить/выключить и при желании поменять ожидание.
+   * Поле отдельное от `enabled`: это не scope, а «показать вопрос ещё и в GUI».
+   */
+  function setHybrid(patch = {}) {
+    return update((state) => {
+      state.hybrid = {
+        enabled: patch.enabled === undefined ? state.hybrid?.enabled === true : patch.enabled === true,
+        waitMs: Number.isFinite(patch.waitMs) && patch.waitMs > 0
+          ? Math.floor(patch.waitMs)
+          : (Number.isFinite(state.hybrid?.waitMs) ? state.hybrid.waitMs : DEFAULT_HYBRID_WAIT_MS),
+      };
+      return state;
+    });
+  }
+
   /** Привязка бота: транспорт, чат, человек, имя бота. Токена здесь нет и не будет. */
   function setBinding(binding) {
     if (binding === null) {
@@ -368,6 +389,7 @@ export function createStore({
     write,
     update,
     setEnabled,
+    setHybrid,
     setBinding,
     addRecent,
     setPending,
@@ -408,6 +430,12 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
       global: enabled.global === true,
       workspaces: booleans(enabled.workspaces),
       sessions: booleans(enabled.sessions),
+    },
+    hybrid: {
+      enabled: value.hybrid?.enabled === true,
+      waitMs: Number.isFinite(value.hybrid?.waitMs) && value.hybrid.waitMs > 0
+        ? Math.floor(value.hybrid.waitMs)
+        : DEFAULT_HYBRID_WAIT_MS,
     },
     recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
     pending: Array.isArray(value.pending) ? value.pending : [],
