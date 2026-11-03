@@ -12,7 +12,7 @@
  * три кнопки, закрытый словарь исходов и честный `next()` при выключенном режиме.
  */
 
-import { createApprovals } from "../approvals.js";
+import { DEFAULT_HYBRID_WAIT_MS, createApprovals } from "../approvals.js";
 import { createAudit } from "../audit.js";
 import { createRegistry } from "../domain/registry.js";
 import { resolveChannel } from "../store.js";
@@ -25,6 +25,20 @@ export const STATE_SERVICE = "remoteStore";
 
 /** Имя сервиса подтверждений: статистика решений для `/remote status` (026). */
 export const APPROVALS_SERVICE = "remoteApprovals";
+
+/**
+ * Гибридный конфиг подтверждений (028) из строки плагина.
+ *
+ * По умолчанию выключен: пока человек не написал `approvals.hybrid: true`,
+ * поведение ровно как в 024 (ждём ответ сколько угодно).
+ */
+export function hybridConfigFrom(config) {
+  const settings = config?.approvals ?? {};
+  const waitMs = Number.isFinite(settings.hybridWaitMs) && settings.hybridWaitMs > 0
+    ? Math.floor(settings.hybridWaitMs)
+    : DEFAULT_HYBRID_WAIT_MS;
+  return { enabled: settings.hybrid === true, waitMs };
+}
 
 export const approvalsFeature = {
   name: "approvals",
@@ -70,11 +84,15 @@ export const approvalsFeature = {
       log: (message) => deps.logger.debug(message),
     });
 
+    // Гибрид (028): не ответили `hybridWaitMs` — подтверждение уходит в GUI.
+    const hybrid = hybridConfigFrom(config);
+
     const approvals = createApprovals({
       transport: deps.get(TRANSPORT_SERVICE),
       transports,
       registry,
       audit,
+      hybrid,
       // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
       channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
       log: (message) => deps.logger.debug(message),
