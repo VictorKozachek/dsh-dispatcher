@@ -359,3 +359,32 @@ test("allowlist проектных чатов обновляется без ре
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(answers.length, 1, "старый чат больше не принимается");
 });
+
+test("remove с полным путём удаляет basename-канал и возвращает fallback", async (t) => {
+  const { store, remote, invoke } = makeCommands(t);
+
+  await remote.handler(invoke("channel /home/vic/projects/alpha 100 --force"));
+  assert.deepEqual(Object.keys(store.read().channels), ["alpha"]);
+
+  const removed = await remote.handler(invoke("channel remove /home/vic/projects/alpha"));
+  assert.equal(removed.kind, "success", removed.text);
+  assert.deepEqual(store.read().channels, {}, "канал удалён, мусорного ключа нет");
+  assert.equal(resolveChannel(store.read(), "/p/alpha").source, "default", "проект вернулся в общий чат");
+});
+
+test("normalizeState нормализует ключи channels (старый/мусорный state)", (t) => {
+  const store = tempStore(t);
+  // Пишем в обход setChannel: как могло остаться от прежней версии/ручной правки.
+  store.update((state) => {
+    state.channels = {
+      "/home/vic/alpha": { chatId: 100 },
+      "beta/": { chatId: 200, threadId: 5 },
+      "/": { chatId: 300 },
+    };
+    return state;
+  });
+
+  const channels = store.read().channels;
+  assert.deepEqual(Object.keys(channels).sort(), ["alpha", "beta"], "ключи — basename, мусор выброшен");
+  assert.deepEqual(channels.beta, { chatId: 200, threadId: 5 });
+});

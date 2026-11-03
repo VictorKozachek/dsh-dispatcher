@@ -42,16 +42,24 @@ export function statePaths({ env = process.env, home = os.homedir() } = {}) {
   return { file, dir, lock: path.join(dir, LOCK_FILE_NAME) };
 }
 
-/** Каналы проектов: только `{chatId, threadId?}`, ключ — имя проекта. */
+/** `basename` проекта: ключ канала в `state.channels` (015). */
+function projectKey(name) {
+  const raw = typeof name === "string" ? name.trim() : "";
+  if (raw === "") return "";
+  return raw.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+}
+
+/** Каналы проектов: только `{chatId, threadId?}`, ключ — basename проекта. */
 function normalizeChannels(value) {
   const base = {};
   if (value === null || typeof value !== "object" || Array.isArray(value)) return base;
   for (const [name, channel] of Object.entries(value)) {
-    if (typeof name !== "string" || name === "") continue;
+    const key = projectKey(name);
+    if (key === "") continue;
     if (channel === null || typeof channel !== "object") continue;
     const chatId = channel.chatId;
     if (chatId === undefined || chatId === null || chatId === "") continue;
-    base[name] = {
+    base[key] = {
       chatId,
       ...(channel.threadId === undefined || channel.threadId === null || channel.threadId === "" ? {} : { threadId: channel.threadId }),
     };
@@ -279,8 +287,7 @@ export function createStore({
   function setChannel(name, channel) {
     // Имя проекта — basename: `/remote channel /full/path/alpha 100` должен
     // совпадать с resolveChannel, который ищет именно basename(cwd).
-    const raw = typeof name === "string" ? name.trim() : "";
-    const key = raw === "" ? "" : raw.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+    const key = projectKey(name);
     if (key === "") throw new TypeError("setChannel: нужно имя проекта");
     if (channel === null || typeof channel !== "object" || channel.chatId === undefined || channel.chatId === null || channel.chatId === "") {
       throw new TypeError("setChannel: нужен chatId");
@@ -299,9 +306,12 @@ export function createStore({
 
   /** Убрать канал проекта: вопросы снова идут в общий чат. */
   function removeChannel(name) {
+    // Та же нормализация, что у setChannel: полный путь тоже должен удалять
+    // канал проекта, а не создавать «висячий» ключ.
+    const key = projectKey(name);
     return update((state) => {
       const channels = { ...state.channels };
-      delete channels[name];
+      delete channels[key];
       state.channels = normalizeChannels(channels);
       return state;
     });
@@ -494,6 +504,8 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT) {
     },
     recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
     pending: Array.isArray(value.pending) ? value.pending : [],
+    // 015: ключи каналов — basename; старый/ручной state с путями чинится здесь.
+    channels: normalizeChannels(value.channels),
   };
 }
 
