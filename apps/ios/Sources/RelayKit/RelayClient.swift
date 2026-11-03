@@ -90,7 +90,10 @@ public final class RelayClient: RelayAPI, @unchecked Sendable {
             pages += 1
             let nextSince = page.nextSince
             let nextId = page.nextId
-            guard page.questions.count >= 100, let nextSince, nextSince != cursorSince, pages < 20 else { break }
+            // Продолжаем по составному курсору: при одинаковом `createdAt`
+            // (пачка ask_user_question) `nextSince` не меняется, двигает `nextId`.
+            let moved = nextSince != cursorSince || nextId != cursorId
+            guard page.questions.count >= 100, let nextSince, moved, pages < 20 else { break }
             cursorSince = nextSince
             cursorId = nextId
         } while true

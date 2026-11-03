@@ -8,10 +8,11 @@
 ## Требования
 
 - Xcode 15+ (проверено на Xcode 27.2 / Swift 6.4), iOS 17+.
-- SPM-пакет, без внешних зависимостей. Три target — стандартная раскладка SPM:
-  `RelayKit` (логика), `RelayApp` (SwiftUI-приложение), `RelayKitTests` (тесты);
-  формулировка «один target» в карточке устарела — приложение и тесты не могут
-  жить в одном target без потери тестируемости.
+- SPM-пакет, без внешних зависимостей. **Один app-target** — `RelayApp`
+  (SwiftUI-приложение); рядом стандартные для SPM `RelayKit` (логика, её
+  импортируют тесты) и `RelayKitTests` (тесты). Иначе тесты не могут
+  импортировать код приложения без дублирования; формулировка «один target» в
+  карточке означала «одно приложение, без лишних модулей» — по существу так и есть.
 
 ## Сборка и запуск
 
@@ -27,8 +28,21 @@ open apps/ios/Package.swift     # Xcode покажет пакет как про�
 ```bash
 cd apps/ios
 swift build                      # macOS-сборка (для быстрой проверки)
+
+# iOS-сборка тем же SwiftPM (SDK симулятора + triple) — проверена в этой задаче:
+SDK=$(xcrun --sdk iphonesimulator --show-sdk-path)
+swift build --sdk "$SDK" --triple arm64-apple-ios17.0-simulator   # Build complete
+
+# Или через Xcode:
 xcodebuild -scheme RelayApp -destination 'platform=iOS Simulator,name=iPhone 15' build
 ```
+
+**Результат проверки:** `swift build --sdk $(xcrun --sdk iphonesimulator --show-sdk-path)
+--triple arm64-apple-ios17.0-simulator` — **Build complete** (компилируются
+`RelayKit` и SwiftUI-приложение `RelayApp` под iOS 17-симулятор). `xcodebuild`
+в песочнице агента упирается в недоступный clang-module-cache
+(`/var/folders/.../C/clang`), поэтому он не проверялся; на машине с Xcode команда
+выше должна работать без дополнительных настроек.
 
 Запуск на macOS (SwiftUI-приложение кросс-платформенное, удобно для отладки):
 

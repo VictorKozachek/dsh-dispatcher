@@ -87,9 +87,9 @@ final class AppModel: ObservableObject {
         let viewModel = QuestionsViewModel(api: client, queue: queue, closedStore: closedStore)
         questions = viewModel
         eventTask?.cancel()
-        eventTask = Task { [weak self] in
+        eventTask = Task { @MainActor [weak self] in
             for await event in client.events() {
-                await self?.questions?.apply(event: event)
+                self?.questions?.apply(event: event)
                 if case .questionAnswered = event {
                     await self?.questions?.load()
                 }

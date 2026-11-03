@@ -427,3 +427,29 @@ final class ClosedQuestionsTests: XCTestCase {
         XCTAssertGreaterThan(api.fetchCount, 0, "question.created обновляет список")
     }
 }
+
+extension RelayClientTests {
+    func testPaginationWithEqualCreatedAtUsesSinceId() async throws {
+        let timestamp = "2026-11-03T18:00:00Z"
+        let page = (0..<100).map { index in
+            #"{"id":"q-\#(index)","shortId":"a1b2c3d4","createdAt":"\#(timestamp)","expiresAt":"2026-11-03T18:30:00Z"}"#
+        }.joined(separator: ",")
+        StubURLProtocol.handler = { request in
+            let query = request.url?.query ?? ""
+            if query.contains("sinceId=q-99") {
+                XCTAssertTrue(query.contains("since=\(timestamp)"), "since не сдвинулся — это нормально, двигает sinceId")
+                let body = #"{"questions":[{"id":"q-100","shortId":"deadbeef","createdAt":"\#(timestamp)","expiresAt":"2026-11-03T18:30:00Z"}],"nextSince":"\#(timestamp)"}"#
+                return (200, Data(body.utf8))
+            }
+            let body = #"{"questions":[\#(page)],"nextSince":"\#(timestamp)","nextId":"q-99"}"#
+            return (200, Data(body.utf8))
+        }
+
+        let questions = try await client().fetchQuestions()
+
+        XCTAssertEqual(questions.count, 101, "остаток не потерян при одинаковом createdAt")
+        XCTAssertEqual(questions.last?.id, "q-100")
+        XCTAssertEqual(StubURLProtocol.requests.count, 2)
+        XCTAssertTrue((StubURLProtocol.requests[1].url?.query ?? "").contains("sinceId=q-99"))
+    }
+}
