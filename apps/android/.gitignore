@@ -1,0 +1,15 @@
+# Gradle и IDE
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+
+# Артефакты сборки и подписи — никогда в git
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# Kotlin-компилятор держит здесь сессии
+.kotlin/
