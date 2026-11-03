@@ -38,6 +38,9 @@ const VALID = {
   "event.question-created.json": "Event",
   "health.response.json": "Health",
   "error.response.json": "Error",
+  "pairing.response.json": "PairingCodeResponse",
+  "question.query.json": "QuestionQuery",
+  "answer.query.json": "AnswerQuery",
 };
 
 test("схема релея: загружается, версия 1, все $ref разрешаются", () => {
@@ -57,7 +60,8 @@ test("схема релея: загружается, версия 1, все $ref
 test("каждый эндпоинт есть в PROTOCOL.md и в схеме (и наоборот)", () => {
   const protocol = readText("PROTOCOL.md");
   const schema = loadSchema();
-  const documented = new Set(protocol.match(/\/v1\/[a-z]+(?:\/\{[a-z]+\})?/g) ?? []);
+  // `/healthz` — алиас вне `/v1`, тоже часть контракта (см. PROTOCOL.md §3).
+  const documented = new Set(protocol.match(/\/v1\/[a-z]+(?:\/\{[a-z]+\})?|\/healthz/g) ?? []);
   const described = new Set(Object.keys(schema.paths));
 
   assert.deepEqual([...documented].sort(), [...described].sort(), "наборы эндпоинтов совпадают");
@@ -146,7 +150,7 @@ test("front matter карточек задач не ломает контрак�
 test("таблица эндпоинтов в PROTOCOL.md совпадает со схемой по методам", () => {
   const protocol = readText("PROTOCOL.md");
   const schema = loadSchema();
-  const rows = [...protocol.matchAll(/^\| `(GET|POST|PUT|DELETE|PATCH) (\/v1\/[^`]+)`/gm)]
+  const rows = [...protocol.matchAll(/^\| `(GET|POST|PUT|DELETE|PATCH) (\/v1\/[^`]+|\/healthz)`/gm)]
     .map((match) => ({ method: match[1].toLowerCase(), path: match[2].split("?")[0] }));
 
   const fromSchema = [];
@@ -241,8 +245,9 @@ test("каждая схема из paths покрыта хотя бы одним
   const covered = new Set(Object.values(VALID));
   for (const [endpoint, methods] of Object.entries(schema.paths)) {
     for (const [method, contract] of Object.entries(methods)) {
-      for (const ref of [contract.request, contract.response]) {
-        if (ref === null) continue;
+      // Покрываем и query-схемы long-poll/курсоров: у них тоже должен быть пример.
+      for (const ref of [contract.request, contract.response, contract.query]) {
+        if (ref === null || ref === undefined) continue;
         const name = ref.split("/").pop();
         assert.ok(covered.has(name), `${method.toUpperCase()} ${endpoint}: для ${name} нет примера`);
       }
@@ -289,4 +294,53 @@ test("title/detail задокументированы и есть в схеме 
   }
   assert.equal(question.required.includes("title"), false, "title необязателен");
   assert.equal(question.required.includes("detail"), false, "detail необязателен");
+});
+
+test("long-poll и курсоры описаны схемой и документом (023)", () => {
+  const schema = loadSchema();
+  const query = schema.components.schemas.QuestionQuery;
+  const answerQuery = schema.components.schemas.AnswerQuery;
+
+  for (const field of ["since", "sinceId", "limit", "wait"]) {
+    assert.ok(field in query.properties, `QuestionQuery.${field}`);
+  }
+  assert.ok("wait" in answerQuery.properties, "AnswerQuery.wait");
+  assert.equal(query.additionalProperties, false, "query строгая: лишние параметры — ошибка");
+
+  assert.equal(schema.paths["/v1/questions"].get.query, "#/components/schemas/QuestionQuery");
+  assert.equal(schema.paths["/v1/answers"].get.query, "#/components/schemas/AnswerQuery");
+  assert.equal(schema.paths["/healthz"].get.response, "#/components/schemas/Health");
+  assert.equal(schema.paths["/v1/pairing"].post.response, "#/components/schemas/PairingCodeResponse");
+  assert.ok("nextId" in schema.components.schemas.QuestionList.properties, "nextId аддитивен");
+
+  const protocol = readText("PROTOCOL.md");
+  for (const token of ["sinceId", "nextId", "wait", "/healthz", "/v1/pairing"]) {
+    assert.ok(protocol.includes(token), `PROTOCOL.md описывает ${token}`);
+  }
+  assert.match(protocol, /идемпотент/i, "повтор с теми же курсорами идемпотентен");
+  assert.match(protocol, /пустым списком|404 not-found/, "таймаут wait описан");
+
+  const pairing = validate(schema.components.schemas.PairingCodeResponse, readJson("pairing.response.json"), { root: schema });
+  assert.equal(pairing.ok, true, pairing.errors.join("; "));
+
+  // Примеры query-схем и аддитивных полей ответов (023).
+  for (const [file, schemaName] of [
+    ["question.query.json", "QuestionQuery"],
+    ["answer.query.json", "AnswerQuery"],
+  ]) {
+    const result = validate(schema.components.schemas[schemaName], readJson(file), { root: schema });
+    assert.equal(result.ok, true, `${file}: ${result.errors.join("; ")}`);
+  }
+  assert.equal(query.required, undefined, "QuestionQuery: все параметры необязательны");
+  assert.deepEqual(schema.components.schemas.AnswerQuery.required, ["questionId"], "без questionId — 400");
+
+  const missingQuestion = validate(schema.components.schemas.AnswerQuery, { wait: 5 }, { root: schema });
+  assert.equal(missingQuestion.ok, false, "AnswerQuery без questionId невалиден");
+
+  const listed = readJson("questions.list.response.json");
+  assert.ok("nextId" in listed, "в примере списка есть nextId");
+  const health = readJson("health.response.json");
+  for (const counter of ["devices", "questions", "answers"]) {
+    assert.equal(typeof health[counter], "number", `в примере health есть ${counter}`);
+  }
 });
