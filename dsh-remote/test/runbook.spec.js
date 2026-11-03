@@ -9,12 +9,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DEFAULT_KEEP_ROTATED, DEFAULT_MAX_BYTES as AUDIT_MAX_BYTES } from "../lib/audit.js";
 import { DOCTOR_FAIL_IDS } from "../lib/doctor.js";
-import { DEFAULT_LOG_KEEP, DEFAULT_LOG_MAX_BYTES } from "../lib/reliability.js";
+import { DEFAULT_LOG_KEEP, DEFAULT_LOG_MAX_BYTES, createJournalLog, createJsonState, createReliability } from "../lib/reliability.js";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const packageDir = path.dirname(testDir);
@@ -133,7 +134,8 @@ test("размеры и число ротированных журналов в 
   const auditSize = human(AUDIT_MAX_BYTES);
   const logSize = human(DEFAULT_LOG_MAX_BYTES);
   assert.equal(auditSize, "5 МиБ", "канон аудита 5 МиБ");
-  assert.equal(logSize, "512 КиБ", "канон лога 512 КиБ");
+  assert.equal(logSize, "5 МиБ", "канон лога 5 МиБ (требование 033)");
+  assert.equal(DEFAULT_LOG_MAX_BYTES, AUDIT_MAX_BYTES, "у аудита и журнала один предел из rotate.js");
   assert.equal(DEFAULT_KEEP_ROTATED, 5);
   assert.equal(DEFAULT_LOG_KEEP, 5);
 
@@ -169,4 +171,31 @@ test("RUNBOOK честно описывает битый state.json (запис�
   assert.match(section.body, /сначала/i, "совет: сначала сохранить копию");
   // «Файл из будущего» — по-прежнему блокируется и не перезаписывается.
   assert.match(section.body, /не перезаписывает/i);
+});
+
+test("createJournalLog и createReliability без аргументов ротируют журнал на 5 МиБ", (t) => {
+  const mib = 1024 * 1024;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-limit-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const pad = "x".repeat(64 * 1024);
+  const lines = 82; // ~5,2 МиБ — чуть больше предела 5 МиБ
+
+  // 1) Голый журнал: дефолт обязан ротировать на 5 МиБ (скрытая 512 КиБ ломала 033).
+  const journalFile = path.join(dir, "log.jsonl");
+  const journal = createJournalLog({ file: journalFile });
+  for (let index = 0; index < lines; index += 1) journal.append({ event: "noise", pad });
+  assert.ok(fs.existsSync(`${journalFile}.1`), "log.jsonl ротирован по 5 МиБ, а не по 512 КиБ");
+  assert.ok(fs.statSync(journalFile).size <= DEFAULT_LOG_MAX_BYTES + pad.length, "текущий журнал ≤ 5 МиБ");
+  assert.ok(fs.statSync(`${journalFile}.1`).size > 0, "ротированный файл не пуст");
+
+  // 2) Журнал внутри reliability: тот же дефолт (features не перекрывает 5 МиБ).
+  const reliabilityFile = path.join(dir, "reliability.jsonl");
+  const reliability = createReliability({
+    state: createJsonState({ file: path.join(dir, "state.json") }),
+    logFile: reliabilityFile,
+    logger: () => {},
+  });
+  for (let index = 0; index < lines; index += 1) reliability.journal.append({ event: "noise", pad });
+  assert.ok(fs.existsSync(`${reliabilityFile}.1`), "журнал reliability тоже ротирован на 5 МиБ");
+  assert.equal(DEFAULT_LOG_KEEP, 5, "храним 5 ротированных файлов");
 });
