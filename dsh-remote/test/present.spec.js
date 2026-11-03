@@ -13,6 +13,8 @@ import path from "node:path";
 
 import {
   FREE_TEXT_LABEL,
+  FREE_TEXT_OPTION,
+  MORE_OPTION,
   MORE_LABEL,
   MULTISELECT_HINT,
   TRUNCATION_MARKER,
@@ -234,6 +236,7 @@ test("renderRows: вариант — одна кнопка в ряд, «Друг
 
   assert.deepEqual(rows.map((row) => row.map((button) => button.label)), [["Да"], ["Нет"], [FREE_TEXT_LABEL]]);
   assert.deepEqual(rows[0][0], { label: "Да", kind: "option", optionId: "o1" });
+  assert.deepEqual(rows.at(-1)[0], { label: FREE_TEXT_LABEL, kind: "free", optionId: FREE_TEXT_OPTION });
   assert.equal(rows.at(-1)[0].kind, "free");
 });
 
@@ -255,7 +258,7 @@ test("renderRows: без свободного ответа и без вариа�
   assert.deepEqual(noFree.map((row) => row[0].kind), ["option"]);
 
   const empty = renderRows({ options: [], allowFreeText: true }, { maxOptions: 8 });
-  assert.deepEqual(empty, [[{ label: FREE_TEXT_LABEL, kind: "free" }]]);
+  assert.deepEqual(empty, [[{ label: FREE_TEXT_LABEL, kind: "free", optionId: FREE_TEXT_OPTION }]]);
 });
 
 test("renderRows: один вариант при maxOptions 2 — вариант и «Другой ответ…»", () => {
@@ -263,4 +266,66 @@ test("renderRows: один вариант при maxOptions 2 — вариант
 
   assert.deepEqual(rows.map((row) => row[0].kind), ["option", "free"]);
   assert.equal(rows.length, 2, "не больше caps.maxOptions");
+});
+
+test("renderRows: лимит рядов соблюдается при maxOptions 1 и 0", () => {
+  const manyOptions = Array.from({ length: 5 }, (_, index) => ({ id: `o${index}`, label: `Вариант ${index}` }));
+
+  const single = renderRows({ options: manyOptions, allowFreeText: true }, { maxOptions: 1 });
+  assert.equal(single.length, 1, "не больше одного ряда");
+  assert.equal(single[0][0].kind, "free", "свободный ответ важнее раскрытия");
+
+  const onlyOption = renderRows({ options: manyOptions, allowFreeText: false }, { maxOptions: 1 });
+  assert.equal(onlyOption.length, 1);
+  assert.equal(onlyOption[0][0].kind, "option");
+
+  assert.deepEqual(renderRows({ options: manyOptions, allowFreeText: true }, { maxOptions: 0 }), []);
+});
+
+test("renderBody: заголовок и подробности вопроса не теряются", () => {
+  const body = renderBody({
+    workspace: "/p/dsh-dispatcher",
+    title: "Деплой",
+    body: "Продолжать деплой?",
+    detail: "Сборка зелёная",
+    createdAt: new Date(2026, 10, 3, 17, 41).getTime(),
+  }, { maxText: 4096 });
+
+  assert.match(body, /^▸ dsh-dispatcher · 17:41/);
+  assert.match(body, /Деплой/);
+  assert.match(body, /Продолжать деплой\?/);
+  assert.match(body, /Сборка зелёная/);
+  assert.ok(body.indexOf("Деплой") < body.indexOf("Продолжать деплой"), "заголовок выше тела");
+  assert.ok(body.indexOf("Сборка зелёная") > body.indexOf("Продолжать деплой"), "подробности ниже тела");
+});
+
+test("findOwnedTask: из нескольких своих карточек выбирается активная, merged — нет", (t) => {
+  const dir = tempWorkspace(t, {
+    cards: {
+      "001.md": card("001", SESSION_ID).replace("status: in-progress", "status: merged"),
+      "006.md": card("006", SESSION_ID),
+      "007.md": card("007", SESSION_ID).replace("status: in-progress", "status: todo"),
+      "002.md": card("002", SESSION_ID),
+    },
+  });
+
+  assert.equal(findOwnedTask(dir, SESSION_ID), "006", "in-progress важнее todo, merged не считается");
+});
+
+test("findOwnedTask: реальная раскладка root/worktree — карточка живёт в worktrees/<id>", (t) => {
+  const root = tempWorkspace(t, {
+    cards: {
+      "001.md": card("001", SESSION_ID).replace("status: in-progress", "status: merged"),
+      "002.md": card("002", "session-other"),
+    },
+  });
+  const worktree = path.join(root, "worktrees", "006");
+  fs.mkdirSync(path.join(worktree, ".kanban", "tasks"), { recursive: true });
+  fs.writeFileSync(path.join(worktree, ".kanban", "tasks", "006.md"), card("006", SESSION_ID));
+
+  const context = resolveContext({ sessionId: SESSION_ID, ctx: fakeCtx({ get: () => session(root, "worker") }) });
+
+  assert.equal(context.cwd, root);
+  assert.equal(context.taskId, "006", "нашли карточку в рабочем дереве проекта");
+  assert.equal(MORE_OPTION, "more");
 });

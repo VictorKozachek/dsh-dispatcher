@@ -33,6 +33,7 @@ import {
   chrome,
   parseCallbackData,
 } from "./base.js";
+import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderRows } from "../present.js";
 
 /** Базовый адрес Bot API: тот же формат, что в доке (`/bot<token>/<method>`). */
 const API_BASE = "https://api.telegram.org";
@@ -113,110 +114,6 @@ function escapeHtml(text) {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
-}
-
-/**
- * Токены HTML-безопасной нарезки: сущность (`&amp;`) и code point неделимы.
- *
- * Резать уже собранную HTML-строку нельзя: граница может попасть внутрь
- * `&amp;`/`&lt;` или между `<b>` и текстом, и `parse_mode: "HTML"` получит
- * сломанную разметку. Поэтому экранируем по одному символу и режем по токенам.
- */
-function htmlTokens(text) {
-  const tokens = [];
-  for (const point of String(text ?? "")) {
-    if (point === "&") tokens.push({ text: "&amp;", space: false });
-    else if (point === "<") tokens.push({ text: "&lt;", space: false });
-    else if (point === ">") tokens.push({ text: "&gt;", space: false });
-    else tokens.push({ text: point, space: /\s/.test(point) });
-  }
-  return tokens;
-}
-
-/**
- * Нарезать **простой** текст под предел сообщения, экранируя HTML по дороге.
- *
- * Предел считается по длине готовой HTML-строки (Telegram считает символы после
- * парсинга entities, то есть строже), поэтому кусок гарантированно влезает.
- * Перенос предпочитаем по пробелу, но никогда не рвём сущность или суррогатную пару.
- */
-export function splitHtml(text, limit) {
-  const max = Math.max(1, Math.floor(limit));
-  const chunks = [];
-  let current = "";
-  let lastSpace = -1;
-
-  const push = (value) => {
-    const trimmed = value.replace(/\s+$/, "");
-    if (trimmed !== "") chunks.push(trimmed);
-  };
-
-  for (const token of htmlTokens(text)) {
-    if (current !== "" && current.length + token.text.length > max) {
-      if (lastSpace > 0) {
-        push(current.slice(0, lastSpace));
-        current = current.slice(lastSpace).replace(/^\s+/, "");
-      } else {
-        push(current);
-        current = "";
-      }
-      lastSpace = -1;
-      if (current !== "" && current.length + token.text.length > max) {
-        push(current);
-        current = "";
-      }
-    }
-    current += token.text;
-    if (token.space) lastSpace = current.length;
-  }
-  push(current);
-  return chunks;
-}
-
-/**
- * Текст вопроса в сообщениях: заголовок жирным, тело, подробности курсивом.
- *
- * Части режутся по отдельности (у каждой свой бюджет на теги), а потом соседние
- * части склеиваются переводом строки, если вместе влезают в предел.
- */
-function renderMessages(question, limit) {
-  const parts = [];
-  const title = typeof question?.title === "string" ? question.title.trim() : "";
-  const body = typeof question?.body === "string" ? question.body : "";
-  const detail = typeof question?.detail === "string" ? question.detail.trim() : "";
-  if (title !== "") parts.push({ text: title, wrap: (chunk) => `<b>${chunk}</b>`, overhead: 7 });
-  if (body !== "") parts.push({ text: body, wrap: (chunk) => chunk, overhead: 0 });
-  if (detail !== "") parts.push({ text: detail, wrap: (chunk) => `<i>${chunk}</i>`, overhead: 7 });
-  if (parts.length === 0) return ["(пустой вопрос)"];
-
-  const messages = [];
-  let buffer = "";
-  let lastGroup = -1;
-
-  parts.forEach((part, group) => {
-    for (const chunk of splitHtml(part.text, Math.max(1, limit - part.overhead))) {
-      const html = part.wrap(chunk);
-      if (buffer === "") {
-        buffer = html;
-        lastGroup = group;
-        continue;
-      }
-      const joined = `${buffer}\n${html}`;
-      if (group !== lastGroup && joined.length <= limit) {
-        buffer = joined;
-        lastGroup = group;
-        continue;
-      }
-      messages.push(buffer);
-      buffer = html;
-      lastGroup = group;
-    }
-  });
-
-  if (buffer !== "") messages.push(buffer);
-  // Текст из одних пробелов не даёт ни одного куска: без сообщения ответчик
-  // ждал бы ответа вечно, поэтому отправляем заглушку.
-  return messages.length > 0 ? messages : ["(пустой вопрос)"];
 }
 
 /**
@@ -564,32 +461,39 @@ export function createTelegramTransport(options = {}) {
         throw new TypeError("telegram: у вопроса нет shortId — кнопки не соберутся");
       }
       const target = sendOptions?.chatId ?? chatId;
-      const chunks = renderMessages(question, caps.maxText);
-      const options = Array.isArray(question.options) ? question.options : [];
-      const keyboard = caps.inlineButtons && options.length > 0
-        ? {
-          inline_keyboard: chrome(options, 1).map((row) => row.map((option) => ({
-            text: option.label,
-            callback_data: callbackData(shortId, option.id),
-          }))),
-        }
-        : undefined;
+
+      // Текст собирает слой представления (006): шапка «откуда», тело, подсказка
+      // multiSelect, усечение под caps.maxText. Отправляем parse_mode HTML,
+      // поэтому экранируем ВЕСЬ простой текст целиком — сущности не рвутся.
+      const text = escapeHtml(renderBody(question, caps));
+
+      // Кнопки — тоже из представления: варианты по одной в ряд, «Показать ещё»
+      // при переполнении, «Другой ответ…» последним.
+      const buttons = caps.inlineButtons
+        ? renderRows(question, caps)
+          .map((row) => row
+            .map((button) => {
+              const optionId = button.optionId
+                ?? (button.kind === "free" ? FREE_TEXT_OPTION : button.kind === "more" ? MORE_OPTION : null);
+              return optionId === null ? null : { text: button.label, callback_data: callbackData(shortId, optionId) };
+            })
+            .filter((button) => button !== null))
+          .filter((row) => row.length > 0)
+        : [];
+      const keyboard = buttons.length > 0 ? { inline_keyboard: buttons } : undefined;
 
       // Запись заводим ДО отправки: ответчик может снять вопрос (аборт), пока
       // sendMessage ещё висит. Тогда закрытие откладывается до конца отправки.
       const record = { chatId: target, messageIds: [], closed: false, closeSummary: "" };
       sent.set(shortId, record);
       try {
-        for (const [index, chunk] of chunks.entries()) {
-          const last = index === chunks.length - 1;
-          const result = await call("sendMessage", {
-            chat_id: target,
-            parse_mode: "HTML",
-            text: chunk,
-            ...(last && keyboard !== undefined ? { reply_markup: keyboard } : {}),
-          });
-          if (result?.message_id !== undefined) record.messageIds.push(result.message_id);
-        }
+        const result = await call("sendMessage", {
+          chat_id: target,
+          parse_mode: "HTML",
+          text,
+          ...(keyboard === undefined ? {} : { reply_markup: keyboard }),
+        });
+        if (result?.message_id !== undefined) record.messageIds.push(result.message_id);
       } catch (error) {
         if (record.messageIds.length === 0) sent.delete(shortId);
         else if (record.closed) await closeRecord(shortId, record);

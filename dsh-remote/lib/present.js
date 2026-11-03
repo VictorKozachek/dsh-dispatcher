@@ -31,6 +31,12 @@ export const FREE_TEXT_LABEL = "Другой ответ…";
 /** Кнопка «вариантов больше, чем влезает» — раскрывает остальные. */
 export const MORE_LABEL = "Показать ещё";
 
+/** `optionId` кнопки свободного ответа в `callback_data`. */
+export const FREE_TEXT_OPTION = "free";
+
+/** `optionId` кнопки «Показать ещё» в `callback_data`. */
+export const MORE_OPTION = "more";
+
 /** Подсказка для multiSelect: одна кнопка-тумблер на вариант. */
 export const MULTISELECT_HINT = "Можно выбрать несколько вариантов.";
 
@@ -100,31 +106,77 @@ export function frontMatterField(text, field) {
  * Только чтение: каталога нет, файл не читается, битый front matter — тихо
  * возвращаем null. Ошибки представления не должны ломать вопрос.
  */
+/** Источники карточек: cwd сессии и рабочие деревья проекта (root/worktree). */
+function taskDirs(cwd) {
+  const dirs = [path.join(cwd, ".kanban", "tasks")];
+  for (const worktrees of ["worktrees", ".worktrees"]) {
+    const root = path.join(cwd, worktrees);
+    let entries;
+    try {
+      entries = fs.readdirSync(root);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      const dir = path.join(root, name, ".kanban", "tasks");
+      try {
+        if (fs.statSync(dir).isDirectory()) dirs.push(dir);
+      } catch {
+        /* нет доски в этом дереве */
+      }
+    }
+  }
+  return dirs;
+}
+
+/** Насколько карточка «активна»: чем больше, тем ближе к текущей задаче. */
+const STATUS_RANK = { "in-progress": 60, testing: 50, "in-review": 40, ready: 30, todo: 20, backlog: 10, blocked: 5 };
+
+/**
+ * Найти карточку, которую сейчас ведёт эта сессия.
+ *
+ * Смотрим не только `.kanban/tasks` в cwd, но и доски рабочих деревьев проекта:
+ * сессия роли живёт в корне, а карточка задачи — в `worktrees/<id>`. Из нескольких
+ * своих карточек выбираем **активную**: `in-progress` важнее `todo`, при равенстве
+ * берём более поздний id (только что выданную). `merged` не считаем вовсе — иначе
+ * хвост из слитых карточек с тем же owner («001» вместо «006») закрывал бы текущую.
+ */
 export function findOwnedTask(cwd, sessionId, { log = noop } = {}) {
   if (typeof cwd !== "string" || cwd === "" || typeof sessionId !== "string" || sessionId === "") {
     return null;
   }
-  const tasksDir = path.join(cwd, ".kanban", "tasks");
-  let entries;
-  try {
-    entries = fs.readdirSync(tasksDir);
-  } catch {
-    return null; // нет каталога доски — просто нет задачи
-  }
-  const files = entries.filter((name) => name.endsWith(".md") && name !== "README.md").sort();
-  for (const name of files) {
-    let text;
+
+  const best = { rank: -1, id: null };
+
+  for (const tasksDir of taskDirs(cwd)) {
+    let entries;
     try {
-      text = fs.readFileSync(path.join(tasksDir, name), "utf8");
-    } catch (error) {
-      log(`карточка ${name} не прочиталась: ${error?.message ?? error}`);
-      continue;
+      entries = fs.readdirSync(tasksDir);
+    } catch {
+      continue; // нет каталога доски — просто нет задачи
     }
-    if (frontMatterField(text, "owner") !== sessionId) continue;
-    const id = frontMatterField(text, "id");
-    return id !== null && id !== "" ? id : name.replace(/\.md$/, "");
+    for (const name of entries.filter((entry) => entry.endsWith(".md") && entry !== "README.md")) {
+      let text;
+      try {
+        text = fs.readFileSync(path.join(tasksDir, name), "utf8");
+      } catch (error) {
+        log(`карточка ${name} не прочиталась: ${error?.message ?? error}`);
+        continue;
+      }
+      if (frontMatterField(text, "owner") !== sessionId) continue;
+      const status = frontMatterField(text, "status") ?? "";
+      if (status === "merged") continue;
+      const id = frontMatterField(text, "id") ?? name.replace(/\.md$/, "");
+      const rank = STATUS_RANK[status] ?? 0;
+      // При равенстве выигрывает более поздний id (свежая задача).
+      if (rank > best.rank || (rank === best.rank && id > (best.id ?? ""))) {
+        best.rank = rank;
+        best.id = id;
+      }
+    }
   }
-  return null;
+
+  return best.id;
 }
 
 /**
@@ -208,7 +260,15 @@ export function renderBody(question = {}, caps = {}) {
     expiresAt: question.expiresAt ?? null,
   });
 
-  const parts = [header, "", String(question.body ?? "")];
+  const parts = [header, ""];
+  const title = typeof question.title === "string" ? question.title.trim() : "";
+  if (title !== "") parts.push(title, "");
+  const detail = typeof question.detail === "string" ? question.detail.trim() : "";
+  const rawBody = String(question.body ?? "");
+  // Пустое тело без заголовка/подробностей — не молчание: честная заглушка,
+  // иначе сообщение выглядело бы пустым.
+  parts.push(rawBody.trim() !== "" || title !== "" || detail !== "" ? rawBody : "(пустой вопрос)");
+  if (detail !== "") parts.push("", detail);
   if (question.multiSelect === true) parts.push("", MULTISELECT_HINT);
   return truncate(parts.join("\n"), maxText, TRUNCATION_MARKER);
 }
@@ -225,23 +285,43 @@ export function renderBody(question = {}, caps = {}) {
  * свободного текста.
  */
 export function renderRows(question = {}, caps = {}) {
-  const maxOptions = Number.isFinite(caps.maxOptions) ? caps.maxOptions : DEFAULT_CAPS.maxOptions;
+  const maxOptions = Math.max(
+    0,
+    Math.floor(Number.isFinite(caps.maxOptions) ? caps.maxOptions : DEFAULT_CAPS.maxOptions),
+  );
+  if (maxOptions === 0) return [];
+
   const options = Array.isArray(question.options) ? question.options : [];
+  const allowFree = question.allowFreeText !== false;
+  const labelLimit = Number.isFinite(caps.maxText) ? Math.min(64, caps.maxText) : 64;
   const rows = [];
 
-  // Два ряда резервируем под «Показать ещё» и «Другой ответ…».
-  const roomForOptions = Math.max(0, maxOptions - 2);
-  const overflows = options.length > Math.max(1, maxOptions - 1);
-  const shown = overflows ? options.slice(0, roomForOptions) : options;
-
-  for (const option of shown) {
-    rows.push([{
-      label: truncate(option?.label ?? "", Number.isFinite(caps.maxText) ? Math.min(64, caps.maxText) : 64),
-      kind: "option",
-      optionId: option?.id ?? null,
-    }]);
+  // Один ряд резервируем под «Другой ответ…»; «Показать ещё» — только если
+  // варианты не влезают, и тоже ценой одного ряда.
+  let room = Math.max(0, maxOptions - (allowFree ? 1 : 0));
+  let more = options.length > room;
+  if (more) {
+    const afterMore = Math.max(0, room - 1);
+    // Если после ряда «Показать ещё» не остаётся ни одного варианта — раскрывать
+    // нечего: показываем первый вариант вместо бессмысленной кнопки.
+    if (afterMore === 0 && room > 0) more = false;
+    else room = afterMore;
   }
-  if (shown.length < options.length) rows.push([{ label: MORE_LABEL, kind: "more" }]);
-  if (question.allowFreeText !== false) rows.push([{ label: FREE_TEXT_LABEL, kind: "free" }]);
+
+  for (const option of options.slice(0, room)) {
+    rows.push([{ label: truncate(option?.label ?? "", labelLimit), kind: "option", optionId: option?.id ?? null }]);
+  }
+  if (more && options.length > room) {
+    rows.push([{ label: MORE_LABEL, kind: "more", optionId: MORE_OPTION }]);
+  }
+  if (allowFree) rows.push([{ label: FREE_TEXT_LABEL, kind: "free", optionId: FREE_TEXT_OPTION }]);
+
+  // Жёсткая гарантия лимита: если рядов всё же больше, первым уходит «Показать
+  // ещё» (раскрытие — не ответ), потом лишние варианты; свободный ответ остаётся.
+  if (rows.length > maxOptions) {
+    const moreIndex = rows.findIndex((row) => row[0]?.kind === "more");
+    if (moreIndex >= 0) rows.splice(moreIndex, 1);
+    while (rows.length > maxOptions) rows.pop();
+  }
   return rows;
 }
