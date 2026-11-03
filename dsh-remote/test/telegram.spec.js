@@ -597,10 +597,11 @@ test("плагин: async apply -> remoteTransport -> answerer подписан 
     telegram: { tokenRef: "tg", chatId: 42, allowedUserIds: [7], pollTimeoutSec: 25 },
   });
 
-  // Команды (005) дополнительно регистрируют сервис состояния.
+  // Команды (005) дополнительно регистрируют сервис состояния, панель (009) — свой.
   const transportEntries = provided.filter((entry) => entry.name === "remoteTransport");
   assert.equal(transportEntries.length, 1, "транспорт зарегистрирован ровно один раз");
   assert.ok(provided.some((entry) => entry.name === "remoteStore"), "состояние зарегистрировано как сервис");
+  assert.ok(provided.some((entry) => entry.name === "remotePanel"), "панель зарегистрирована рядом");
   const facade = transportEntries[0].service;
   assert.equal(facade.current?.polling, true, "поллинг запущен после async-привязки");
   const transport = facade.current;
