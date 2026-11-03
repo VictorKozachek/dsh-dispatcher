@@ -4,6 +4,10 @@
 Цель — понять, какими API плагин может (а) перехватить вопрос агента к человеку,
 (б) отправить его во внешний мессенджер, (в) принять ответ и вернуть его в сессию.
 
+Отчёт писан под плагин `dsh-remote` этого проекта (`docs/CONCEPT.md`,
+`.kanban/specs/001.md`): §1–§8 — факты о DSH с ссылками на код, §9 — что из них
+следует для дизайна и как требования спеки ложатся на реальные API.
+
 **Что читалось (revision-фиксация):**
 
 - `/Users/victor/projects/deepseek-harness` — монорепо DSH, HEAD `0a53fb55` (2026-08-30,
@@ -624,10 +628,12 @@ export interface Object<T = any> { apply(ctx: Context, config: T): any }
 ```
 
 Конфиг приходит **вторым аргументом** `apply(ctx, config)` / конструктора
-`new (ctx, config)`; `this.config` доступен в подклассе `Service`
-(пример: `packages/credentials/credentials-local/src/index.ts:517-520, 90`).
-Отдельного `ctx.config` в Cordis нет — значение живёт в fiber'е
-(`vendor/cordis/src/fiber.ts:253`: `new runtime.callback(this.ctx, this.config)`).
+`new (ctx, config)`; в подклассе `Service` его обычно принимают как
+`constructor(ctx, public config: Config)` и объявляют схему рядом
+(`packages/credentials/credentials-local/src/index.ts:517` — `static Config: z<Config> = z.object({...})`,
+`:550` — конструктор). Отдельного `ctx.config` в Cordis нет — значение живёт в
+fiber'е (`vendor/cordis/src/fiber.ts:253`:
+`new runtime.callback(this.ctx, this.config)`).
 `!!js`-выражения в конфиге ряда разворачивает Loader:
 `vendor/loader/src/index.ts:96-100` (`interpolate(this.ctx, config)`) **[код]**.
 
