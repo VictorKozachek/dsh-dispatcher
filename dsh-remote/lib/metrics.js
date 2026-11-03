@@ -60,6 +60,7 @@ export function createMetrics({ now = () => Date.now(), log = noopLog } = {}) {
     if (path === undefined) throw new RangeError(`metrics: неизвестный счётчик ${name}`);
     const step = Number(delta);
     if (!Number.isFinite(step)) throw new TypeError(`metrics: ${name}: delta должен быть числом`);
+    if (step < 0) throw new RangeError(`metrics: ${name}: delta не может быть отрицательным`);
     const [section, key] = path;
     data[section][key] += step;
     return data[section][key];

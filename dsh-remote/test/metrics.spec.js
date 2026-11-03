@@ -31,6 +31,8 @@ test("счётчики: инкременты, неизвестное имя — 
   assert.equal(metrics.inc("deliveries.sent", 5), 5);
   assert.throws(() => metrics.inc("questions.unknown"), /неизвестный счётчик/);
   assert.throws(() => metrics.inc("questions.asked", "много"), /delta/);
+  assert.throws(() => metrics.inc("questions.asked", -1), /отрицательным/);
+  assert.equal(metrics.snapshot().questions.asked, 3, "отрицательный delta не изменил счётчик");
 });
 
 test("гистограмма латентности: фиксированные бакеты, память не растёт", () => {
@@ -228,4 +230,86 @@ test("интеграция: вопрос и ответ двигают счётч
   assert.equal(snapshot.questions.cancelled, 0);
   assert.equal(snapshot.latency.count, 1);
   assert.equal(snapshot.latency.sumMs, 1_000, "латентность = now - createdAt");
+});
+
+// --- ревью 031: реальная форма сервиса approvals и отсутствие side effect ----
+
+test("фича approvals публикует pendingOpen, а stats видит реальную очередь", async (t) => {
+  const { approvalsFeature } = await import("../lib/features/approvals.js");
+  const metrics = createMetrics();
+  const sent = [];
+  const handlers = new Set();
+  const transport = {
+    id: "telegram",
+    async sendQuestion(question) {
+      sent.push(question);
+      return { messageId: "m-1" };
+    },
+    async closeQuestion() {},
+    onAnswer(handler) {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+  };
+  const store = tempStore(t);
+  store.setEnabled({ kind: "global" }, true);
+  const provided = new Map();
+  let approvalHandler = null;
+  const ctx = {
+    provide: (name, service) => provided.set(name, service),
+    on: (name, fn) => {
+      if (name === "approval/request") approvalHandler = fn;
+      return () => {};
+    },
+    get: (name) => (name === "remoteMetrics" ? metrics : provided.get(name) ?? null),
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+    onDispose: () => {},
+  };
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => {
+      if (name === "remoteTransport") return transport;
+      if (name === "remoteStore") return store;
+      if (name === "remoteMetrics") return metrics;
+      return null;
+    },
+    onDispose: () => {},
+  };
+  approvalsFeature.apply(ctx, { approvals: { tools: ["read_file"], denyRemote: [] } }, deps);
+
+  const service = provided.get("remoteApprovals");
+  assert.equal(typeof service?.pendingOpen, "number", "сервис отдаёт pendingOpen");
+
+  const pending = approvalHandler(
+    { agent: { id: "s1" }, toolName: "read_file", callId: "c-1" },
+    async () => "gui",
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sent.length, 1, "подтверждение ушло в канал");
+  assert.equal(service.pendingOpen, 1, "одно открытое подтверждение");
+
+  const before = metrics.snapshot().queues.approvals_open;
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => 1_700_000_000_000 });
+  const invoke = (rawInput) => ({
+    commandId: "c1",
+    agent: { id: "s1", session: { id: "s1" } },
+    rawInput,
+    signal: new AbortController().signal,
+  });
+
+  const json = await remote.handler(invoke("stats --json"));
+  assert.equal(json.kind, "success", json.text);
+  const snapshot = JSON.parse(json.text);
+  assert.equal(snapshot.queues.approvals_open, 1, "JSON видит фактическую очередь approvals");
+  assert.equal(metrics.snapshot().queues.approvals_open, before, "stats не мутирует метрики");
+
+  const human = await remote.handler(invoke("stats"));
+  assert.match(human.text, /очереди: доставок \d+, таймеров \d+, подтверждений 1/);
+
+  for (const answer of [...handlers]) answer({ shortId: sent[0].shortId, optionIds: ["o1"] });
+  await pending;
+  assert.equal(service.pendingOpen, 0, "после ответа очередь пуста");
 });

@@ -26,7 +26,13 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { createRegistry } from "./domain/registry.js";
-import { credentialRef, createCredentialAccess } from "./store.js";
+import { STATE_VERSION, credentialRef, createCredentialAccess } from "./store.js";
+import {
+  buildReport,
+  formatHealthReport,
+  runHealthChecks,
+  serializeReport,
+} from "./doctor.js";
 import { RELAY_TOKEN_REF } from "./transport/relay.js";
 import { createAudit } from "./audit.js";
 import { formatStats } from "./metrics.js";
@@ -1015,7 +1021,6 @@ export function createRemoteCommands({
       + `${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
   }
 
-  /** `/remote doctor` — диагностика: токен, getMe, поллеры, канал, состояние. */
   /**
    * `/remote stats [--json]` — метрики за время работы плагина (031).
    *
@@ -1027,24 +1032,34 @@ export function createRemoteCommands({
     if (metrics === null || typeof metrics?.snapshot !== "function") {
       return failure("метрики недоступны: плагин без фичи metrics (031)");
     }
-    // Живые размеры очередей: устойчивость знает pending/timers, approvals — open.
+    // Живые размеры очередей: не мутируем метрики чтением, а кладём в снимок.
+    const live = {};
     try {
       const reliability = ctx?.get?.("remoteReliability") ?? null;
       const health = typeof reliability?.healthCheck === "function" ? await reliability.healthCheck() : null;
-      if (Number.isFinite(health?.pending)) metrics.gauge("deliveries_pending", health.pending);
-      if (Number.isFinite(health?.watching)) metrics.gauge("timers_active", health.watching);
+      if (Number.isFinite(health?.pending)) live.deliveries_pending = health.pending;
+      if (Number.isFinite(health?.watching)) live.timers_active = health.watching;
       const approvals = ctx?.get?.("remoteApprovals") ?? null;
-      if (Number.isFinite(approvals?.pendingOpen)) metrics.gauge("approvals_open", approvals.pendingOpen);
+      if (Number.isFinite(approvals?.pendingOpen)) live.approvals_open = approvals.pendingOpen;
     } catch (error) {
       log(`stats: размеры очередей не прочитаны (${humanError(error)})`);
     }
-    const snapshot = metrics.snapshot();
+    const base = metrics.snapshot();
+    const snapshot = { ...base, queues: { ...base.queues, ...live } };
     if (flags?.has?.("json") === true) return success(JSON.stringify(snapshot));
     return success(formatStats(snapshot));
   }
 
-  async function doctor() {
-    const checks = await runDoctorChecks({
+  /**
+   * `/remote doctor [--json]` — диагностика 2.0 (задача 030).
+   *
+   * Legacy-проверки 010 остаются (токен, getMe, поллеры, канал, состояние), к ним
+   * добавляются credentials/relay/schema/timers; человеческий вывод узнаваем,
+   * `--json` — стабильная машиночитаемая структура с кодом возврата.
+   */
+  async function doctor(invocation, flags) {
+    const legacyChecks = await runDoctorChecks({
+
       store,
       credentials,
       transport: liveTransport(),
@@ -1052,7 +1067,34 @@ export function createRemoteCommands({
       version: readPluginVersion(),
       now,
     });
-    return success(formatDoctorReport(checks));
+
+    const relayService = ctx?.get?.("remoteRelay") ?? null;
+    const live = liveTransport();
+    const relay = relayService !== null
+      ? { url: relayService.url, transport: relayService.transport }
+      : live !== null && live.id === "relay"
+        ? { url: store.read().bindings?.url, transport: live }
+        : store.read().bindings?.transport === "relay"
+          ? { url: store.read().bindings?.url, transport: null }
+          : null;
+
+    // Ссылку relay-токена проверяем только когда релей действительно настроен:
+    // на Telegram-only установке её отсутствие — норма, а не fail.
+    const tokenRefs = relay === null ? [TELEGRAM_TOKEN_REF] : [TELEGRAM_TOKEN_REF, RELAY_TOKEN_REF];
+    const checks = await runHealthChecks({
+      legacyChecks,
+      credentials,
+      tokenRefs,
+      relay,
+      store,
+      reliability: ctx?.get?.("remoteReliability") ?? null,
+      supportedSchemaVersion: STATE_VERSION,
+    });
+    const report = buildReport(checks);
+    if (flags?.has?.("json") === true) {
+      return { ...success(serializeReport(report)), exitCode: report.exitCode };
+    }
+    return { ...success(formatHealthReport(report)), exitCode: report.exitCode };
   }
 
   async function disconnect(invocation) {
