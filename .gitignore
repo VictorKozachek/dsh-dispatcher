@@ -26,3 +26,6 @@ __pycache__/
 
 # Локальный gradle-кэш проверок (sandbox: ~/.gradle недоступен)
 .gradle-home/
+
+# Готовый CI-воркфлоу: ждёт scope workflow у gh (см. README)
+.ci-staged/
