@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plugin:
+    name: Плагин dsh-remote (node --test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Тесты плагина
+        run: node --test dsh-remote/test/*.spec.js
+      - name: Синтаксис скриптов
+        run: |
+          for file in bin/*.sh deploy/*.sh; do
+            bash -n "$file"
+          done
+          echo "все скрипты разбираются"
+
+  relay:
+    name: Релей (cargo test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: relay
+      - name: Тесты релея
+        run: cargo test --all-targets
+
+  kotlin-vectors:
+    name: Крипто-векторы (Kotlin, JVM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v3
+      - name: Тесты векторов
+        working-directory: docs/relay/impl/kotlin
+        run: ./gradlew test
+
+  swift:
+    name: Swift-пакеты (swift test)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: iOS-клиент
+        run: swift test --package-path apps/ios
+      - name: Крипто-векторы (Swift)
+        run: swift test --package-path docs/relay/impl/swift
+
+  android:
+    name: Android (gradlew test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-36 build-tools;36.0.0"
+      - uses: gradle/actions/setup-gradle@v3
+      - name: Юнит-тесты приложения
+        working-directory: apps/android
+        run: ./gradlew test --no-daemon
