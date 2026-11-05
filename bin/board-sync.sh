@@ -62,6 +62,8 @@ flush() {
 
   local id=""
   case "$branch" in
+    refs/heads/feature/*) id="${branch##refs/heads/feature/}" ;;
+    refs/heads/bug/*) id="${branch##refs/heads/bug/}" ;;
     refs/heads/task/*) id="${branch##refs/heads/task/}" ;;
     *) id="$(basename "$worktree" | sed -n 's/.*-t\([0-9][0-9]*\)$/\1/p')" ;;
   esac

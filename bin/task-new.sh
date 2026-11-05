@@ -10,12 +10,16 @@
 # а скрытые каталоги там не видны без системного сочетания клавиш. Переопределить
 # имя можно переменной KANBAN_WORKTREES_DIR.
 #
-# Карточка коммитится в ветку `task/<id>` — иначе исполнитель в своём worktree её не
+# Карточка коммитится в ветку задачи (`feature/<id>` или `bug/<id>`) — иначе
+# исполнитель в своём worktree её не
 # увидит (запись за пределы рабочей директории запрещена песочницей сессии).
 # В основной чекаут карточка попадает слиянием ветки.
 #
 # Использование:
-#   bin/task-new.sh "Название задачи" [--owner ID] [--no-worktree] [--backlog] [--spec NNN]
+#   bin/task-new.sh "Название задачи" [--type feature|bug] [--owner ID] \
+#       [--no-worktree] [--backlog] [--spec NNN]
+#
+# --type feature|bug — тип задачи: ветка feature/<id> (по умолчанию) или bug/<id>.
 #
 # --backlog — завести карточку сразу со `status: backlog` и пустым `owner`: это
 # лог нарезанных заранее задач. Из backlog задачу выдают в todo асайном:
@@ -31,8 +35,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 usage() {
   cat <<'EOF'
 Использование:
-  bin/task-new.sh "Название задачи" [--owner ID] [--no-worktree] [--backlog] [--spec NNN]
+  bin/task-new.sh "Название задачи" [--type feature|bug] [--owner ID] \
+      [--no-worktree] [--backlog] [--spec NNN]
 
+  --type T       feature (по умолчанию) → ветка feature/<id>; bug → bug/<id>
   --owner ID     сразу закрепить карточку за сессией (выдача в todo)
   --no-worktree  только карточка в текущей директории, без рабочего дерева
   --backlog      карточка сразу в backlog: status: backlog, owner пустой
@@ -40,20 +46,26 @@ usage() {
   --spec NNN     ссылка на спецификацию .kanban/specs/NNN.md (поле spec);
                  годится и файл со слагом, NNN-название.md
 
-Задача с рабочим деревом: worktree worktrees/<id>, ветка task/<id>, карточка
-внутри ветки. Подробности — в комментарии в начале файла и в KANBAN.md.
+Задача с рабочим деревом: worktree worktrees/<id>, ветка <type>/<id>
+(`feature/007` для задачи, `bug/007` для бага), карточка внутри ветки.
+База ветки — `develop` (или $KANBAN_BASE_BRANCH), а не текущая ветка: работа
+идёт в develop, main — релизная. Подробности — в комментарии в начале файла,
+AGENTS.md («Ветвление и релизы») и KANBAN.md.
 EOF
 }
 
 TITLE=""
 OWNER=""
 SPEC=""
+TYPE="feature"
 WITH_WORKTREE=1
 BACKLOG=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-worktree) WITH_WORKTREE=0; shift ;;
+    --type) TYPE="${2:?--type требует значения: feature или bug}"; shift 2 ;;
+    --type=*) TYPE="${1#*=}"; shift ;;
     --backlog) BACKLOG=1; shift ;;
     --owner) OWNER="${2:?--owner требует значения}"; shift 2 ;;
     --owner=*) OWNER="${1#*=}"; shift ;;
@@ -67,6 +79,14 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "$TYPE" in
+  feature|bug) ;;
+  *)
+    echo "--type: ожидается feature или bug (получено: $TYPE)" >&2
+    exit 2
+    ;;
+esac
 
 if [[ -z "$TITLE" ]]; then
   echo "нужно название задачи" >&2
@@ -118,15 +138,17 @@ for file in "$ROOT"/.kanban/tasks/[0-9]*.md; do
   if (( 10#$number >= next )); then next=$(( 10#$number + 1 )); fi
 done
 if is_git; then
+  # Номера занимают ветки всех типов: feature/, bug/ и унаследованные task/.
   while IFS= read -r branch; do
-    number="${branch##*task/}"
+    number="${branch##*/}"
     [[ "$number" =~ ^[0-9]+$ ]] || continue
     if (( 10#$number >= next )); then next=$(( 10#$number + 1 )); fi
-  done < <(git -C "$ROOT" for-each-ref --format='%(refname:short)' 'refs/heads/task/*' 2>/dev/null || true)
+  done < <(git -C "$ROOT" for-each-ref --format='%(refname:short)' \
+             'refs/heads/feature/*' 'refs/heads/bug/*' 'refs/heads/task/*' 2>/dev/null || true)
 fi
 
 id="$(printf '%03d' "$next")"
-branch="task/$id"
+branch="$TYPE/$id"
 worktrees_dir_name="${KANBAN_WORKTREES_DIR:-worktrees}"
 worktree="$ROOT/$worktrees_dir_name/$id"
 stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -169,7 +191,16 @@ if (( WITH_WORKTREE == 1 )); then
   elif [[ -e "$worktree" ]]; then
     echo "предупреждение: $worktree уже существует, worktree не создаю" >&2
   else
-    base="$(git -C "$ROOT" symbolic-ref --short -q HEAD || echo main)"
+    # База — рабочая ветка develop (или $KANBAN_BASE_BRANCH), а не текущая:
+    # релизная main не должна становиться родителем задач.
+    base="${KANBAN_BASE_BRANCH:-}"
+    if [[ -z "$base" ]]; then
+      if git -C "$ROOT" show-ref --verify --quiet refs/heads/develop; then
+        base="develop"
+      else
+        base="$(git -C "$ROOT" symbolic-ref --short -q HEAD || echo main)"
+      fi
+    fi
     if git -C "$ROOT" worktree add -b "$branch" "$worktree" "$base" >/dev/null 2>&1; then
       created_worktree=1
     else
@@ -193,6 +224,7 @@ if (( created_worktree == 1 )); then
   echo "worktree: $worktree (ветка $branch, карточка закоммичена: $([[ $committed -eq 1 ]] && echo да || echo нет))"
   echo
   echo "дальше:"
+  echo "  ветка: $branch (база $base)"
   echo "  1. в DSH Web добавьте Workspace «${worktree}» и создайте в нём сессию с пресетом worker"
   if (( BACKLOG == 1 )); then
     echo "  2. задача лежит в backlog: выдайте её асайном bin/task-move.sh $id todo --owner <session-id>"
