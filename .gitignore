@@ -27,5 +27,5 @@ __pycache__/
 # Локальный gradle-кэш проверок (sandbox: ~/.gradle недоступен)
 .gradle-home/
 
-# Готовый CI-воркфлоу: ждёт scope workflow у gh (см. README)
-.ci-staged/
+# Кэши локального CI (bin/ci.sh): песочница не даёт писать в ~/.cargo, ~/.gradle
+.ci-cache/

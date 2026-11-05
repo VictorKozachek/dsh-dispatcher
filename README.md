@@ -98,14 +98,22 @@ cd apps/ios && swift test     # iOS-клиент: 19 тестов
 cd apps/android && ./gradlew test
 cd docs/relay/impl/kotlin && ./gradlew test   # крипто-векторы (Kotlin)
 cd docs/relay/impl/swift && swift test        # крипто-векторы (Swift)
+
+./bin/ci.sh            # всё сразу: плагин, скрипты, релей, Swift, Kotlin
+./bin/ci.sh --fast     # только плагин и скрипты (секунды)
+./bin/ci.sh --android  # плюс юнит-тесты Android
 ```
 
-GitHub Actions гоняет то же самое на каждый push в `main`
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): плагин и скрипты,
-релей, оба Swift-пакета, крипто-векторы Kotlin и юнит-тесты Android.
+CI — **локальный**: `bin/ci.sh` прогоняет те же проверки, что и будущий
+workflow (плагин и скрипты, релей, оба Swift-пакета, крипто-векторы Kotlin,
+опционально Android). Готовый файл GitHub Actions лежит в
+[`docs/ci/github-actions-ci.yml`](docs/ci/github-actions-ci.yml): он не
+активирован, потому что у токена `gh` нет scope `workflow`; скопируйте его в
+`.github/workflows/ci.yml` — и он заработает как есть.
 
-Пуш в remote — шаг человека; агенты и скрипты набора не пушат и не сливают
-ветки в `main` (это делает оркестратор через `bin/task-commit.sh`).
+Пуш в remote делает оркестратор (GitHub делегирован ему человеком), после
+`bin/ci.sh`; роли — исполнитель, ревьювер, тестировщик — не пушат, а скрипты
+набора пушат только по явной команде.
 
 ## Ветвление
 
