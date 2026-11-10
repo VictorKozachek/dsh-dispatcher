@@ -67,6 +67,7 @@ bin/install-remote.sh             # поставить плагин в проф�
 - [`.kanban/specs/001.md`](.kanban/specs/001.md) — спека первой очереди;
 - [`AGENTS.md`](AGENTS.md) — протокол работы агентов, роли, жизненный цикл задачи;
 - [`docs/user-guide.md`](docs/user-guide.md) — инструкция пользователя;
+- [`docs/acceptance.md`](docs/acceptance.md) — чек-лист живой приёмки (бот, телефон, отказы);
 - [`dsh-remote/README.md`](dsh-remote/README.md) — плагин: установка, панель, `/remote`;
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — эксплуатация: инциденты, диагностика, SLO;
 - [`docs/approvals.md`](docs/approvals.md) — удалённые подтверждения и политика;
