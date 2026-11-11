@@ -134,6 +134,8 @@ function harness(t, {
   transport = null,
   withCommands = true,
   fetchImpl,
+  maxPairingDeadlineMs = undefined,
+  maxPairingPollTimeoutSec = undefined,
 } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-cmd-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -156,6 +158,8 @@ function harness(t, {
     },
     random: () => CODE_RANDOM,
     fetch: fetchImpl ?? (async () => jsonResponse({ ok: true, result: {} })),
+    ...(maxPairingDeadlineMs === undefined ? {} : { maxPairingDeadlineMs }),
+    ...(maxPairingPollTimeoutSec === undefined ? {} : { maxPairingPollTimeoutSec }),
   });
 
   return {
@@ -1478,4 +1482,76 @@ test("/remote audit: поздний ответ помечается «поздн
 
   const status = await stand.remote.handler(invoke("status"));
   assert.match(status.text, /подтверждения: удалённо 1, в GUI 1, без ответа 1 \(всего 4\)/);
+});
+
+
+// --- 050: MAX pairing — дедлайн, ошибки, отмена -----------------------------
+
+const MAX_ANSWERS = {
+  "remote-connect-transport": { selected: ["MAX"] },
+  "remote-connect-max-token": { custom: "max-test-token" },
+  "remote-connect-max-send-code": { selected: ["Отправил"] },
+};
+
+function maxFetch({ updates = [], status = 200 } = {}) {
+  return async (url) => {
+    if (String(url).endsWith("/me")) return jsonResponse({ name: "MAX bot" });
+    if (String(url).includes("/updates")) {
+      if (status !== 200) return jsonResponse({ message: "no" }, status);
+      return jsonResponse({ marker: 1, updates: Array.isArray(updates) ? updates : updates() });
+    }
+    return jsonResponse({ ok: true });
+  };
+}
+
+test("050: connect MAX по дедлайну отвечает понятным текстом, привязки нет", async (t) => {
+  const stand = harness(t, {
+    answers: MAX_ANSWERS,
+    fetchImpl: maxFetch({ updates: [] }),
+    maxPairingDeadlineMs: 2_000,
+    maxPairingPollTimeoutSec: 0,
+  });
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "error");
+  assert.match(result.text, /не пришёл боту MAX за 2 с/);
+  assert.match(result.text, /апдейтов: 0/);
+  assert.match(result.text, /типы: —/);
+  assert.match(result.text, /нажали Start/);
+  assert.equal(stand.store.read().bindings, null, "привязка не сохранена");
+});
+
+test("050: connect MAX: 401/403 — токен или активация бота, без fetch failed", async (t) => {
+  const stand = harness(t, {
+    answers: MAX_ANSWERS,
+    fetchImpl: maxFetch({ status: 401 }),
+    maxPairingDeadlineMs: 5_000,
+    maxPairingPollTimeoutSec: 0,
+  });
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "error");
+  assert.match(result.text, /не принял токен или бот не активирован/);
+  assert.match(result.text, /Start/);
+  assert.doesNotMatch(result.text, /fetch failed/);
+  assert.equal(stand.store.read().bindings, null);
+});
+
+test("050: connect MAX: отмена вопроса прекращает опрос", async (t) => {
+  const stand = harness(t, {
+    answers: MAX_ANSWERS,
+    fetchImpl: maxFetch({ updates: [] }),
+    maxPairingDeadlineMs: 60_000,
+    maxPairingPollTimeoutSec: 0,
+  });
+  const controller = new AbortController();
+  controller.abort();
+
+  const result = await stand.remote.handler(invoke("connect", { signal: controller.signal }));
+
+  assert.equal(result.kind, "error");
+  assert.match(result.text, /отменена/);
+  assert.equal(stand.store.read().bindings, null);
 });

@@ -450,6 +450,8 @@ export function createRemoteCommands({
   maxApiBase = undefined,
   /** 039: `GET /updates?timeout=…` для pairing (long polling, не короткий опрос). */
   maxPairingPollTimeoutSec = MAX_PAIRING_POLL_TIMEOUT_SEC,
+  /** 050: общий дедлайн pairing (не «висеть вечно»), мс. */
+  maxPairingDeadlineMs = 120_000,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   pairingTtlMs = PAIRING_TTL_MS,
   ensureTransport = null,
@@ -847,7 +849,9 @@ export function createRemoteCommands({
     }
 
     const code = pairingCode(random);
-    const deadline = now() + pairingTtlMs;
+    // 050: pairing не может висеть дольше дедлайна; код живёт 10 минут, но
+    // человек получает внятный ответ уже через maxPairingDeadlineMs.
+    const pollDeadline = now() + Math.max(1_000, Math.floor(maxPairingDeadlineMs));
     await askStep(invocation, {
       id: "remote-connect-max-send-code",
       question: `Откройте бота «${botName}» в MAX и отправьте ему код ${code} в течение 10 минут `
@@ -856,11 +860,12 @@ export function createRemoteCommands({
     });
 
     let match;
+    const stats = { polls: 0, updates: 0, types: new Set(), codeSeen: 0, host: null };
     try {
       match = await maxPollForCode({
         token,
         code,
-        deadline,
+        deadline: pollDeadline,
         pollTimeoutSec: maxPairingPollTimeoutSec,
         apiBase: pairingBase,
         fetch: fetchImpl,
@@ -868,12 +873,32 @@ export function createRemoteCommands({
         sleep,
         signal: invocation?.signal,
         log,
+        stats,
       });
     } catch (error) {
+      if (error?.name === "AbortError" || invocation?.signal?.aborted === true) {
+        return failure("привязка MAX отменена — опрос остановлен");
+      }
+      const status = Number(error?.status ?? 0);
+      if (status === 401 || status === 403) {
+        return failure("MAX не принял токен или бот не активирован: проверьте токен и нажмите Start у бота в MAX");
+      }
+      if (status === 429) {
+        return failure(`MAX ограничил частоту запросов (429${error?.retryAfterMs ? `, retry_after ${Math.round(error.retryAfterMs / 1000)} с` : ""}) — повторите /remote connect позже`);
+      }
+      if (error?.code === "MAX_TIMEOUT") {
+        return failure(`MAX не ответил за ${Math.round(maxPairingDeadlineMs / 1000)} с — проверьте сеть и повторите /remote connect`);
+      }
       return failure(`не удалось получить код из MAX: ${humanError(error, token)}`);
     }
     if (match === null) {
-      return failure(`код ${code} не пришёл боту MAX за 10 минут — привязки нет, повторите /remote connect`);
+      if (stats.lastError?.status === 429) {
+        return failure(`MAX ограничил частоту запросов (429${stats.lastError.retryAfterMs ? `, retry_after ${Math.round(stats.lastError.retryAfterMs / 1000)} с` : ""}) — повторите /remote connect позже`);
+      }
+      const types = stats.types.size === 0 ? "—" : [...stats.types].join(", ");
+      const seconds = Math.round(Math.max(1_000, maxPairingDeadlineMs) / 1000);
+      return failure(`код ${code} не пришёл боту MAX за ${seconds} с; апдейтов: ${stats.updates}; `
+        + `типы: ${types}; хост: ${stats.host ?? "?"} — проверьте, что написали боту и нажали Start`);
     }
 
     const scopeAnswer = await askStep(invocation, {

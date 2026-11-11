@@ -892,6 +892,8 @@ export async function maxApiRequest({
   apiBase,
   fetch: doFetch = globalThis.fetch,
   signal,
+  /** 050: предел одного HTTP-запроса (мс), чтобы pairing не висел вечно. */
+  timeoutMs = 15_000,
   /** Внутренний хук (048): какой базой в итоге ответили — им пользуются connect/polling. */
   onBase,
   env = globalThis.process?.env ?? {},
@@ -909,6 +911,14 @@ export async function maxApiRequest({
       if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
     }
     try {
+      // 050: каждый запрос ограничен по времени; внешний signal (отмена вопроса)
+      // комбинируется с таймаутом, а не подменяется.
+      const timeoutSignal = typeof AbortSignal?.timeout === "function" && Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? AbortSignal.timeout(timeoutMs)
+        : null;
+      const combinedSignal = signal !== undefined && timeoutSignal !== null
+        ? (typeof AbortSignal?.any === "function" ? AbortSignal.any([signal, timeoutSignal]) : signal)
+        : (signal ?? timeoutSignal);
       response = await doFetch(url.toString(), {
         method,
         headers: {
@@ -916,11 +926,18 @@ export async function maxApiRequest({
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        ...(signal === undefined ? {} : { signal }),
+        ...(combinedSignal === null || combinedSignal === undefined ? {} : { signal: combinedSignal }),
       });
       usedBase = base;
       break;
     } catch (error) {
+      if (signal?.aborted) throw error;
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        const timeoutError = new Error(`MAX ${method} ${path}: таймаут ${timeoutMs} мс`);
+        timeoutError.code = "MAX_TIMEOUT";
+        timeoutError.retryable = true;
+        throw timeoutError;
+      }
       if (signal?.aborted) throw error;
       tried.push({ base, error });
       // 048: фолбэк только на TLS/сеть (401/403/429 — это токен и лимиты).
@@ -943,14 +960,25 @@ export async function maxApiRequest({
   }
   if (response.status === 200) return response.json();
   let detail = "";
+  let payloadValue;
   try {
     const payload = await response.json();
     detail = typeof payload?.message === "string" ? describeError(new Error(payload.message), token) : "";
+    payloadValue = payload?.retry_after ?? payload?.retryAfter;
   } catch {
     detail = "";
   }
   const error = new Error(`MAX ${method} ${path}: ${response.status}${detail === "" ? "" : ` ${detail}`}`);
   error.status = response.status;
+  error.host = usedBase;
+  // 050: 429 — пауза по retry_after (заголовок или поле тела), иначе 1 с.
+  const headerRetry = typeof response.headers?.get === "function" ? response.headers.get("retry-after") : null;
+  let retryAfter = Number(headerRetry);
+  if (!Number.isFinite(retryAfter) && payloadValue !== undefined) {
+    const value = Number(payloadValue);
+    if (Number.isFinite(value)) retryAfter = value;
+  }
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) error.retryAfterMs = Math.floor(retryAfter * 1000);
   throw error;
 }
 
@@ -1003,50 +1031,129 @@ export async function maxPollForCode({
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   signal,
   log = () => {},
+  /** 050: сюда складывается диагностика для текста ошибки (`polls/updates/types/host`). */
+  stats = null,
+  timeoutMs = 15_000,
 } = {}) {
   let marker = null;
   // 048: как только один из хостов ответил, дальше опрашиваем именно его —
   // иначе каждый long polling начинался бы с падения на TLS у api2.
   let workingBase = apiBase;
+  let waitMs = 1_000;
+  let attempt = 0;
+  const counts = stats ?? { polls: 0, updates: 0, types: new Set(), codeSeen: 0, host: null };
+
   while (now() < deadline) {
     if (signal?.aborted) throw Object.assign(new Error("подключение отменено"), { name: "AbortError" });
+    const remainingSec = Math.max(0, Math.ceil((deadline - now()) / 1000));
+    const requestTimeoutSec = Math.max(0, Math.floor(pollTimeoutSec));
     let response;
     try {
       response = await maxApiRequest({
         token,
         path: "/updates",
         query: {
-          timeout: Math.min(90, Math.max(0, Math.floor(pollTimeoutSec))),
+          timeout: Math.min(90, requestTimeoutSec),
           limit: 100,
           ...(marker === null ? {} : { marker }),
         },
         apiBase: workingBase,
         fetch: doFetch,
         signal,
+        timeoutMs: Math.max(1_000, Math.min(timeoutMs, Math.max(0, deadline - now()))),
         onBase: (info) => {
-          if (info?.fallbackUsed === true && typeof info.base === "string") workingBase = info.base;
+          if (typeof info?.base === "string") {
+            workingBase = info.base;
+            counts.host = info.base;
+          }
         },
       });
+      waitMs = 1_000;
+      attempt = 0;
+      counts.lastError = null;
     } catch (error) {
-      if (error?.status === 401) throw error;
-      log(`max pairing: опрос апдейтов не удался (${describeError(error, token)})`);
-      await sleep(1000);
+      if (error?.name === "AbortError" || signal?.aborted) throw error;
+      const status = Number(error?.status ?? 0);
+      // 401/403 — токен/активация бота: повторять бессмысленно, пусть человек чинит.
+      if (status === 401 || status === 403) throw error;
+      attempt += 1;
+      counts.lastError = { status, retryAfterMs: error?.retryAfterMs ?? null, message: describeError(error, token) };
+      let pause = waitMs;
+      if (status === 429) {
+        pause = Math.max(1_000, Number(error?.retryAfterMs ?? 0) || 1_000);
+        log(`max pairing: 429 rate limit, пауза ${Math.round(pause / 1000)} с (retry_after)`);
+      } else {
+        pause = Math.min(10_000, waitMs * 2 ** Math.min(4, attempt - 1));
+        log(`max pairing: опрос не удался (${describeError(error, token)}), backoff ${pause} мс`);
+      }
+      const left = deadline - now();
+      if (left <= 0) break;
+      await sleep(Math.min(pause, left));
       continue;
     }
+    counts.polls += 1;
     if (Number.isFinite(response?.marker)) marker = response.marker;
-    for (const update of Array.isArray(response?.updates) ? response.updates : []) {
-      if (update?.type !== "message_created") continue;
-      const text = typeof update?.message?.body?.text === "string" ? update.message.body.text.trim() : "";
-      if (text !== code) continue;
-      const chatId = update?.message?.chat?.chat_id ?? update?.chat?.chat_id ?? null;
-      const userId = update?.message?.sender?.user_id ?? update?.user?.user_id ?? null;
-      if (chatId === null || userId === null) continue;
-      return { chatId, userId, marker };
+    const updates = Array.isArray(response?.updates) ? response.updates : [];
+    counts.updates += updates.length;
+    for (const update of updates) {
+      const type = updateType(update);
+      if (type !== null) counts.types.add(type);
     }
+    // 050: одна строка на каждый опрос — по ней видно «пусто» vs «пришло, но не разобрали».
+    const types = counts.types.size === 0 ? "—" : [...counts.types].join(",");
+    const found = findPairingUpdate(updates, code);
+    if (found.codeSeen) counts.codeSeen += 1;
+    log(`max pairing: poll host=${counts.host ?? workingBase ?? "?"} updates=${updates.length} types=${types} code=${found.codeSeen ? "yes" : "no"}`);
+    if (found.match !== null) return { ...found.match, marker, stats: counts };
     // Long polling уже ждал ответ `pollTimeoutSec`; короткий опрос (0) — пауза 1 с.
     await sleep(pollTimeoutSec > 0 ? 200 : 1000);
   }
+  stats && Object.assign(stats, counts);
   return null;
+}
+
+/** Тип апдейта с учётом v1/v2: `type`, `update_type` или вложенный `update.update_type`. */
+function updateType(update) {
+  for (const value of [update?.type, update?.update_type, update?.message?.type, update?.update?.update_type, update?.update?.type]) {
+    if (typeof value === "string" && value !== "") return value;
+  }
+  return null;
+}
+
+/**
+ * Найти pairing-код в апдейте, не завися от схемы v1/v2.
+ *
+ * Код ищем в сериализованном апдейте (любая вложенность), id — по цепочке
+ * известных путей. Возвращает `{match, codeSeen}`; `match` — `{chatId,userId}`.
+ */
+export function findPairingUpdate(updates, code) {
+  let codeSeen = false;
+  for (const update of Array.isArray(updates) ? updates : []) {
+    let serialized = "";
+    try {
+      serialized = JSON.stringify(update);
+    } catch {
+      serialized = "";
+    }
+    if (serialized.includes(code)) codeSeen = true;
+    // v2 иногда заворачивает событие в `update`; разбираем и плоскую, и вложенную форму.
+    const base = update?.update !== null && typeof update?.update === "object" ? update.update : update;
+    const userId = base?.message?.sender?.user_id
+      ?? base?.user?.user_id
+      ?? base?.sender?.user_id
+      ?? base?.message?.sender?.id
+      ?? null;
+    const chatId = base?.message?.recipient?.chat_id
+      ?? base?.message?.chat?.chat_id
+      ?? base?.chat?.chat_id
+      ?? base?.chat_id
+      ?? base?.recipient?.chat_id
+      ?? null;
+    if (serialized.includes(code) && chatId !== null && userId !== null) {
+      return { match: { chatId, userId }, codeSeen: true };
+    }
+  }
+  return { match: null, codeSeen };
 }
 
 /** Хелпер для тестов: разложить текст под предел MAX, не потеряв символы. */

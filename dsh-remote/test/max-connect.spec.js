@@ -245,7 +245,8 @@ test("connect MAX: код не пришёл — привязки нет", async 
   const result = await stand.remote.handler(invoke("connect"));
 
   assert.equal(result.kind, "error", result.text);
-  assert.match(result.text, /не пришёл боту MAX за 10 минут/);
+  assert.match(result.text, /не пришёл боту MAX за 120 с; апдейтов: 0; типы: —; хост: /);
+  assert.match(result.text, /нажали Start/);
   assert.equal(stand.store.read().bindings, null, "привязки нет");
   const updateCalls = api.calls.filter((call) => call.key === "GET /updates");
   assert.ok(updateCalls.length > 0, "pairing опрашивал /updates");
@@ -435,4 +436,45 @@ test("MAX-транспорт доставляет вопрос и возвращ
   assert.equal(result.answers.length, 1, "ответ из MAX вернулся в сессию");
   assert.deepEqual(result.answers[0].selected, ["Да"]);
   await transport.stop();
+});
+
+
+// --- 050: слепой цикл закрыт — ошибки апдейтов видны ------------------------
+
+test("050: connect MAX: 401 при опросе /updates — понятная ошибка про токен/активацию", async (t) => {
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/me") return jsonResponse({ name: "max_bot" });
+    return jsonResponse({ message: "unauthorized" }, 401);
+  };
+  const stand = harness(t, { answers: MAX_ANSWERS, fetchImpl });
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "error", result.text);
+  assert.match(result.text, /не принял токен или бот не активирован/);
+  assert.match(result.text, /Start/);
+  assert.doesNotMatch(result.text, /fetch failed/);
+  assert.equal(stand.store.read().bindings, null);
+});
+
+test("050: connect MAX: 429 при опросе — пауза и отказ с retry_after", async (t) => {
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/me") return jsonResponse({ name: "max_bot" });
+    return {
+      ok: false,
+      status: 429,
+      headers: { get: (name) => (name === "retry-after" ? "1" : null) },
+      json: async () => ({ message: "too many requests" }),
+    };
+  };
+  const stand = harness(t, { answers: MAX_ANSWERS, fetchImpl, options: { maxPairingDeadlineMs: 3_000, maxPairingPollTimeoutSec: 0 } });
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "error", result.text);
+  assert.match(result.text, /ограничил частоту запросов/);
+  assert.match(result.text, /retry_after 1 с/);
+  assert.equal(stand.store.read().bindings, null);
 });

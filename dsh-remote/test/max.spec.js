@@ -6,7 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { checkTransport } from "../lib/transport/base.js";
-import { MAX_CAPS, createMaxTransport } from "../lib/transport/max.js";
+import { MAX_CAPS, createMaxTransport, findPairingUpdate, maxApiRequest, maxPollForCode } from "../lib/transport/max.js";
 
 const TOKEN = "max-test-token";
 
@@ -744,4 +744,176 @@ test("answered-elsewhere после рестарта (без записи) — �
 
   const put = calls.filter((item) => item.key === "PUT /messages").at(-1);
   assert.equal(put.body.text, "Отвечено в другом канале");
+});
+
+
+// --- 050: pairing MAX — таймауты, диагностика, v1/v2 ------------------------
+
+const CODE = "123456";
+
+/** Часы+сон: сон двигает часы, тесты не ждут реальные секунды. */
+function fakeClock(start = 0) {
+  let clock = start;
+  const sleeps = [];
+  return {
+    now: () => clock,
+    sleep: async (ms) => { sleeps.push(ms); clock += ms; },
+    sleeps,
+    get clock() { return clock; },
+    advance: (ms) => { clock += ms; },
+  };
+}
+
+function pairingSetup(responses, { deadline = 5_000, signal, stats } = {}) {
+  const clock = fakeClock();
+  const calls = [];
+  const logs = [];
+  const impl = async (url, init = {}) => {
+    calls.push({ url, init });
+    const next = responses.shift();
+    if (next === undefined) return response({ updates: [] });
+    if (typeof next === "function") return next(url, init);
+    return next;
+  };
+  return {
+    clock, calls, logs,
+    run: () => maxPollForCode({
+      token: TOKEN,
+      code: CODE,
+      deadline: clock.clock + deadline,
+      pollTimeoutSec: 0,
+      apiBase: "https://platform-api2.max.ru",
+      fetch: impl,
+      now: clock.now,
+      sleep: clock.sleep,
+      signal,
+      log: (line) => logs.push(line),
+      stats,
+    }),
+  };
+}
+
+test("050: pairing находит код в схеме v2 и логирует типы без секретов", async () => {
+  const setup = pairingSetup([response({
+    marker: 10,
+    updates: [{ type: "message_created", message: { sender: { user_id: 7 }, recipient: { chat_id: 42 }, body: { text: CODE } } }],
+  })]);
+  const match = await setup.run();
+
+  assert.equal(match.chatId, 42);
+  assert.equal(match.userId, 7);
+  assert.equal(match.marker, 10);
+  const log = setup.logs.join("\n");
+  assert.match(log, /updates=1/);
+  assert.match(log, /types=message_created/);
+  assert.match(log, /code=yes/);
+  assert.equal(log.includes(TOKEN), false, "токен не в логе");
+  assert.equal(log.includes(CODE), false, "текст сообщения не в логе");
+});
+
+test("050: pairing находит код в схеме v1 (другая вложенность)", async () => {
+  const setup = pairingSetup([response({
+    updates: [{ update_type: "message_new", message: { chat: { chat_id: 9 }, sender: { user_id: 5 }, body: { text: `код ${CODE}` } } }],
+  })]);
+  const match = await setup.run();
+  assert.deepEqual({ chatId: match.chatId, userId: match.userId }, { chatId: 9, userId: 5 });
+});
+
+test("050: pairing терпим к вложенному update_type и message.created", async () => {
+  const setup = pairingSetup([response({
+    updates: [
+      { update: { update_type: "message_created", message: { created: true, chat: { chat_id: 11 }, sender: { user_id: 12 }, body: { text: CODE } } } },
+    ],
+  })]);
+  const match = await setup.run();
+  assert.deepEqual({ chatId: match.chatId, userId: match.userId }, { chatId: 11, userId: 12 });
+});
+
+test("050: пустые апдейты — null, статистика и понятный итог", async () => {
+  const stats = { polls: 0, updates: 0, types: new Set(), codeSeen: 0, host: null };
+  const setup = pairingSetup([], { deadline: 1_000, stats });
+  const match = await setup.run();
+
+  assert.equal(match, null);
+  assert.equal(stats.updates, 0);
+  assert.equal(stats.polls, 1);
+  assert.ok(setup.logs.some((line) => /updates=0/.test(line)));
+});
+
+test("050: 401 не крутит цикл и пробрасывает статус", async () => {
+  const setup = pairingSetup([response({ message: "unauthorized" }, 401)]);
+  await assert.rejects(setup.run(), (error) => error.status === 401);
+  assert.equal(setup.calls.length, 1, "после 401 повторов нет");
+});
+
+test("050: 429 уважает retry_after и затем получает код", async () => {
+  const rateLimited = {
+    ok: false,
+    status: 429,
+    headers: { get: (name) => (name === "retry-after" ? "2" : null) },
+    async json() { return { message: "too many requests" }; },
+  };
+  const setup = pairingSetup([rateLimited, response({
+    updates: [{ type: "message_created", message: { sender: { user_id: 1 }, recipient: { chat_id: 2 }, body: { text: CODE } } }],
+  })], { deadline: 10_000 });
+  const match = await setup.run();
+
+  assert.equal(match.chatId, 2);
+  assert.ok(setup.clock.sleeps.includes(2_000), `пауза по retry_after: ${setup.clock.sleeps}`);
+  assert.ok(setup.logs.some((line) => /429 rate limit/.test(line)));
+});
+
+test("050: дедлайн pairing возвращает null, а не висит; отмена — AbortError", async () => {
+  const clock = fakeClock();
+  const controller = new AbortController();
+  const pending = maxPollForCode({
+    token: TOKEN,
+    code: CODE,
+    deadline: clock.clock + 60_000,
+    pollTimeoutSec: 0,
+    apiBase: "https://platform-api2.max.ru",
+    fetch: async () => response({ updates: [] }),
+    now: clock.now,
+    sleep: clock.sleep,
+    signal: controller.signal,
+  });
+  controller.abort();
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+});
+
+test("050: у каждого HTTP-запроса есть таймаут", async () => {
+  const hanging = async (url, init = {}) => new Promise((_, reject) => {
+    init.signal?.addEventListener("abort", () => {
+      const error = new Error("timeout");
+      error.name = "TimeoutError";
+      reject(error);
+    });
+  });
+  await assert.rejects(
+    maxApiRequest({ token: TOKEN, path: "/updates", apiBase: "https://platform-api2.max.ru", fetch: hanging, timeoutMs: 20 }),
+    (error) => error.code === "MAX_TIMEOUT",
+  );
+});
+
+test("050: findPairingUpdate не зависит от одной формы", () => {
+  assert.deepEqual(
+    findPairingUpdate([{ message: { recipient: { chat_id: 1 }, sender: { user_id: 2 }, body: { text: CODE } } }], CODE).match,
+    { chatId: 1, userId: 2 },
+  );
+  assert.deepEqual(
+    findPairingUpdate([{ chat_id: 3, user: { user_id: 4 }, text: CODE }], CODE).match,
+    { chatId: 3, userId: 4 },
+  );
+  assert.equal(findPairingUpdate([{ message: { body: { text: "нет кода" } } }], CODE).match, null);
+});
+
+test("050: 5xx даёт backoff, а не молчаливый цикл", async () => {
+  const setup = pairingSetup([
+    response({ message: "server error" }, 500),
+    response({ updates: [{ type: "message_created", message: { sender: { user_id: 1 }, recipient: { chat_id: 2 }, body: { text: CODE } } }] }),
+  ], { deadline: 20_000 });
+  const match = await setup.run();
+  assert.equal(match.chatId, 2);
+  assert.ok(setup.logs.some((line) => /backoff/.test(line)), "backoff залогирован");
+  assert.ok(setup.clock.sleeps.length >= 1);
 });
