@@ -40,6 +40,36 @@ import { DEFAULT_KEEP, vacuum } from "./rotate.js";
 import { formatStats } from "./metrics.js";
 import { randomUUID } from "node:crypto";
 
+/**
+ * Сервис из контекста БЕЗ прямого обращения к свойству.
+ *
+ * cordis отвечает `cannot get property "<name>" without inject`, если читать
+ * `ctx.<service>` у сервиса, которого нет в `inject` плагина. Наш плагин
+ * сознательно ничего не требует жёстко (`inject: []`): недостающий сервис — это
+ * деградация, а не отказ. Поэтому все сервисы берутся через `ctx.get(name)`:
+ * он возвращает `null`, а не бросает.
+ *
+ * @param {object} ctx - контекст cordis (или фейковый в тестах)
+ * @param {string} name - имя сервиса
+ * @returns {object|null} сервис или null
+ */
+export function serviceOf(ctx, name) {
+  // 1) cordis-путь: `ctx.get(name)` возвращает сервис или null и не бросает.
+  try {
+    const viaGet = ctx?.get?.(name);
+    if (viaGet !== null && viaGet !== undefined) return viaGet;
+  } catch {
+    /* ctx без get или бросающий get — идём дальше */
+  }
+  // 2) прямой доступ: так сервисы подставляют тесты и простые хосты. В cordis
+  //    это бросит `without inject` — именно поэтому доступ обёрнут.
+  try {
+    return ctx?.[name] ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Имя ссылки на токен Telegram в `ctx.credentials` (не значение!). */
 export const TELEGRAM_TOKEN_REF = credentialRef("DSH_REMOTE_TELEGRAM_TOKEN");
 
@@ -377,7 +407,7 @@ export function createRemoteCommands({
 
   /** Локальный вопрос человеку: это GUI, не мессенджер (режим ещё выключен). */
   async function askStep(invocation, { id, question, options }) {
-    const service = ctx?.userQuestions;
+    const service = serviceOf(ctx, "userQuestions");
     if (typeof service?.ask !== "function") {
       throw new Error("локальные вопросы недоступны: нет ctx.userQuestions");
     }
@@ -1249,7 +1279,7 @@ export function createRemoteCommands({
 
   /** Зарегистрировать `/remote` в реестре команд DSH. */
   function register() {
-    const commands = ctx?.commands ?? ctx?.get?.("commands") ?? null;
+    const commands = serviceOf(ctx, "commands");
     if (typeof commands?.register !== "function") {
       log("команды: ctx.commands недоступен — /remote не зарегистрирован");
       return () => {};
