@@ -120,6 +120,59 @@ bin/install-remote.sh --profile desktop --uninstall   # убрать из про
 вручную; токен — `unset` через `/remote disconnect` или убрать
 `DSH_REMOTE_TELEGRAM_TOKEN` из `~/.dsh/.credentials.yaml`.
 
+## Локальный релей без телефона (задача 040)
+
+Цель: убедиться, что плагин публикует вопрос в **свой** релей и получает ответ
+через API — без хостинга, TLS и телефона. Всё только на `127.0.0.1`.
+
+1. Собрать и запустить релей (точные команды — `relay/README.md`,
+   «Проверенная локальная последовательность»):
+
+   ```bash
+   cd relay
+   export CARGO_HOME="$PWD/../.cargo-home" CARGO_TARGET_DIR="$PWD/../.cargo-target"
+   cargo build
+   RELAY_BIND=127.0.0.1:8080 RELAY_AGENT_TOKEN=dev-agent-token \
+   RELAY_DATABASE_URL="sqlite://$PWD/.run/relay.db?mode=rwc" \
+     "$CARGO_TARGET_DIR/debug/dsh-relay"
+   curl -sS -H 'X-Relay-Version: 1' http://127.0.0.1:8080/healthz   # ok:true
+   ```
+
+2. Smoke самого релея:
+
+   ```bash
+   RELAY_BASE_URL=http://127.0.0.1:8080 RELAY_AGENT_TOKEN=dev-agent-token \
+     deploy/smoke.sh
+   # smoke: OK — healthz, привязка, вопрос, ответ, идемпотентность
+   ```
+
+3. Плагин → релей (без телефона). В `dsh-remote` транспорт `relay` — это обычный
+   `createRelayTransport`; в сессии он поднимается после
+   `/remote connect` → **Relay** → `http://127.0.0.1:8080` + токен агента.
+   Для проверки без GUI/телефона тот же транспорт подключается скриптом:
+
+   ```js
+   const transport = createRelayTransport({ url: "http://127.0.0.1:8080", agentToken: "dev-agent-token" });
+   await transport.start();                       // healthCheck + long-poll/WS
+   const answerer = createAnswerer({ transport, registry });
+   answerer.attach(ctx);
+   const pending = answerer.handler({ questions: [{ id: "live-q", question: "Продолжать?", options: [{ label: "Да" }, { label: "Нет" }] }], agent: { id: "live" } }, () => next());
+   // устройство (iOS или curl) регистрируется и отвечает:
+   // POST /v1/answers {questionId, selected:["o1"], idempotencyKey}
+   const result = await pending;                  // {answers:[{selected:["Да"]}]}
+   ```
+
+   Ответ приходит через тот же long-poll/WS, что и у живого телефона; `next()`
+   не вызывается. Проверено вживую: вопрос появился в `GET /v1/questions`,
+   `POST /v1/answers` вернул `201`, сессия получила `selected: ["Да"]`.
+
+4. Недоступный релей (порт закрыт): `createRelayTransport` с
+   `http://127.0.0.1:9`, тот же `answerer.handler` → `next()` вызывается за
+   десятки миллисекунд (вопрос уходит в GUI), ожидание не висит.
+
+Ограничения: e2e-шифрование (021) для этого прогона выключено (открытый режим);
+webhook, TLS и внешний хостинг — задача 041.
+
 ## Результаты живой проверки (2026-11-11, приложение desktop, @dshdisp_bot)
 
 | Сценарий | Результат |
@@ -131,6 +184,10 @@ bin/install-remote.sh --profile desktop --uninstall   # убрать из про
 | Вопрос **без вариантов** → поле ввода | ✅ `force_reply`, клавиатура открывается сама |
 | Кнопка «Другой ответ…» | ✅ бот присылает «✍️ Напишите ответ текстом», текст доходит |
 | Пачка из **двух** вопросов | ❌ свободный текст неоднозначен, ожидание висит до аборта — `bug/037` |
+| Локальный релей: `cargo build` + `dsh-relay` на `127.0.0.1:8080` | ✅ `/healthz` → 200, миграция `1 init` применена |
+| `deploy/smoke.sh` против локального релея | ✅ привязка, вопрос, ответ, идемпотентный повтор |
+| Плагин → локальный релей → ответ через `POST /v1/answers` | ✅ вопрос в `GET /v1/questions`, ответ вернулся в сессию (`selected: ["Да"]`) |
+| Недоступный релей (`127.0.0.1:9`) | ✅ `next()` за 34 мс — вопрос уходит в GUI, без зависания |
 
 Найдено и исправлено по ходу приёмки (каждое — отдельный дефект, а не переделка):
 
