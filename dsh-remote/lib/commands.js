@@ -35,7 +35,12 @@ import {
   serializeReport,
 } from "./doctor.js";
 import { RELAY_TOKEN_REF } from "./transport/relay.js";
-import { MAX_API_BASE, maxMe, maxPollForCode } from "./transport/max.js";
+import {
+  MAX_API_BASE,
+  MAX_PAIRING_POLL_TIMEOUT_SEC,
+  maxMe,
+  maxPollForCode,
+} from "./transport/max.js";
 import { createAudit } from "./audit.js";
 import { DEFAULT_KEEP, vacuum } from "./rotate.js";
 import { formatStats } from "./metrics.js";
@@ -412,6 +417,8 @@ export function createRemoteCommands({
   fetch: fetchImpl = globalThis.fetch,
   baseUrl = TELEGRAM_API_BASE,
   maxApiBase = MAX_API_BASE,
+  /** 039: `GET /updates?timeout=…` для pairing (long polling, не короткий опрос). */
+  maxPairingPollTimeoutSec = MAX_PAIRING_POLL_TIMEOUT_SEC,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   pairingTtlMs = PAIRING_TTL_MS,
   ensureTransport = null,
@@ -813,6 +820,7 @@ export function createRemoteCommands({
         token,
         code,
         deadline,
+        pollTimeoutSec: maxPairingPollTimeoutSec,
         apiBase: maxApiBase,
         fetch: fetchImpl,
         now,

@@ -104,7 +104,7 @@ function scriptedAsk(answers) {
   };
 }
 
-function harness(t, { bindings = null, credentials = fakeCredentials(), answers = {}, fetchImpl, ensureTransport } = {}) {
+function harness(t, { bindings = null, credentials = fakeCredentials(), answers = {}, fetchImpl, ensureTransport, options = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-max-connect-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const store = createStore({ file: path.join(dir, "state.json") });
@@ -141,6 +141,7 @@ function harness(t, { bindings = null, credentials = fakeCredentials(), answers 
         return { id: "max", async start() { return true; } };
       }
       : ensureTransport,
+    ...options,
   });
   return { store, remote, credentials, asked, ensured };
 }
@@ -198,6 +199,8 @@ test("connect MAX: токен проверен, pairing-код, привязка
 
   const tokenCall = api.calls.find((call) => call.key === "GET /me");
   assert.equal(tokenCall.init.headers.authorization, TOKEN, "токен MAX ушёл заголовком Authorization");
+  const updatesCall = api.calls.find((call) => call.key === "GET /updates");
+  assert.equal(updatesCall.url.searchParams.get("timeout"), "5", "pairing идёт long polling (timeout=5), а не коротким опросом");
 });
 
 test("connect MAX: невалидный токен — понятная ошибка и никакой привязки", async (t) => {
@@ -244,6 +247,27 @@ test("connect MAX: код не пришёл — привязки нет", async 
   assert.equal(result.kind, "error", result.text);
   assert.match(result.text, /не пришёл боту MAX за 10 минут/);
   assert.equal(stand.store.read().bindings, null, "привязки нет");
+  const updateCalls = api.calls.filter((call) => call.key === "GET /updates");
+  assert.ok(updateCalls.length > 0, "pairing опрашивал /updates");
+  for (const call of updateCalls) {
+    assert.equal(call.url.searchParams.get("timeout"), "5", "каждый опрос — long polling timeout=5");
+  }
+  assert.ok(updateCalls.length < 4000, `опросов немного (${updateCalls.length}), а не 600 коротких`);
+});
+
+test("connect MAX: таймаут pairinга можно переопределить (config.max.pollTimeoutSec)", async (t) => {
+  const api = maxFetch({ updates: pairingUpdates });
+  const stand = harness(t, {
+    answers: MAX_ANSWERS,
+    fetchImpl: api.fetch,
+    options: { maxPairingPollTimeoutSec: 2 },
+  });
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "success", result.text);
+  const updatesCall = api.calls.find((call) => call.key === "GET /updates");
+  assert.equal(updatesCall.url.searchParams.get("timeout"), "2");
 });
 
 test("status MAX: токен, marker, polling и предупреждение про webhook", async (t) => {

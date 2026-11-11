@@ -400,7 +400,15 @@ export const commandsFeature = {
     // status/on должны видеть хотя бы один живой канал.
     const currentChannel = () => facade.current ?? [...transportRegistry.values()][0] ?? null;
     trace("commands:createRemoteCommands");
-    const remote = createRemoteCommands({ ctx, store, log, ensureTransport: ensure, currentChannel });
+    const remote = createRemoteCommands({
+      ctx,
+      store,
+      log,
+      ensureTransport: ensure,
+      currentChannel,
+      // 039: long polling для pairing MAX; можно переопределить в config.max.
+      ...(Number.isFinite(config?.max?.pollTimeoutSec) ? { maxPairingPollTimeoutSec: config.max.pollTimeoutSec } : {}),
+    });
     trace("commands:register");
     deps.onDispose(remote.register(), "commands");
     trace("commands:зарегистрирована");

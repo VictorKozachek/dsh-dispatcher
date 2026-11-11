@@ -52,6 +52,12 @@ export const MAX_CAPS = Object.freeze({
 /** Лимит платформы: не больше 2 запросов в секунду в один чат. */
 export const MAX_CHAT_RPS_INTERVAL_MS = 500;
 
+/**
+ * Таймаут long polling для pairing (`GET /updates?timeout=…`), секунды.
+ * 039: без него MAX-опрос был бы коротким раз в секунду (лишняя нагрузка).
+ */
+export const MAX_PAIRING_POLL_TIMEOUT_SEC = 5;
+
 /** Причины, при которых сообщение закрывается молчаливой пометкой. */
 const QUIET_REASONS = new Set([
   "aborted",
@@ -730,7 +736,7 @@ export async function maxPollForCode({
   token,
   code,
   deadline,
-  pollTimeoutSec = 0,
+  pollTimeoutSec = MAX_PAIRING_POLL_TIMEOUT_SEC,
   apiBase,
   fetch: doFetch,
   now = () => Date.now(),
@@ -771,7 +777,8 @@ export async function maxPollForCode({
       if (chatId === null || userId === null) continue;
       return { chatId, userId, marker };
     }
-    await sleep(1000);
+    // Long polling уже ждал ответ `pollTimeoutSec`; короткий опрос (0) — пауза 1 с.
+    await sleep(pollTimeoutSec > 0 ? 200 : 1000);
   }
   return null;
 }
