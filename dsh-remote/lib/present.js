@@ -157,7 +157,7 @@ export function findOwnedTask(cwd, sessionId, { log = noop } = {}) {
       try {
         text = fs.readFileSync(path.join(tasksDir, name), "utf8");
       } catch (error) {
-        log(`карточка ${name} не прочиталась: ${error?.message ?? error}`);
+        log(`card ${name} could not be read: ${error?.message ?? error}`);
         continue;
       }
       if (frontMatterField(text, "owner") !== sessionId) continue;

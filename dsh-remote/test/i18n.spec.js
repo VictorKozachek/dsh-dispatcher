@@ -162,3 +162,22 @@ test("046: новый вопрос создаётся на языке из со�
   const result = await pending;
   assert.equal(result.answers[0].custom, "Yes");
 });
+
+test("046: статическая проверка — в present/quick-replies нет русских литералов", async () => {
+  const fs = await import("node:fs");
+  const url = await import("node:url");
+  const dir = url.fileURLToPath(new URL("../lib/", import.meta.url));
+  const stripComments = (source) => source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  const literal = /("([^"\\]|\\.)*"|`([^`\\]|\\.)*`)/g;
+
+  for (const file of ["present.js", "quick-replies.js"]) {
+    const source = stripComments(fs.readFileSync(`${dir}${file}`, "utf8"));
+    const offenders = [];
+    for (const match of source.matchAll(literal)) {
+      if (/[А-Яа-яЁё]/.test(match[0])) offenders.push(match[0].slice(0, 60));
+    }
+    assert.deepEqual(offenders, [], `${file}: пользовательские строки — только через i18n.js`);
+  }
+});
