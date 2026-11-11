@@ -1043,6 +1043,9 @@ test("фасад: dispose гасит запущенный канал и сним
 });
 
 test("фасад без канала: отправка — ошибка, /remote test и on честно отказывают", async (t) => {
+  // Изоляция от реального ~/.dsh/remote-control/state.json: иначе тест зависит
+  // от того, привязан ли бот на машине разработчика.
+  withTempState(t);
   const stand = harness(t);
   const { ctx, provided } = makePluginCtx();
   const { deps, disposers } = fakeDeps();

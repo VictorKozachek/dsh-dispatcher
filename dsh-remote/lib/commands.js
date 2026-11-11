@@ -73,6 +73,34 @@ export function serviceOf(ctx, name) {
 /** Имя ссылки на токен Telegram в `ctx.credentials` (не значение!). */
 export const TELEGRAM_TOKEN_REF = credentialRef("DSH_REMOTE_TELEGRAM_TOKEN");
 
+/** Имя ссылки на токен MAX (038/039): тот же секрет, что читает фича max. */
+export const MAX_TOKEN_REF = credentialRef("DSH_REMOTE_MAX_TOKEN");
+
+/** Человеческое имя транспорта для ответов connect/status. */
+export function transportLabel(transport) {
+  if (transport === "telegram") return "Telegram";
+  if (transport === "max") return "MAX";
+  if (transport === "relay") return "релей";
+  return typeof transport === "string" && transport !== "" ? transport : "канал";
+}
+
+/** Ссылка на секрет транспорта: при переключении канала чистим именно её. */
+export function tokenRefFor(transport) {
+  if (transport === "relay") return RELAY_TOKEN_REF;
+  if (transport === "max") return MAX_TOKEN_REF;
+  return TELEGRAM_TOKEN_REF;
+}
+
+/**
+ * Строка «X отключён, Y подключён» для ответа connect (038). Если прежнего
+ * канала не было — null: сообщение про привязку скажет само.
+ */
+export function switchNoteFor(previousTransport, nextTransport) {
+  if (previousTransport === null || previousTransport === undefined) return null;
+  if (previousTransport === nextTransport) return null;
+  return `${transportLabel(previousTransport)} отключён, ${transportLabel(nextTransport)} подключён`;
+}
+
 /** Адрес Bot API; переопределяется в тестах. */
 export const TELEGRAM_API_BASE = "https://api.telegram.org";
 
@@ -511,6 +539,79 @@ export function createRemoteCommands({
     return { plan: null, note: "режим пока выключен: включите его /remote on" };
   }
 
+  /**
+   * Остановить каналы конкретного транспорта (038): фасад, если в нём он, и
+   * каналы из реестра 012. Другие транспорты не трогаем — ими управляет их
+   * фича/конфиг, а не переключение привязки.
+   */
+  async function stopTransportChannels(transportId) {
+    const facade = ctx?.get?.("remoteTransport") ?? null;
+    if (facade !== null && typeof facade.stop === "function") {
+      const currentId = facade?.current?.id ?? null;
+      if (currentId === null || currentId === transportId) {
+        try {
+          await facade.stop();
+        } catch (error) {
+          log(`фасад.stop при переключении: ${humanError(error)}`);
+        }
+      }
+    }
+    const channels = ctx?.get?.("remoteTransports") ?? null;
+    if (channels !== null && typeof channels.values === "function") {
+      for (const channel of [...channels.values()]) {
+        if (channel === null || channel?.id !== transportId || typeof channel.stop !== "function") continue;
+        try {
+          await channel.stop();
+        } catch (error) {
+          log(`канал ${transportId}.stop при переключении: ${humanError(error)}`);
+        }
+        try {
+          channels.delete?.(channel.id);
+        } catch {
+          /* реестр мог быть очищен */
+        }
+      }
+    }
+  }
+
+  /**
+   * Отключить текущую привязку перед записью новой (038).
+   *
+   * Порядок важен: сначала останавливаем канал(ы) прежнего транспорта, потом
+   * убираем его токен, и только затем connect пишет новую привязку. Если
+   * остановка не удалась, всё равно идём дальше: новая привязка и токен важнее,
+   * а старый поллер получит 409 и не сможет мешать (и это видно в логе).
+   */
+  async function retireActiveChannel(nextTransport) {
+    const previous = store.read().bindings;
+    if (previous === null) return { previous: null, switchNote: null, secretNote: null };
+    const previousTransport = typeof previous.transport === "string" ? previous.transport : "telegram";
+    await stopTransportChannels(previousTransport);
+
+    let secretNote = null;
+    try {
+      const ref = tokenRefFor(previousTransport);
+      const described = await credentials.describe(ref);
+      if (described?.present === true) {
+        if (described.writable === true) {
+          secretNote = (await credentials.unset(ref))
+            ? `токен ${ref} удалён`
+            : `токен ${ref} удалить не удалось — удалите вручную`;
+        } else {
+          secretNote = `токен ${ref} остался в окружении (источник только для чтения)`;
+        }
+      }
+    } catch (error) {
+      log(`секрет прежнего канала не очищен: ${humanError(error)}`);
+    }
+
+    return {
+      previous: previousTransport,
+      switchNote: switchNoteFor(previousTransport, nextTransport),
+      secretNote,
+    };
+  }
+
   /** `/remote connect` — пошаговая привязка бота. */
   /**
    * `/remote connect relay`: URL релея + токен агента (секрет), проверка `/healthz`.
@@ -555,6 +656,8 @@ export function createRemoteCommands({
       options: ["Только этот проект", "Все проекты", "Пока не включать"],
     });
     const scope = planConnectScope(scopeAnswer, invocation);
+    // 038: прежний канал отключаем ДО записи новой привязки.
+    const retired = await retireActiveChannel("relay");
     try {
       store.update((state) => {
         state.bindings = {
@@ -562,6 +665,7 @@ export function createRemoteCommands({
           url,
           botUsername: "relay",
           createdAt: now(),
+          ...(retired.previous !== null && retired.previous !== "relay" ? { previousTransport: retired.previous } : {}),
         };
         if (scope.plan?.kind === "global") state.enabled.global = true;
         if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
@@ -578,6 +682,8 @@ export function createRemoteCommands({
         : `токен взят из окружения (${RELAY_TOKEN_REF}) и не сохранён`;
 
     return success([
+      ...(retired.switchNote === null ? [] : [retired.switchNote]),
+      ...(retired.secretNote === null ? [] : [retired.secretNote]),
       `релей привязан: ${url} (${health.detail})`,
       tokenNote,
       scope.note,
@@ -688,6 +794,8 @@ export function createRemoteCommands({
       });
 
       const scope = planConnectScope(scopeAnswer, invocation);
+      // 038: прежний канал отключаем ДО записи новой привязки.
+      const retired = await retireActiveChannel("telegram");
       try {
         store.update((state) => {
           state.bindings = {
@@ -696,6 +804,7 @@ export function createRemoteCommands({
             userId: match.userId,
             botUsername,
             createdAt: now(),
+            ...(retired.previous !== null && retired.previous !== "telegram" ? { previousTransport: retired.previous } : {}),
           };
           if (scope.plan?.kind === "global") state.enabled.global = true;
           if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
@@ -742,6 +851,8 @@ export function createRemoteCommands({
       }
 
       return success([
+        ...(retired.switchNote === null ? [] : [retired.switchNote]),
+        ...(retired.secretNote === null ? [] : [retired.secretNote]),
         `бот @${botUsername} привязан (чат ${match.chatId}, человек ${match.userId})`,
         tokenNote,
         scopeNote,
@@ -829,6 +940,10 @@ export function createRemoteCommands({
           : `e2e: включён (keyId ${e2e.keyId}, alg ${e2e.alg}) — тело вопроса и варианты шифруются`);
       } else {
         lines.push(`бот: @${state.bindings.botUsername ?? "?"} (${state.bindings.transport}), чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
+      }
+      // 038: история переключения — какой канал был активным до текущего.
+      if (typeof state.bindings.previousTransport === "string" && state.bindings.previousTransport !== "") {
+        lines.push(`прежний канал: ${transportLabel(state.bindings.previousTransport)} (отключён)`);
       }
     }
 
@@ -1164,6 +1279,12 @@ export function createRemoteCommands({
     });
     if (!/^Да/i.test(confirm.selected[0] ?? "")) return success("отключение отменено");
 
+    // 038: чистим токен АКТИВНОГО канала, а не всегда Telegram.
+    const activeTransport = (() => {
+      const state = store.read();
+      const binding = state?.bindings ?? null;
+      return typeof binding?.transport === "string" ? binding.transport : "telegram";
+    })();
     try {
       store.setBinding(null);
       store.setEnabled({ kind: "global" }, false);
@@ -1176,14 +1297,15 @@ export function createRemoteCommands({
       return failure(`не удалось очистить привязку: ${humanError(error)}`);
     }
 
-    const described = await credentials.describe(TELEGRAM_TOKEN_REF);
-    let secretNote = `секрет ${TELEGRAM_TOKEN_REF} оставлен`;
+    const activeRef = tokenRefFor(activeTransport);
+    const described = await credentials.describe(activeRef);
+    let secretNote = `секрет ${activeRef} оставлен`;
     if (described.present && described.writable) {
-      secretNote = (await credentials.unset(TELEGRAM_TOKEN_REF))
-        ? `секрет ${TELEGRAM_TOKEN_REF} удалён`
-        : `секрет ${TELEGRAM_TOKEN_REF} удалить не удалось — удалите вручную`;
+      secretNote = (await credentials.unset(activeRef))
+        ? `секрет ${activeRef} удалён`
+        : `секрет ${activeRef} удалить не удалось — удалите вручную`;
     } else if (described.present) {
-      secretNote = `секрет ${TELEGRAM_TOKEN_REF} из окружения — удалите переменную сами`;
+      secretNote = `секрет ${activeRef} из окружения — удалите переменную сами`;
     }
 
     const transport = ctx?.get?.("remoteTransport") ?? null;
@@ -1224,7 +1346,10 @@ export function createRemoteCommands({
       }
     }
 
-    return success(`привязка удалена, режим выключен\n${secretNote}`);
+    return success([
+      `привязка (${transportLabel(activeTransport)}) удалена, режим выключен`,
+      secretNote,
+    ].join("\n"));
   }
 
   /** Обработчик `/remote`: разбор и диспетчеризация. */
