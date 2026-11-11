@@ -24,6 +24,7 @@ import { DEFAULT_CAPS } from "../transport/base.js";
 import { TELEGRAM_TOKEN_REF, createRemoteCommands } from "../commands.js";
 import { createCredentialAccess, createStore } from "../store.js";
 import { createTelegramTransport } from "../transport/telegram.js";
+import { RELAY_TOKEN_REF, createRelayTransport } from "../transport/relay.js";
 import { answererFeature } from "./answerer.js";
 
 /** Имя сервиса транспорта: то же, что ждёт фича answerer в своих `needs`. */
@@ -139,14 +140,63 @@ function createTransportFacade() {
  * изменились: после `/remote disconnect` + `/remote connect` старый поллер с
  * прежним токеном не должен продолжать работать.
  */
-async function ensureTransport(ctx, store, deps, facade, isDisposed = () => false) {
+async function ensureTransport(ctx, store, deps, facade, isDisposed = () => false, config = null) {
   const log = (message) => deps.logger.debug(message);
   const binding = store.read().bindings;
+
+  // 038: привязка на релей — канал создаём здесь же, чтобы `/remote connect relay`
+  // переключал публикацию сразу, а не только после перезагрузки профиля.
+  if (binding !== null && binding.transport === "relay") {
+    const credentials = createCredentialAccess(ctx, { log });
+    const relaySettings = config?.relay !== null && typeof config?.relay === "object" ? config.relay : {};
+    const tokenRef = typeof relaySettings.tokenRef === "string" && relaySettings.tokenRef !== "" ? relaySettings.tokenRef : RELAY_TOKEN_REF;
+    const token = await credentials.resolve(tokenRef);
+    if (isDisposed()) {
+      await facade.stop();
+      return null;
+    }
+    if (token === null) {
+      deps.logger.warn(`фича commands: привязка на релей, а секрета ${tokenRef} нет — канал не поднят`);
+      return null;
+    }
+    const key = `relay|${binding.url ?? ""}|${token}`;
+    const currentRelay = facade.current;
+    if (currentRelay !== null && currentRelay.__bindingKey === key) return currentRelay;
+    if (currentRelay !== null) await facade.stop();
+    let relayTransport;
+    try {
+      relayTransport = createRelayTransport({
+        url: binding.url,
+        agentToken: token,
+        fetch: relaySettings.fetch,
+        wsFactory: relaySettings.wsFactory,
+        log: (message) => deps.logger.debug(message),
+      });
+    } catch (error) {
+      deps.logger.warn(`фича commands: транспорт релея не создан (${error?.message ?? error})`);
+      return null;
+    }
+    relayTransport.__bindingKey = key;
+    facade.set(relayTransport);
+    try {
+      await relayTransport.start();
+    } catch (error) {
+      deps.logger.warn(`фича commands: канал релея не стартовал (${error?.message ?? error})`);
+    }
+    deps.logger.info("фича commands: канал релея поднят из сохранённой привязки");
+    return relayTransport;
+  }
 
   if (binding === null || binding.transport !== "telegram") {
     // Канал из config.telegram (004) мы не создавали — его не гасим: без привязки
     // в состоянии он и есть рабочий канал.
     const adopted = facade.current;
+    const boundId = typeof binding?.transport === "string" ? binding.transport : null;
+    if (boundId !== null) {
+      // 038: привязка на другой транспорт (relay/max) — config-канал не активен.
+      if (adopted !== null && adopted.id === boundId) return adopted;
+      return null;
+    }
     if (adopted !== null && adopted.__bindingKey === undefined) return adopted;
     if (adopted !== null) await facade.stop();
     return null;
@@ -260,7 +310,7 @@ export const commandsFeature = {
     /** Стартовый подъём канала: ответчика применит каркас (порядок фич). */
     const ensureAtStart = async () => {
       if (disposed) return null;
-      const transport = await ensureTransport(ctx, store, deps, facade, () => disposed);
+      const transport = await ensureTransport(ctx, store, deps, facade, () => disposed, config);
       if (disposed) {
         await facade.stop();
         return null;
