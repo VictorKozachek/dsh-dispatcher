@@ -35,6 +35,7 @@ import {
   serializeReport,
 } from "./doctor.js";
 import { RELAY_TOKEN_REF } from "./transport/relay.js";
+import { MAX_API_BASE, maxMe, maxPollForCode } from "./transport/max.js";
 import { createAudit } from "./audit.js";
 import { DEFAULT_KEEP, vacuum } from "./rotate.js";
 import { formatStats } from "./metrics.js";
@@ -199,31 +200,53 @@ export async function runDoctorChecks({
   );
 
   // --- токен ---------------------------------------------------------------
+  // 039: проверяем секрет АКТИВНОГО канала (MAX живёт по своему токену).
+  const binding = typeof store?.read === "function" ? store.read()?.bindings ?? null : null;
+  const activeTransport = typeof binding?.transport === "string" ? binding.transport : "telegram";
+  const tokenRef = tokenRefFor(activeTransport);
   let token = null;
   const access = credentials;
   if (access === null || typeof access?.availableFor !== "function") {
     add("fail", "токен", "ctx.credentials недоступен", "задайте секрет или токен в окружении");
-  } else if (!access.availableFor(TELEGRAM_TOKEN_REF)) {
-    add("fail", "токен", `нет ссылки ${TELEGRAM_TOKEN_REF}`, "получите токен у @BotFather и выполните /remote connect");
+  } else if (!access.availableFor(tokenRef)) {
+    add("fail", "токен", `нет ссылки ${tokenRef}`, "получите токен у бота и выполните /remote connect");
   } else {
     try {
-      token = await access.resolve(TELEGRAM_TOKEN_REF);
+      token = await access.resolve(tokenRef);
     } catch {
       token = null;
     }
     if (typeof token !== "string" || token === "") {
-      add("fail", "токен", `${TELEGRAM_TOKEN_REF} не разрешился`, "проверьте секрет: /remote connect");
+      add("fail", "токен", `${tokenRef} не разрешился`, "проверьте секрет: /remote connect");
       token = null;
     } else {
-      const info = typeof access.describe === "function" ? await access.describe(TELEGRAM_TOKEN_REF).catch(() => null) : null;
+      const info = typeof access.describe === "function" ? await access.describe(tokenRef).catch(() => null) : null;
       const source = typeof info?.source === "string" ? info.source : "unknown";
       const readonly = info?.writable === false ? ", только чтение" : "";
-      add("ok", "токен", `${TELEGRAM_TOKEN_REF} найден (источник: ${source}${readonly})`);
+      add("ok", "токен", `${tokenRef} найден (источник: ${source}${readonly})`);
+    }
+  }
+
+  // --- MAX: живость канала и marker (039) -----------------------------------
+  if (transport?.id === "max") {
+    let health = null;
+    try {
+      health = await transport.healthCheck?.();
+    } catch (error) {
+      add("fail", "канал", `MAX: healthCheck упал: ${humanError(error, token)}`, "проверьте сеть и токен MAX; webhook требует HTTPS:443 — используйте long polling");
+    }
+    if (health !== null) {
+      add(
+        health?.ok === true ? "ok" : "fail",
+        "канал",
+        `MAX: ${health?.detail ?? "?"}; marker ${transport.marker ?? "?"}; polling ${transport.polling === true ? "да" : "нет"}`,
+        health?.ok === true ? undefined : "проверьте токен MAX и сеть; webhook требует публичного HTTPS:443 — используйте long polling",
+      );
     }
   }
 
   // --- getMe ---------------------------------------------------------------
-  if (token !== null && typeof telegramCallImpl === "function") {
+  if (activeTransport === "telegram" && token !== null && typeof telegramCallImpl === "function") {
     try {
       const me = await telegramCallImpl(token, "getMe", {});
       const username = me?.result?.username ?? me?.username ?? null;
@@ -236,7 +259,7 @@ export async function runDoctorChecks({
     } catch (error) {
       add("fail", "getMe", `Telegram не ответил: ${humanError(error, token)}`, "проверьте сеть и токен; токен можно перевыпустить у @BotFather");
     }
-  } else if (token !== null) {
+  } else if (activeTransport === "telegram" && token !== null) {
     add("warn", "getMe", "проверка вне плагина недоступна");
   }
 
@@ -388,6 +411,7 @@ export function createRemoteCommands({
   random = Math.random,
   fetch: fetchImpl = globalThis.fetch,
   baseUrl = TELEGRAM_API_BASE,
+  maxApiBase = MAX_API_BASE,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   pairingTtlMs = PAIRING_TTL_MS,
   ensureTransport = null,
@@ -753,6 +777,113 @@ export function createRemoteCommands({
     return { ok: body?.ok === true, detail: `relay ${body?.version ?? "?"}` };
   }
 
+  /**
+   * `/remote connect` → MAX (039): токен → `GET /me` → pairing-код через
+   * `GET /updates` → привязка (и отключение прежнего канала, правило 038).
+   */
+  async function connectMax(invocation) {
+    const tokenAnswer = await askStep(invocation, {
+      id: "remote-connect-max-token",
+      question: "Токен бота MAX (business.max.ru/self → «Чат-боты» → ⋮ → «Настройки») — "
+        + `сохраним как ${MAX_TOKEN_REF}. В ответе «Другой ответ».`,
+    });
+    const token = String(tokenAnswer.custom ?? "").trim();
+    if (token === "") return failure("токен MAX не получен — привязка отменена");
+
+    let me;
+    try {
+      me = await maxMe({ token, apiBase: maxApiBase, fetch: fetchImpl });
+    } catch (error) {
+      return failure(`MAX не принял токен: ${humanError(error, token)}`);
+    }
+    const botName = typeof me?.name === "string" && me.name !== "" ? me.name : "MAX-бот";
+
+    const code = pairingCode(random);
+    const deadline = now() + pairingTtlMs;
+    await askStep(invocation, {
+      id: "remote-connect-max-send-code",
+      question: `Откройте бота «${botName}» в MAX и отправьте ему код ${code} в течение 10 минут `
+        + "(бот MAX заводится только на юрлицо/ИП/самозанятого РФ). Отправили? Нажмите «Отправил».",
+      options: ["Отправил"],
+    });
+
+    let match;
+    try {
+      match = await maxPollForCode({
+        token,
+        code,
+        deadline,
+        apiBase: maxApiBase,
+        fetch: fetchImpl,
+        now,
+        sleep,
+        signal: invocation?.signal,
+        log,
+      });
+    } catch (error) {
+      return failure(`не удалось получить код из MAX: ${humanError(error, token)}`);
+    }
+    if (match === null) {
+      return failure(`код ${code} не пришёл боту MAX за 10 минут — привязки нет, повторите /remote connect`);
+    }
+
+    const scopeAnswer = await askStep(invocation, {
+      id: "remote-connect-scope",
+      question: "Включить удалённый режим?",
+      options: ["Только этот проект", "Все проекты", "Пока не включать"],
+    });
+    const scope = planConnectScope(scopeAnswer, invocation);
+    // 038: прежний канал отключаем ДО записи новой привязки.
+    const retired = await retireActiveChannel("max");
+    try {
+      store.update((state) => {
+        state.bindings = {
+          transport: "max",
+          chatId: match.chatId,
+          userId: match.userId,
+          botUsername: botName,
+          ...(match.marker === null || match.marker === undefined ? {} : { marker: match.marker }),
+          createdAt: now(),
+          ...(retired.previous !== null && retired.previous !== "max" ? { previousTransport: retired.previous } : {}),
+        };
+        if (scope.plan?.kind === "global") state.enabled.global = true;
+        if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
+        return state;
+      });
+    } catch (error) {
+      return failure(`привязка не сохранена: ${humanError(error, token)}`);
+    }
+
+    const saved = await credentials.set(MAX_TOKEN_REF, token);
+    const tokenNote = saved
+      ? `токен сохранён как ${MAX_TOKEN_REF}`
+      : credentials.available
+        ? `токен не сохранён: источник ${MAX_TOKEN_REF} только для чтения`
+        : `токен взят из окружения (${MAX_TOKEN_REF}) и не сохранён`;
+
+    let channelNote = "канал поднимется при следующей загрузке профиля (или после /remote on)";
+    if (typeof ensureTransport === "function") {
+      try {
+        const started = await ensureTransport();
+        channelNote = started === null
+          ? "привязка сохранена, но канал не поднят: проверьте /remote status"
+          : "канал поднят: вопросы уходят в MAX";
+      } catch (error) {
+        log(`ensureTransport после привязки MAX: ${humanError(error, token)}`);
+        channelNote = "канал не поднялся — проверьте /remote status";
+      }
+    }
+
+    return success([
+      ...(retired.switchNote === null ? [] : [retired.switchNote]),
+      ...(retired.secretNote === null ? [] : [retired.secretNote]),
+      `бот MAX «${botName}» привязан (чат ${match.chatId}, человек ${match.userId})`,
+      tokenNote,
+      scope.note,
+      channelNote,
+    ].join("\n"));
+  }
+
   async function connect(invocation) {
     // Шаги connect спрашиваются локальными вопросами. Если удалённый режим уже
     // включён, ответчик перехватит их и отправит в мессенджер — в том числе
@@ -773,10 +904,10 @@ export function createRemoteCommands({
       const choice = await askStep(invocation, {
         id: "remote-connect-transport",
         question: "Какой транспорт подключить?",
-        options: ["Telegram", "Relay (свой сервер)", "MAX (пока недоступен)"],
+        options: ["Telegram", "Relay (свой сервер)", "MAX"],
       });
       if (choice.selected[0]?.startsWith("MAX") === true) {
-        return failure("MAX пока не поддерживается (фаза 2) — выберите Telegram или Relay");
+        return await connectMax(invocation);
       }
       if (choice.selected[0]?.startsWith("Relay") === true) {
         return await connectRelay(invocation);
@@ -966,6 +1097,14 @@ export function createRemoteCommands({
         lines.push(e2e === null
           ? "e2e: выключен — тело вопроса и варианты идут открытым текстом"
           : `e2e: включён (keyId ${e2e.keyId}, alg ${e2e.alg}) — тело вопроса и варианты шифруются`);
+      } else if (state.bindings.transport === "max") {
+        const live = liveTransport();
+        const marker = Number.isFinite(live?.marker) ? live.marker : Number.isFinite(state.bindings.marker) ? state.bindings.marker : null;
+        const lastError = live?.lastError ?? null;
+        lines.push(`бот MAX: «${state.bindings.botUsername ?? "?"}», чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
+        lines.push(`max: long polling ${live?.polling === true ? "работает" : "не запущен"}, marker ${marker ?? "?"}`
+          + `${lastError === null ? "" : `, последняя ошибка: ${humanError(lastError)}`}`);
+        lines.push("max: webhook недоступен без публичного HTTPS:443 — используется long polling");
       } else {
         lines.push(`бот: @${state.bindings.botUsername ?? "?"} (${state.bindings.transport}), чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
       }
