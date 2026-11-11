@@ -376,15 +376,26 @@ export function credentialRef(name) {
  * видно в `status`.
  */
 export function createCredentialAccess(ctx, { log = () => {}, env = process.env } = {}) {
-  const service = ctx?.get?.("credentials") ?? null;
-  const has = (method) => typeof service?.[method] === "function";
+  // Сервис ищется ЛЕНИВО, на каждое обращение: cordis монтирует ряды по графу
+  // зависимостей, и `credentials` может появиться уже после того, как плагин
+  // стартовал. Живой сбой: сервис в профиле есть, а `ctx.get("credentials")` в
+  // момент apply вернул null — и плагин навсегда решил, что секретов нет.
+  const serviceOf = () => {
+    try {
+      return ctx?.get?.("credentials") ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const has = (method) => typeof serviceOf()?.[method] === "function";
 
   /** Значение из окружения (fallback, только чтение). */
   const fromEnv = (ref) => (typeof env?.[ref] === "string" && env[ref] !== "" ? env[ref] : null);
 
   /** Вызов сервиса: любой отказ — null и строка в лог, без исключения. */
   async function settle(method, ...args) {
-    if (!has(method)) return null;
+    const service = serviceOf();
+    if (typeof service?.[method] !== "function") return null;
     try {
       return await service[method](...args);
     } catch (error) {
@@ -426,7 +437,8 @@ export function createCredentialAccess(ctx, { log = () => {}, env = process.env 
     },
     /** Записать секрет. Успех — отсутствие исключения: сервис возвращает void. */
     async set(ref, value) {
-      if (!has("set")) return false;
+      const service = serviceOf();
+      if (typeof service?.set !== "function") return false;
       try {
         await service.set(ref, value);
         return true;
@@ -437,7 +449,8 @@ export function createCredentialAccess(ctx, { log = () => {}, env = process.env 
     },
     /** Удалить секрет (не бросает: у env-источника записи нет). */
     async unset(ref) {
-      if (!has("unset")) return false;
+      const service = serviceOf();
+      if (typeof service?.unset !== "function") return false;
       try {
         await service.unset(ref);
         return true;

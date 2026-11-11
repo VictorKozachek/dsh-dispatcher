@@ -277,4 +277,14 @@ export async function apply(ctx, config = {}) {
   // Одна строка «что поднялось» — по ней видно, дошёл ли плагин до фич и какие
   // из них пропущены из-за отсутствующих сервисов.
   recordBootTrace(logger, `features запущено ${started}/${registry.length}: ${report.join(", ")}`);
+
+  // Контрольная точка через 3 секунды: видно, появились ли сервисы ПОСЛЕ старта
+  // плагина (cordis монтирует ряды по графу зависимостей, порядок не гарантирован).
+  // Отсюда же видно, работает ли ленивый поиск секретов и вопросов.
+  const probe = setTimeout(() => {
+    const names = ["credentials", "commands", "userQuestions", "sessions", "sessionController"];
+    const seen = names.map((name) => `${name}=${deps.get(name) === null ? "нет" : "есть"}`).join(" ");
+    recordBootTrace(logger, `services через 3с: ${seen}`);
+  }, 3000);
+  probe.unref?.();
 }
