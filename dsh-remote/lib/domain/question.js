@@ -284,5 +284,13 @@ export function createQuestion(item, context = {}) {
 
 /** Вопросы запроса одной пачкой: один контекст на всю пачку. */
 export function createQuestions(items, context = {}) {
-  return (Array.isArray(items) ? items : []).map((item) => createQuestion(item, context));
+  const list = Array.isArray(items) ? items : [];
+  // Номер и всего вопросов — для шапки сообщения («вопрос 2/2»): в мессенджере
+  // пачка выглядит как несколько сообщений, и человек должен видеть, сколько их.
+  return list.map((item, index) => {
+    const question = createQuestion(item, context);
+    question.index = index + 1;
+    question.total = list.length;
+    return question;
+  });
 }

@@ -28,6 +28,9 @@ import { DEFAULT_CAPS } from "./transport/base.js";
 /** Кнопка свободного ответа: переключает вопрос в режим ожидания текста. */
 export const FREE_TEXT_LABEL = "Другой ответ…";
 
+/** Подсказка под вопросом без вариантов: как ответить из мессенджера. */
+export const FREE_TEXT_HINT = "↩︎ Ответьте текстом на это сообщение.";
+
 /** Кнопка «вариантов больше, чем влезает» — раскрывает остальные. */
 export const MORE_LABEL = "Показать ещё";
 
@@ -245,6 +248,10 @@ export function renderHeader(context = {}) {
   if (taskId !== "") segments.push(`task ${taskId}`);
   const role = typeof context.role === "string" && context.role !== "" ? truncate(context.role, WORKSPACE_LIMIT) : null;
   if (role !== null) segments.push(role);
+  // Номер вопроса в пачке: в мессенджере вопросы идут отдельными сообщениями.
+  const index = Number.isFinite(context.index) ? context.index : null;
+  const total = Number.isFinite(context.total) ? context.total : null;
+  if (index !== null && total !== null && total > 1) segments.push(`вопрос ${index}/${total}`);
   segments.push(renderClock(now, expiresAt));
 
   return `▸ ${segments.join(" · ")}`;
@@ -265,6 +272,8 @@ export function renderBody(question = {}, caps = {}) {
     workspace: cwd === null ? null : path.basename(cwd),
     taskId: question.taskId ?? null,
     role: question.role ?? null,
+    index: question.index ?? null,
+    total: question.total ?? null,
     now,
     expiresAt: question.expiresAt ?? null,
   });
@@ -279,6 +288,11 @@ export function renderBody(question = {}, caps = {}) {
   parts.push(rawBody.trim() !== "" || title !== "" || detail !== "" ? rawBody : "(пустой вопрос)");
   if (detail !== "") parts.push("", detail);
   if (question.multiSelect === true) parts.push("", MULTISELECT_HINT);
+  // Вопрос без вариантов: в мессенджере нет «поля ввода», поэтому прямо говорим,
+  // как ответить, и транспорт дополнительно включает force_reply (клавиатура
+  // сразу открывается с подсказкой).
+  const hasOptions = Array.isArray(question.options) && question.options.length > 0;
+  if (!hasOptions && question.allowFreeText !== false) parts.push("", FREE_TEXT_HINT);
   return truncate(parts.join("\n"), maxText, TRUNCATION_MARKER);
 }
 

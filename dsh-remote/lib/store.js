@@ -58,12 +58,19 @@ export class StateSchemaError extends Error {
 const DEFAULT_FILE_NAME = "state.json";
 const LOCK_FILE_NAME = "lock";
 
-/** Куда писать состояние: явный путь из env главнее домашнего каталога. */
+/**
+ * Куда писать состояние.
+ *
+ * Приоритет: явный `DSH_REMOTE_STATE` → `DSH_HOME` → `~/.dsh`. `DSH_HOME` важен и
+ * для тестов, и для alt-профилей: без него тесты читали живое состояние
+ * пользователя и поднимали настоящий поллер бота (сбой в приёмке 2026-11-11).
+ */
 export function statePaths({ env = process.env, home = os.homedir() } = {}) {
   const override = typeof env?.DSH_REMOTE_STATE === "string" && env.DSH_REMOTE_STATE !== ""
     ? env.DSH_REMOTE_STATE
     : null;
-  const file = override ?? path.join(home, ".dsh", "remote-control", DEFAULT_FILE_NAME);
+  const dshHome = typeof env?.DSH_HOME === "string" && env.DSH_HOME !== "" ? env.DSH_HOME : null;
+  const file = override ?? path.join(dshHome ?? path.join(home, ".dsh"), "remote-control", DEFAULT_FILE_NAME);
   const dir = path.dirname(file);
   return { file, dir, lock: path.join(dir, LOCK_FILE_NAME) };
 }

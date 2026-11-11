@@ -238,7 +238,9 @@ export const commandsFeature = {
     trace("commands:сервисы provide");
     const existing = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
     const facade = existing?.__isTransportFacade === true ? existing : createTransportFacade();
-    if (existing !== null && existing !== facade) facade.set(existing);
+    /** Чужой транспорт (из config или тестов): его нельзя терять при старте. */
+    const foreign = existing !== null && existing !== facade ? existing : null;
+    if (foreign !== null) facade.set(foreign);
     deps.expose?.(TRANSPORT_SERVICE, facade);
     if (existing === null || existing !== facade) {
       try {
@@ -299,6 +301,11 @@ export const commandsFeature = {
     // фичи ответчика, — её `needs` уже будут выполнены.
     trace("commands:ensureAtStart");
     const transport = await ensureAtStart();
+    // Чужой транспорт мог быть снят внутри ensureTransport (например, при
+    // отсутствии привязки он решает «канала нет»). Но если он был в контексте —
+    // это рабочий канал (config.telegram или тестовый), возвращаем его на место.
+    if (facade.current === null && foreign !== null) facade.set(foreign);
+    trace(`commands:чужой транспорт ${foreign === null ? "не было" : facade.current === foreign ? "на месте" : "не удержан"}`);
     trace(`commands:ensureAtStart готов (${transport === null ? "канала нет" : transport.id ?? "канал"})`);
     if (transport !== null) answererReady = true;
 

@@ -57,7 +57,16 @@ run() {
   fi
 }
 
-plugin_tests() { "$NODE" --test dsh-remote/test/*.spec.js; }
+plugin_tests() {
+  # Изоляция от живого ~/.dsh: подменяем DSH_HOME на временный каталог, иначе
+  # тесты видят настоящую привязку бота и поднимают второй поллер.
+  local home
+  home="$(mktemp -d "${TMPDIR:-/tmp}/dsh-remote-ci.XXXXXX")"
+  DSH_HOME="$home" "$NODE" --test dsh-remote/test/*.spec.js
+  local status=$?
+  rm -rf "$home"
+  return $status
+}
 
 scripts_syntax() {
   local file

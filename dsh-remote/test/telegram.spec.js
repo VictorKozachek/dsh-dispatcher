@@ -952,3 +952,24 @@ test("фича telegram: config + токен в окружении без ctx.cr
   assert.equal(entry.service.polling, true);
   await entry.service.stop();
 });
+
+test("вопрос без вариантов: force_reply — клавиатура открывается сама", async (t) => {
+  const { transport, calls } = setup();
+  t.after(() => transport.stop());
+
+  await transport.sendQuestion({ shortId: "a1b2c3d4", body: "Напиши слово", options: [], allowFreeText: true });
+
+  const send = calls.find((call) => call.method === "sendMessage");
+  assert.deepEqual(
+    send.payload.reply_markup,
+    { force_reply: true, input_field_placeholder: "Ответьте текстом…", selective: true },
+    "вместо кнопок — запрос ввода",
+  );
+  assert.equal(send.payload.reply_markup.inline_keyboard, undefined, "клавиатуры вариантов нет");
+
+  // Вопрос с вариантами — по-прежнему кнопки, без force_reply.
+  await transport.sendQuestion({ shortId: "b1b2c3d4", body: "Выбери", options: [{ id: "o1", label: "Да" }] });
+  const withButtons = calls.filter((call) => call.method === "sendMessage").at(-1);
+  assert.ok(withButtons.payload.reply_markup.inline_keyboard.length > 0, "варианты — кнопками");
+  assert.equal(withButtons.payload.reply_markup.force_reply, undefined, "force_reply только для свободного ответа");
+});
