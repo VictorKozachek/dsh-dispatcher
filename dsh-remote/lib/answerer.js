@@ -358,7 +358,18 @@ export function createAnswerer({
   }
 
   function onTransportAnswer(event, sourceTransport = null) {
-    const normalized = normalizeAnswerEvent(event);
+    let incoming = event;
+    // 037: свободный текст без reply. Транспорт обычно проставляет shortId
+    // (force_reply), но если при одном открытом вопросе его нет — роутинг
+    // однозначен: ответ адресован этому вопросу, иначе человек ждёт вечно.
+    if (event !== null && typeof event === "object"
+      && (typeof event.shortId !== "string" || event.shortId === "")
+      && pending.size === 1) {
+      const only = pending.keys().next().value;
+      incoming = { ...event, shortId: only };
+      log(`ответ транспорта без shortId: единственный открытый вопрос ${only} — принимаю`);
+    }
+    const normalized = normalizeAnswerEvent(incoming);
     if (normalized === null) {
       log("ответ транспорта: событие без shortId — игнор");
       return;
@@ -535,18 +546,20 @@ export function createAnswerer({
     /** Ответы, которыми TTL закрыл вопрос (empty/default-first). */
     const expiredAnswers = new Map();
 
-    // Ожидание ответа: по промису на вопрос, ключ — короткий id для кнопок.
-    // `catch`-заглушка вешается сразу: если вопрос снимают (аборт, ошибка
-    // отправки), промис остаётся неразрешённым, но не должен шуметь как
-    // необработанный отказ.
-    const waiting = [];
-    for (const question of questions) {
+    /**
+     * 037: регистрируем ожидание ровно в момент публикации вопроса. Раньше
+     * pending/markOpen/TTL создавались для всей пачки сразу — второй вопрос
+     * висел «открытым» и под TTL до отправки, а его ответ мог разрешиться
+     * раньше времени. Теперь вызывается по одному вопросу в цикле публикации.
+     */
+    function registerWaiting(question) {
       question.markOpen(now());
+      // `catch`-заглушка: если вопрос снимают (аборт, ошибка отправки), промис
+      // остаётся неразрешённым, но не должен шуметь как необработанный отказ.
       const waited = new Promise((resolve, reject) => {
         pending.set(question.shortId, { question, resolve, reject, signal: request?.signal ?? null });
       });
       waited.catch(() => {});
-      waiting.push(waited);
 
       // TTL-сторож (008): по истечении вопрос получает исход из конфига. Abort
       // отклоняет ожидание (DSH получит ASK_ABORTED), empty/default-first
@@ -571,6 +584,7 @@ export function createAnswerer({
           entry.resolve(question);
         },
       });
+      return waited;
     }
 
     // Аборт слушаем ДО отправки: иначе аборт во время sendQuestion оставил бы
@@ -620,6 +634,13 @@ export function createAnswerer({
      * вопрос сразу после его отправки. Ответ на предыдущий вопрос к этому
      * моменту уже получен, а гибрид для ещё не отправленного вопроса не тикает.
      */
+    /** Снять таймеры, ожидания и TTL-сторожа пачки (успех, GUI, аборт, сбой). */
+    function cleanupBatch() {
+      cleanupHybrid();
+      for (const question of questions) pending.delete(question.shortId);
+      reliability?.unwatch?.(questions.map((question) => question.shortId));
+    }
+
     function armHybrid(question) {
       if (hybridState.enabled !== true) return;
       const timer = setTimeoutImpl(() => {
@@ -658,11 +679,13 @@ export function createAnswerer({
         for (let index = 0; index < questions.length; index += 1) {
           const question = questions[index];
           attempted.add(question);
+          const waited = registerWaiting(question);
           if (useBroker) {
             const publication = await Promise.race([publishAll(question, request?.signal, channelFor), aborted]);
             if (!publication.anyDelivered) {
               // Ни один канал не принял вопрос — он достаётся GUI, как в 008.
               log(`вопрос ${question.shortId}: ни один канал не доставил — отдаю GUI (next)`);
+              cleanupBatch();
               await closeQuestions(questions, "undelivered", attempted);
               return next();
             }
@@ -694,6 +717,7 @@ export function createAnswerer({
               }
               // Недоставка за отведённое время: вопрос достаётся GUI, сессия не висит.
               log(`вопрос ${question.shortId}: не доставлен — отдаю GUI (next)`);
+              cleanupBatch();
               await closeQuestions(questions, "undelivered", attempted);
               return next();
             }
@@ -706,8 +730,10 @@ export function createAnswerer({
 
           // 037: дождались ответа на текущий — только теперь публикуем следующий.
           armHybrid(question);
-          const answered = await Promise.race([waiting[index], aborted, guiRace]);
+          const answered = await Promise.race([waited, aborted, guiRace]);
           if (answered === HYBRID_GUI || guiRequested) {
+            // pending оставляем: поздний ответ из мессенджера должен уйти
+            // steer-ом, а не потеряться (как и до 037); снимаем только таймеры.
             cleanupHybrid();
             return next();
           }
@@ -719,6 +745,7 @@ export function createAnswerer({
           } catch {
             /* метрики не должны ронять аборт */
           }
+          cleanupBatch();
           await closeQuestions(questions, "aborted", attempted);
           throw error;
         }
@@ -728,6 +755,7 @@ export function createAnswerer({
         } catch {
           /* метрики не должны ронять отправку */
         }
+        cleanupBatch();
         await closeQuestions(questions, "send-failed", attempted);
         return next();
       }
@@ -741,9 +769,7 @@ export function createAnswerer({
       }
     }
 
-    cleanupHybrid();
-    for (const question of questions) pending.delete(question.shortId);
-    reliability?.unwatch?.(questions.map((question) => question.shortId));
+    cleanupBatch();
     log(`вопросов ${questions.length}: ответ получен (${decision.scope})`);
     return {
       answers: questions.map((question) => expiredAnswers.get(question.shortId) ?? question.toAnswer()),
@@ -874,5 +900,5 @@ export function createAnswerer({
     return cancelled;
   }
 
-  return { attach, handler, dispose, stats, cancelChannel };
+  return { attach, handler, dispose, stats, cancelChannel, pending, known };
 }

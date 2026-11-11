@@ -265,7 +265,13 @@ test("аборт во время sendQuestion: не ждём отправку, �
   };
   const ctx = fakeContext();
   const registry = createRegistry({ readState: () => ({ global: true }) });
-  const answerer = createAnswerer({ transport, registry, now: () => 1_000 });
+  const watched = [];
+  const unwatched = [];
+  const reliability = {
+    watch: (question) => { watched.push(question.questionId); },
+    unwatch: (ids) => { unwatched.push(...(Array.isArray(ids) ? ids : [ids])); },
+  };
+  const answerer = createAnswerer({ transport, registry, reliability, now: () => 1_000 });
   answerer.attach(ctx);
 
   const controller = new AbortController();
@@ -276,6 +282,8 @@ test("аборт во время sendQuestion: не ждём отправку, �
   }, () => assert.fail("next() не должен вызываться"));
   await tick();
   assert.equal(sent.length, 1, "037: второй вопрос не публикуется до ответа на первый");
+  assert.deepEqual(watched, ["q1"], "TTL-сторож только у опубликованного вопроса");
+  assert.equal(answerer.pending.size, 1, "pending только у опубликованного");
 
   controller.abort();
 
@@ -283,6 +291,9 @@ test("аборт во время sendQuestion: не ждём отправку, �
   assert.equal(closed.length, 1, "закрыт уже опубликованный вопрос");
   assert.deepEqual(closed.map((item) => item.question.questionId), ["q1"]);
   assert.equal(sent[0].status, QUESTION_STATUS.cancelled);
+  assert.equal(answerer.pending.size, 0, "после аборта висящих ожиданий нет");
+  assert.deepEqual(watched, ["q1"], "неопубликованный вопрос не попал под TTL");
+  assert.equal(unwatched.length >= 1, true, "сторож снят");
 });
 
 test("два вопроса в одном запросе задаются последовательно и не путаются", async () => {
@@ -662,4 +673,92 @@ test("037: аборт после ответа на первый снимает �
   const closedIds = transport.closed.map((entry) => entry.question.questionId);
   assert.ok(closedIds.includes("q2"), "опубликованный второй закрыт");
   assert.equal(transport.sent[1].status, QUESTION_STATUS.cancelled);
+});
+
+test("037: TTL второго вопроса не тикает до его публикации", async () => {
+  const { ctx, transport, answerer } = setup();
+  // Пересоздаём ответчик с наблюдаемой устойчивостью: нужен факт watch().
+  const watched = [];
+  const watchedAnswerer = (await import("../lib/answerer.js")).createAnswerer({
+    transport,
+    registry: createRegistry({ readState: () => ({ global: true }) }),
+    reliability: { watch: (question) => watched.push(question.questionId), unwatch: () => {} },
+    now: () => 1_000,
+  });
+  watchedAnswerer.attach(ctx);
+  void answerer;
+
+  const pending = runWaterfall(ctx, EVENT, request({
+    questions: [item({ id: "q1" }), item({ id: "q2" })],
+  }), () => assert.fail("next()"));
+  await tick();
+  assert.deepEqual(watched, ["q1"], "q2 не под TTL, пока не опубликован");
+  assert.equal(watchedAnswerer.pending.size, 1);
+
+  transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+  await tick();
+  assert.deepEqual(watched, ["q1", "q2"], "q2 под TTL только после публикации");
+  transport.answer({ shortId: transport.sent[1].shortId, optionId: "o1" });
+  await pending;
+});
+
+test("037: ответ по реальному shortId q2 до публикации игнорируется", async () => {
+  const { ctx, transport, answerer } = setup();
+  answerer.attach(ctx);
+  const pending = runWaterfall(ctx, EVENT, request({
+    questions: [item({ id: "q1" }), item({ id: "q2" })],
+  }), () => assert.fail("next()"));
+  await tick();
+  assert.equal(transport.sent.length, 1);
+
+  const q2 = [...answerer.known.values()].find((question) => question.questionId === "q2");
+  assert.ok(q2, "q2 создан и известен");
+  transport.answer({ shortId: q2.shortId, optionId: "o1" });
+  await tick();
+  assert.equal(transport.sent.length, 1, "q2 всё ещё не опубликован");
+  assert.equal(q2.status, QUESTION_STATUS.pending, "ответ по q2 до публикации не принят");
+  assert.equal(q2.answer, undefined);
+
+  transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+  await tick();
+  assert.equal(transport.sent.length, 2);
+  transport.answer({ shortId: transport.sent[1].shortId, optionId: "o1" });
+  const result = await pending;
+  assert.equal(result.answers.length, 2, "обе части ответа в результате, висящих промисов нет");
+  assert.equal(answerer.pending.size, 0);
+});
+
+test("037: свободный текст без shortId при одном открытом вопросе принимается", async () => {
+  const { ctx, transport, answerer } = setup();
+  answerer.attach(ctx);
+  const pending = runWaterfall(ctx, EVENT, request({
+    questions: [item({ id: "q1", question: "Что дальше?", options: [] })],
+  }), () => assert.fail("next()"));
+
+  await tick();
+  assert.equal(transport.sent.length, 1);
+  // Текст без reply/shortId: открыт ровно один вопрос — это его ответ.
+  transport.answer({ text: "деплой в пятницу" });
+
+  const result = await pending;
+  assert.deepEqual(result.answers, [{ id: "q1", selected: [], custom: "деплой в пятницу" }]);
+});
+
+test("037: свободный текст без shortId после публикации второго вопроса идёт ему", async () => {
+  const { ctx, transport, answerer } = setup();
+  answerer.attach(ctx);
+  const pending = runWaterfall(ctx, EVENT, request({
+    questions: [item({ id: "q1", options: [] }), item({ id: "q2", options: [] })],
+  }), () => assert.fail("next()"));
+  await tick();
+  assert.equal(transport.sent.length, 1);
+
+  // Пока открыт только первый — текст без reply однозначно его.
+  transport.answer({ text: "первому" });
+  await tick();
+  assert.equal(transport.sent.length, 2, "после ответа опубликован второй");
+
+  transport.answer({ text: "второму" });
+  const result = await pending;
+  assert.deepEqual(result.answers.map((answer) => answer.custom), ["первому", "второму"]);
 });
