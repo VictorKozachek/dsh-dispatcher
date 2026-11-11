@@ -300,7 +300,7 @@ export const commandsFeature = {
     // Привязка из прошлого запуска: поднимаем канал до того, как каркас дойдёт до
     // фичи ответчика, — её `needs` уже будут выполнены.
     trace("commands:ensureAtStart");
-    const transport = await ensureAtStart();
+    let transport = await ensureAtStart();
     // Чужой транспорт мог быть снят внутри ensureTransport (например, при
     // отсутствии привязки он решает «канала нет»). Но если он был в контексте —
     // это рабочий канал (config.telegram или тестовый), возвращаем его на место.
@@ -308,6 +308,39 @@ export const commandsFeature = {
     trace(`commands:чужой транспорт ${foreign === null ? "не было" : facade.current === foreign ? "на месте" : "не удержан"}`);
     trace(`commands:ensureAtStart готов (${transport === null ? "канала нет" : transport.id ?? "канал"})`);
     if (transport !== null) answererReady = true;
+
+    // Канал мог не подняться на старте: например, сервис секретов cordis
+    // монтируется позже плагина, и `credentials.resolve` вернул null (живой сбой
+    // 2026-11-11: после перезапуска бот молчал, хотя привязка была в состоянии).
+    // Поэтому пробуем ещё несколько раз с паузой, пока канал не встанет.
+    if (transport === null) {
+      const delays = [1000, 3000, 7000, 15000];
+      let attempt = 0;
+      const retry = async () => {
+        if (disposed || facade.current !== null) return;
+        attempt += 1;
+        trace(`commands:повтор подъёма канала #${attempt}`);
+        try {
+          const started = await ensureAtStart();
+          if (started !== null) {
+            transportRegistry.set(started.id ?? "telegram", started);
+            answererReady = true;
+            trace(`commands:канал поднят повтором #${attempt}`);
+            return;
+          }
+        } catch (error) {
+          deps.logger.warn(`фича commands: повтор подъёма канала не удался (${error?.message ?? error})`);
+        }
+        if (attempt < delays.length) {
+          const timer = setTimeout(() => void retry(), delays[attempt]);
+          timer.unref?.();
+          deps.onDispose(() => clearTimeout(timer), "timers");
+        }
+      };
+      const first = setTimeout(() => void retry(), delays[0]);
+      first.unref?.();
+      deps.onDispose(() => clearTimeout(first), "timers");
+    }
 
     deps.logger.info("фича commands: /remote зарегистрирована");
     // Возвращаем точку подъёма канала: тестам она нужна, чтобы проверить
