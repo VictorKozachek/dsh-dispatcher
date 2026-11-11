@@ -265,7 +265,7 @@ test("package.json: поля, которые читает загрузчик п�
   const pkg = JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8"));
 
   assert.equal(pkg.name, "dsh-remote");
-  assert.equal(pkg.version, "0.2.0");
+  assert.equal(pkg.version, "0.3.0");
   assert.equal(pkg.private, true);
   assert.equal(pkg.license, "MIT");
   assert.equal(pkg.type, "module");
