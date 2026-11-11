@@ -19,6 +19,38 @@ cargo run
 RELAY_AGENT_TOKEN=dev-agent-token RELAY_BIND=127.0.0.1:8080 cargo run
 ```
 
+### Проверенная локальная последовательность (040)
+
+Cargo в песочнице не должен писать в `~/.cargo`, поэтому сборка и запуск — с
+локальными каталогами (как в `bin/ci.sh`):
+
+```bash
+cd relay
+export CARGO_HOME="$PWD/../.cargo-home" CARGO_TARGET_DIR="$PWD/../.cargo-target"
+cargo build
+mkdir -p .run
+RELAY_BIND=127.0.0.1:8080 \
+RELAY_AGENT_TOKEN=dev-agent-token \
+RELAY_DATABASE_URL="sqlite://$PWD/.run/relay.db?mode=rwc" \
+  "$CARGO_TARGET_DIR/debug/dsh-relay"
+```
+
+В другом терминале:
+
+```bash
+curl -sS -H 'X-Relay-Version: 1' http://127.0.0.1:8080/healthz
+# {"ok":true,"version":"0.1.0",...,"devices":0,"questions":0,"answers":0}
+
+RELAY_BASE_URL=http://127.0.0.1:8080 RELAY_AGENT_TOKEN=dev-agent-token \
+  ../deploy/smoke.sh
+# smoke: OK — healthz, привязка, вопрос, ответ, идемпотентность
+```
+
+Миграции применяются на старте: в `.run/relay.db` появляются таблицы
+`_sqlx_migrations`, `devices`, `pairing_codes`, `questions`, `answers`, `events`
+(миграция `1 init`). Локальный релей слушает только `127.0.0.1`; TLS, webhook и
+внешний хостинг — задача 041.
+
 Проверка живости:
 
 ```bash
