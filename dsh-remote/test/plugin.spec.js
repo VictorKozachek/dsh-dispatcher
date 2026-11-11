@@ -12,6 +12,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -279,5 +281,39 @@ test("файлы из exports и files существуют", () => {
   const pkg = JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8"));
   for (const target of [pkg.main, pkg.dsh.bundle.patch, ...pkg.files]) {
     assert.ok(existsSync(path.join(packageDir, target)), `нет файла ${target}`);
+  }
+});
+
+test("трассировка старта: путь из DSH_HOME и строка на загрузку", async () => {
+  const { apply, bootTraceFile } = await import("../lib/index.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-boot-"));
+  try {
+    assert.equal(
+      bootTraceFile({ DSH_HOME: dir }),
+      path.join(dir, "remote-control", "boot.log"),
+      "по умолчанию — $DSH_HOME/remote-control/boot.log",
+    );
+    assert.equal(
+      bootTraceFile({ DSH_HOME: dir, DSH_REMOTE_BOOT_LOG: path.join(dir, "custom.log") }),
+      path.join(dir, "custom.log"),
+      "явный путь переопределяет",
+    );
+
+    const { ctx } = fakeCtx();
+    const previousHome = process.env.DSH_HOME;
+    process.env.DSH_HOME = dir;
+    try {
+      await apply(ctx, {});
+    } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousHome;
+    }
+    const file = bootTraceFile({ DSH_HOME: dir });
+    const text = fs.readFileSync(file, "utf8").trim();
+    assert.match(text, /^\d{4}-\d{2}-\d{2}T/, "строка начинается с ISO-времени");
+    assert.match(text, /apply pid=\d+/, "в строке есть pid");
+    assert.equal((text.match(/\n/g) ?? []).length, 0, "один запуск — одна строка");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

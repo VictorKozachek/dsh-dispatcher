@@ -18,6 +18,10 @@
  * трогает.
  */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { features } from "./features.js";
 
 /** Имя плагина: оно же scope логгера и `name` ряда в `cordis.patch.yml`. */
@@ -30,6 +34,36 @@ export const name = "dsh-remote";
 export const inject = [];
 
 apply.inject = inject;
+
+/**
+ * Файл трассировки старта: одна строка на каждую загрузку плагина.
+ *
+ * Зачем: команда `/remote` и панель видны только когда плагин действительно
+ * поднялся в профиле, а `logger` пишет в консоль хоста — её не видно без
+ * отладки. Строка в файле отвечает на вопрос «загрузился ли плагин» без
+ * перезапуска с флагами. Путь переопределяется `$DSH_REMOTE_BOOT_LOG`.
+ */
+export function bootTraceFile(env = process.env) {
+  const explicit = env.DSH_REMOTE_BOOT_LOG;
+  if (explicit !== undefined && explicit !== "") return explicit;
+  const home = env.DSH_HOME !== undefined && env.DSH_HOME !== "" ? env.DSH_HOME : path.join(os.homedir(), ".dsh");
+  return path.join(home, "remote-control", "boot.log");
+}
+
+/** Записать строку трассировки; сбой трассировки не мешает плагину. */
+function recordBootTrace(logger) {
+  try {
+    const file = bootTraceFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(file, `${new Date().toISOString()} apply pid=${process.pid}\n`, { mode: 0o600 });
+  } catch (error) {
+    try {
+      logger.warn(`трассировка старта не записалась: ${error?.message ?? error}`);
+    } catch {
+      /* логгер тоже может быть сломан — молчим */
+    }
+  }
+}
 
 /** Уровни лога cordis, которые нужны плагину. */
 const LEVELS = ["debug", "info", "warn", "error"];
@@ -112,6 +146,7 @@ function readConfig(config) {
  */
 export async function apply(ctx, config = {}) {
   const logger = createLogger(ctx);
+  recordBootTrace(logger);
   const { settings, invalid } = readConfig(config);
   if (invalid) logger.warn("config плагина не объект — работаю с пустым конфигом");
 
