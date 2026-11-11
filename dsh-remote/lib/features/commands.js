@@ -21,10 +21,11 @@
  */
 
 import { DEFAULT_CAPS } from "../transport/base.js";
-import { TELEGRAM_TOKEN_REF, createRemoteCommands } from "../commands.js";
+import { MAX_TOKEN_REF, TELEGRAM_TOKEN_REF, createRemoteCommands } from "../commands.js";
 import { createCredentialAccess, createStore } from "../store.js";
 import { createTelegramTransport } from "../transport/telegram.js";
 import { RELAY_TOKEN_REF, createRelayTransport } from "../transport/relay.js";
+import { MAX_API_BASE, createMaxTransport } from "../transport/max.js";
 import { answererFeature } from "./answerer.js";
 
 /** Имя сервиса транспорта: то же, что ждёт фича answerer в своих `needs`. */
@@ -202,6 +203,63 @@ async function ensureTransport(ctx, store, deps, facade, isDisposed = () => fals
     return null;
   }
 
+  // 039: привязка на MAX — канал создаём здесь же, чтобы `/remote connect MAX`
+  // начинал публиковать сразу, без перезагрузки профиля.
+  if (binding !== null && binding.transport === "max") {
+    const credentials = createCredentialAccess(ctx, { log });
+    const maxSettings = config?.max !== null && typeof config?.max === "object" ? config.max : {};
+    const tokenRef = typeof maxSettings.tokenRef === "string" && maxSettings.tokenRef !== "" ? maxSettings.tokenRef : MAX_TOKEN_REF;
+    const token = await credentials.resolve(tokenRef);
+    if (isDisposed()) {
+      await facade.stop();
+      return null;
+    }
+    if (token === null) {
+      deps.logger.warn(`фича commands: привязка на MAX, а секрета ${tokenRef} нет — канал не поднят`);
+      return null;
+    }
+    const key = `max|${binding.chatId ?? ""}|${binding.userId ?? ""}|${token}`;
+    const currentMax = facade.current;
+    if (currentMax !== null && currentMax.__bindingKey === key) return currentMax;
+    if (currentMax !== null) await facade.stop();
+    let maxTransport;
+    try {
+      maxTransport = createMaxTransport({
+        token,
+        chatId: binding.chatId ?? null,
+        userId: binding.userId ?? null,
+        allowedUserIds: binding.userId === null || binding.userId === undefined ? [] : [binding.userId],
+        ...(Number.isFinite(binding.marker) ? { marker: binding.marker } : {}),
+        persistMarker: (marker) => {
+          try {
+            store.update((state) => {
+              if (state.bindings !== null && state.bindings.transport === "max") state.bindings.marker = marker;
+              return state;
+            });
+          } catch (error) {
+            deps.logger.debug(`фича commands: marker MAX не сохранён (${error?.message ?? error})`);
+          }
+        },
+        apiBase: typeof maxSettings.apiBase === "string" && maxSettings.apiBase !== "" ? maxSettings.apiBase : MAX_API_BASE,
+        ...(typeof maxSettings.fetch === "function" ? { fetch: maxSettings.fetch } : {}),
+        ...(Number.isFinite(maxSettings.pollTimeoutSec) ? { pollTimeoutSec: maxSettings.pollTimeoutSec } : {}),
+        log: (message) => deps.logger.debug(message),
+      });
+    } catch (error) {
+      deps.logger.warn(`фича commands: транспорт MAX не создан (${error?.message ?? error})`);
+      return null;
+    }
+    maxTransport.__bindingKey = key;
+    facade.set(maxTransport);
+    try {
+      await maxTransport.start();
+    } catch (error) {
+      deps.logger.warn(`фича commands: канал MAX не стартовал (${error?.message ?? error})`);
+    }
+    deps.logger.info("фича commands: канал MAX поднят из сохранённой привязки");
+    return maxTransport;
+  }
+
   const credentials = createCredentialAccess(ctx, { log });
   const token = await credentials.resolve(TELEGRAM_TOKEN_REF);
   if (token === null) {
@@ -342,7 +400,15 @@ export const commandsFeature = {
     // status/on должны видеть хотя бы один живой канал.
     const currentChannel = () => facade.current ?? [...transportRegistry.values()][0] ?? null;
     trace("commands:createRemoteCommands");
-    const remote = createRemoteCommands({ ctx, store, log, ensureTransport: ensure, currentChannel });
+    const remote = createRemoteCommands({
+      ctx,
+      store,
+      log,
+      ensureTransport: ensure,
+      currentChannel,
+      // 039: long polling для pairing MAX; можно переопределить в config.max.
+      ...(Number.isFinite(config?.max?.pollTimeoutSec) ? { maxPairingPollTimeoutSec: config.max.pollTimeoutSec } : {}),
+    });
     trace("commands:register");
     deps.onDispose(remote.register(), "commands");
     trace("commands:зарегистрирована");

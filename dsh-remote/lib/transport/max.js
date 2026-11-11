@@ -52,6 +52,12 @@ export const MAX_CAPS = Object.freeze({
 /** Лимит платформы: не больше 2 запросов в секунду в один чат. */
 export const MAX_CHAT_RPS_INTERVAL_MS = 500;
 
+/**
+ * Таймаут long polling для pairing (`GET /updates?timeout=…`), секунды.
+ * 039: без него MAX-опрос был бы коротким раз в секунду (лишняя нагрузка).
+ */
+export const MAX_PAIRING_POLL_TIMEOUT_SEC = 5;
+
 /** Причины, при которых сообщение закрывается молчаливой пометкой. */
 const QUIET_REASONS = new Set([
   "aborted",
@@ -657,6 +663,124 @@ export function createMaxTransport(options = {}) {
   };
 
   return transport;
+}
+
+/**
+ * Низкоуровневый вызов MAX API без транспорта (039): нужен для `connect`, пока
+ * нет chatId/userId — транспорт создаётся только после привязки.
+ */
+export async function maxApiRequest({
+  token,
+  method = "GET",
+  path,
+  query,
+  body,
+  apiBase = MAX_API_BASE,
+  fetch: doFetch = globalThis.fetch,
+  signal,
+} = {}) {
+  if (typeof token !== "string" || token === "") throw new TypeError("max: нужен токен бота");
+  const url = new URL(path, apiBase);
+  for (const [key, value] of Object.entries(query ?? {})) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  }
+  let response;
+  try {
+    response = await doFetch(url.toString(), {
+      method,
+      headers: {
+        authorization: token,
+        ...(body === undefined ? {} : { "content-type": "application/json" }),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(signal === undefined ? {} : { signal }),
+    });
+  } catch (error) {
+    throw new Error(`MAX ${method} ${path}: сеть недоступна (${describeError(error, token)})`);
+  }
+  if (response.status === 200) return response.json();
+  let detail = "";
+  try {
+    const payload = await response.json();
+    detail = typeof payload?.message === "string" ? describeError(new Error(payload.message), token) : "";
+  } catch {
+    detail = "";
+  }
+  const error = new Error(`MAX ${method} ${path}: ${response.status}${detail === "" ? "" : ` ${detail}`}`);
+  error.status = response.status;
+  throw error;
+}
+
+/** `GET /me`: проверить токен бота MAX до привязки. */
+export async function maxMe({ token, apiBase, fetch: doFetch } = {}) {
+  const me = await maxApiRequest({ token, path: "/me", apiBase, fetch: doFetch });
+  return {
+    name: typeof me?.name === "string" && me.name !== ""
+      ? me.name
+      : typeof me?.username === "string" && me.username !== ""
+        ? me.username
+        : typeof me?.user?.name === "string" && me.user.name !== ""
+          ? me.user.name
+          : null,
+  };
+}
+
+/**
+ * Ждём сообщение с pairing-кодом боту MAX (`GET /updates`, long polling).
+ *
+ * Возвращает `{chatId, userId, marker}` или `null`, если код не пришёл до
+ * `deadline`. `marker` сохраняется вызывающим (в состоянии привязки), чтобы
+ * после привязки транспорт не перечитал старые апдейты.
+ */
+export async function maxPollForCode({
+  token,
+  code,
+  deadline,
+  pollTimeoutSec = MAX_PAIRING_POLL_TIMEOUT_SEC,
+  apiBase,
+  fetch: doFetch,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  signal,
+  log = () => {},
+} = {}) {
+  let marker = null;
+  while (now() < deadline) {
+    if (signal?.aborted) throw Object.assign(new Error("подключение отменено"), { name: "AbortError" });
+    let response;
+    try {
+      response = await maxApiRequest({
+        token,
+        path: "/updates",
+        query: {
+          timeout: Math.min(90, Math.max(0, Math.floor(pollTimeoutSec))),
+          limit: 100,
+          ...(marker === null ? {} : { marker }),
+        },
+        apiBase,
+        fetch: doFetch,
+        signal,
+      });
+    } catch (error) {
+      if (error?.status === 401) throw error;
+      log(`max pairing: опрос апдейтов не удался (${describeError(error, token)})`);
+      await sleep(1000);
+      continue;
+    }
+    if (Number.isFinite(response?.marker)) marker = response.marker;
+    for (const update of Array.isArray(response?.updates) ? response.updates : []) {
+      if (update?.type !== "message_created") continue;
+      const text = typeof update?.message?.body?.text === "string" ? update.message.body.text.trim() : "";
+      if (text !== code) continue;
+      const chatId = update?.message?.chat?.chat_id ?? update?.chat?.chat_id ?? null;
+      const userId = update?.message?.sender?.user_id ?? update?.user?.user_id ?? null;
+      if (chatId === null || userId === null) continue;
+      return { chatId, userId, marker };
+    }
+    // Long polling уже ждал ответ `pollTimeoutSec`; короткий опрос (0) — пауза 1 с.
+    await sleep(pollTimeoutSec > 0 ? 200 : 1000);
+  }
+  return null;
 }
 
 /** Хелпер для тестов: разложить текст под предел MAX, не потеряв символы. */
