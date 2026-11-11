@@ -133,6 +133,20 @@ export class PanelService {
         channelPresent,
         now: this.options.now,
         logger: this.options.logger,
+        // 045: доска текущего проекта и явные корни из конфига; данные только читаются.
+        includeCwd: this.options.includeCwd === true,
+        ...(Array.isArray(this.options.workspaces) ? { workspaces: this.options.workspaces } : {}),
+        ...(Number.isFinite(this.options.staleMinutes) ? { staleMinutes: this.options.staleMinutes } : {}),
+        ...(typeof this.options.metrics === "function"
+          ? (() => {
+            try {
+              const value = this.options.metrics();
+              return value !== null && typeof value === "object" ? { metrics: value } : {};
+            } catch {
+              return {};
+            }
+          })()
+          : {}),
       });
     } catch (error) {
       return { ok: false, message: shortText(`снимок не собран: ${error?.message ?? error}`) };

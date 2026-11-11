@@ -57,7 +57,15 @@ window.__ModuleLoader__.load({
       loading: "loading…",
       offline: "host channel unavailable",
       deadline: "deadline",
-      expired: "expired"
+      expired: "expired",
+      board: "board",
+      boardNone: "no board data",
+      boardStale: "stuck at role",
+      spend: "token spend",
+      spendNone: "no token spend recorded",
+      today: "today",
+      week: "week",
+      total: "total"
     };
 
     const ru = {
@@ -81,7 +89,15 @@ window.__ModuleLoader__.load({
       loading: "загружаю…",
       offline: "host-канал недоступен",
       deadline: "дедлайн",
-      expired: "истёк"
+      expired: "истёк",
+      board: "доска",
+      boardNone: "данных доски нет",
+      boardStale: "залипли у роли",
+      spend: "расход токенов",
+      spendNone: "расход пока не записан",
+      today: "сегодня",
+      week: "неделя",
+      total: "всего"
     };
 
     /** Время в формате `ЧЧ:ММ`; нечисловое значение — прочерк. */
@@ -307,6 +323,43 @@ window.__ModuleLoader__.load({
             )
           );
         }
+      }
+
+      const board = snapshot && snapshot.board ? snapshot.board : null;
+      if (board !== null) {
+        children.push(h("div", { key: "board-title", style: { marginTop: 12, fontSize: 12, color: "#64748b" } }, t("board")));
+        const workspaces = Array.isArray(board.workspaces) ? board.workspaces : [];
+        if (board.available !== true || workspaces.length === 0) {
+          children.push(h("div", { key: "board-none", style: { fontSize: 12, color: "#94a3b8" } }, t("boardNone")));
+        } else {
+          for (const workspace of workspaces) {
+            if (workspace.missing === true) {
+              children.push(h("div", { key: "board-" + workspace.name, style: { fontSize: 12, color: "#94a3b8" } }, workspace.name + ": " + t("boardNone")));
+              continue;
+            }
+            const counts = workspace.counts || {};
+            const summary = Object.keys(counts).map((key) => key + " " + String(counts[key])).join(" · ");
+            children.push(h("div", { key: "board-" + workspace.name, style: { fontSize: 12 } }, workspace.name + ": " + summary));
+            const stale = Array.isArray(workspace.stale) ? workspace.stale : [];
+            for (const card of stale) {
+              children.push(h("div", { key: "stale-" + workspace.name + "-" + card.id, style: { fontSize: 11, color: "#b45309" } }, "#" + card.id + " " + card.title + " — " + card.status + " · " + String(card.ageMinutes) + " " + t("stale")));
+            }
+          }
+        }
+      }
+
+      const spend = snapshot && snapshot.spend ? snapshot.spend : null;
+      if (spend !== null) {
+        children.push(h("div", { key: "spend-title", style: { marginTop: 12, fontSize: 12, color: "#64748b" } }, t("spend")));
+        const tasks = Array.isArray(spend.tasks) ? spend.tasks.slice(0, 5) : [];
+        if (tasks.length === 0) {
+          children.push(h("div", { key: "spend-none", style: { fontSize: 12, color: "#94a3b8" } }, t("spendNone")));
+        } else {
+          for (const task of tasks) {
+            children.push(h("div", { key: "spend-" + task.workspace + "-" + task.id, style: { fontSize: 12 } }, "#" + task.id + " " + task.title + " — " + String(task.tokens) + " " + t("spend")));
+          }
+        }
+        children.push(h("div", { key: "spend-total", style: { fontSize: 11, color: "#64748b" } }, t("today") + ": " + String(spend.today) + " · " + t("week") + ": " + String(spend.week) + " · " + t("total") + ": " + String(spend.total)));
       }
 
       children.push(h("div", { key: "journal-title", style: { marginTop: 12, fontSize: 12, color: "#64748b" } }, t("journal")));
