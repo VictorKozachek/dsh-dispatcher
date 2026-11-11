@@ -762,3 +762,123 @@ test("037: свободный текст без shortId после публик�
   const result = await pending;
   assert.deepEqual(result.answers.map((answer) => answer.custom), ["первому", "второму"]);
 });
+
+test("037: TTL второго вопроса отсчитывается от публикации, а не от создания пачки", async () => {
+  let clock = 1_000;
+  const watched = [];
+  const reliability = { watch: (question) => watched.push(question), unwatch: () => {} };
+  const handlers = new Set();
+  const transport = {
+    sent: [],
+    answer(event) {
+      for (const handler of [...handlers]) handler(event);
+    },
+    sendQuestion(question) {
+      this.sent.push(question);
+      return Promise.resolve();
+    },
+    closeQuestion() {},
+    onAnswer(handler) {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+  };
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({
+    transport,
+    registry,
+    reliability,
+    now: () => clock,
+  });
+  const ctx = fakeContext();
+  answerer.attach(ctx);
+
+  const pending = runWaterfall(ctx, EVENT, {
+    questions: [item({ id: "q1" }), item({ id: "q2" })],
+    agent: { id: "s1" },
+  }, () => assert.fail("next()"));
+
+  await tick();
+  const q2 = [...answerer.known.values()].find((question) => question.questionId === "q2");
+  // Эмулируем короткий TTL пачки: q2 создан в 1000, дедлайн 6000.
+  q2.createdAt = 1_000;
+  q2.expiresAt = 6_000;
+  assert.equal(watched.length, 1, "q1 под TTL, q2 ещё нет");
+
+  // Человек отвечает на q1 позже исходного дедлайна q2 (10000 > 6000).
+  clock = 10_000;
+  transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+  await tick();
+  assert.equal(watched.length, 2, "q2 под TTL после публикации");
+
+  const q2Watch = watched[1];
+  assert.equal(q2Watch.questionId, "q2");
+  assert.equal(q2Watch.createdAt, 10_000, "latency q2 считается от публикации");
+  assert.equal(q2Watch.expiresAt, 15_000, "TTL q2 — полные 5 с от публикации, не просрочен");
+  assert.ok(q2Watch.expiresAt > clock, "q2 не истёк в момент публикации");
+
+  // tick по исходному времени не должен истечь q2: до его дедлайна ещё 5 с.
+  clock = 10_000;
+  assert.ok(q2Watch.expiresAt > clock);
+  transport.answer({ shortId: transport.sent[1].shortId, optionId: "o1" });
+  const result = await pending;
+  assert.deepEqual(result.answers, [
+    { id: "q1", selected: ["Да"] },
+    { id: "q2", selected: ["Да"] },
+  ]);
+});
+
+test("037: три вопроса — каждый получает свой TTL от своей публикации", async () => {
+  let clock = 0;
+  const watched = [];
+  const handlers = new Set();
+  const transport = {
+    sent: [],
+    answer(event) {
+      for (const handler of [...handlers]) handler(event);
+    },
+    sendQuestion(question) {
+      this.sent.push(question);
+      return Promise.resolve();
+    },
+    closeQuestion() {},
+    onAnswer(handler) {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+  };
+  const answerer = createAnswerer({
+    transport,
+    registry: createRegistry({ readState: () => ({ global: true }) }),
+    reliability: { watch: (question) => watched.push(question), unwatch: () => {} },
+    now: () => clock,
+  });
+  const ctx = fakeContext();
+  answerer.attach(ctx);
+
+  const pending = runWaterfall(ctx, EVENT, {
+    questions: [item({ id: "q1" }), item({ id: "q2" }), item({ id: "q3" })],
+    agent: { id: "s1" },
+  }, () => assert.fail("next()"));
+  await tick();
+
+  for (const question of [...answerer.known.values()]) {
+    question.createdAt = 0;
+    question.expiresAt = 2_000;
+  }
+
+  clock = 3_000;
+  transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+  await tick();
+  assert.equal(watched.at(-1).expiresAt, 5_000, "q2: TTL от публикации в 3000");
+
+  clock = 7_000;
+  transport.answer({ shortId: transport.sent[1].shortId, optionId: "o1" });
+  await tick();
+  assert.equal(watched.at(-1).expiresAt, 9_000, "q3: TTL от публикации в 7000");
+
+  transport.answer({ shortId: transport.sent[2].shortId, optionId: "o1" });
+  const result = await pending;
+  assert.equal(result.answers.length, 3, "все три части в результате");
+  assert.equal(answerer.pending.size, 0, "висящих ожиданий нет");
+});

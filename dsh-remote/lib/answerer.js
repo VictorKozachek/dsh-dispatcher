@@ -553,6 +553,13 @@ export function createAnswerer({
      * раньше времени. Теперь вызывается по одному вопросу в цикле публикации.
      */
     function registerWaiting(question) {
+      // 037: TTL отсчитывается от публикации, а не от создания пачки. Иначе
+      // второй вопрос, прождавший долгий ответ на первый, был бы уже просрочен
+      // в момент отправки и человек не успел бы ответить; latency тоже считаем
+      // от публикации.
+      const ttlMs = Math.max(1, question.expiresAt - question.createdAt);
+      question.createdAt = now();
+      question.expiresAt = question.createdAt + ttlMs;
       question.markOpen(now());
       // `catch`-заглушка: если вопрос снимают (аборт, ошибка отправки), промис
       // остаётся неразрешённым, но не должен шуметь как необработанный отказ.
