@@ -237,6 +237,7 @@ export const answererFeature = {
       transports,
       hybrid: () => (store?.read?.().hybrid ?? { enabled: false }),
       registry,
+      quickReplies: config?.quickReplies,
       reliability,
       metrics: deps.get("remoteMetrics") ?? null,
       deliver: reliability === null ? null : (argument) => reliability.deliver(argument),

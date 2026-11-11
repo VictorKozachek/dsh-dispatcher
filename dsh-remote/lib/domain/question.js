@@ -19,6 +19,8 @@
 
 import { randomBytes, randomUUID } from "node:crypto";
 
+import { normalizeQuickReplies } from "../quick-replies.js";
+
 /** Статусы вопроса. `pending` — создан, но ещё не отправлен. */
 export const QUESTION_STATUS = Object.freeze({
   pending: "pending",
@@ -112,6 +114,8 @@ export class RemoteQuestion {
     this.multiSelect = item.multiSelect === true;
     /** Свободный ответ: у plan-review его нет — там выбор из «approve/decline». */
     this.allowFreeText = item.intent?.kind === "plan-review" ? false : true;
+    /** 044: быстрые ответы для вопроса без вариантов (конфиг плагина). */
+    this.quickReplies = normalizeQuickReplies(context.quickReplies);
     this.createdAt = now;
     this.expiresAt = now + ttlMs;
     this.status = QUESTION_STATUS.pending;
