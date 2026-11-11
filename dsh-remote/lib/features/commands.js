@@ -217,6 +217,7 @@ export const commandsFeature = {
     // Реестр каналов (012): в него складывают транспорты фичи telegram/max,
     // чтобы ответчик мог публиковать вопрос сразу в несколько.
     const transportRegistry = new Map();
+    deps.expose?.("remoteTransports", transportRegistry);
     try {
       ctx.provide?.("remoteTransports", transportRegistry);
     } catch (error) {
@@ -224,6 +225,7 @@ export const commandsFeature = {
     }
 
     // Состояние как сервис: ответчик читает его для реестра режима.
+    deps.expose?.(STATE_SERVICE, store);
     try {
       ctx.provide?.(STATE_SERVICE, store);
     } catch (error) {
@@ -237,6 +239,7 @@ export const commandsFeature = {
     const existing = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
     const facade = existing?.__isTransportFacade === true ? existing : createTransportFacade();
     if (existing !== null && existing !== facade) facade.set(existing);
+    deps.expose?.(TRANSPORT_SERVICE, facade);
     if (existing === null || existing !== facade) {
       try {
         ctx.provide?.(TRANSPORT_SERVICE, facade);
@@ -263,13 +266,22 @@ export const commandsFeature = {
       return transport;
     };
 
-    /** Хук для connect: канал поднимаем и ответчика применяем сразу, если ещё нет. */
+    /**
+     * Хук для connect: канал поднимаем и фичи, ждавшие `remoteTransport`,
+     * поднимаем сразу — иначе `reliability`/`answerer`/`approvals` остались бы
+     * пропущенными до перезапуска, и вопрос некуда было бы отправить.
+     */
     const ensure = async () => {
       const transport = await ensureAtStart();
       if (transport !== null) transportRegistry.set(transport.id ?? "telegram", transport);
       if (transport !== null && !answererReady) {
         answererReady = true;
-        await answererFeature.apply(ctx, config, deps);
+        if (typeof deps.retryPending === "function") {
+          await deps.retryPending("канал поднят");
+        } else {
+          // Фолбэк для хостов без каркасного `retryPending` (тесты, старые версии).
+          await answererFeature.apply(ctx, config, deps);
+        }
       }
       return transport;
     };

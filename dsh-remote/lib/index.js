@@ -192,10 +192,30 @@ export async function apply(ctx, config = {}) {
     logger.warn(`не подписался на событие dispose: ${describeError(error)}`);
   }
 
+  /**
+   * Общий реестр значений плагина.
+   *
+   * Зачем: `ctx.provide` у cordis рассчитан на настоящие Service-объекты, а наши
+   * фасад транспорта и хранилище — обычные объекты. Живой сбой: `commands`
+   * поднимался, но `reliability`/`answerer`/`approvals` продолжали видеть
+   * `нет-remoteTransport`. Поэтому фичи кладут значения сюда, а `deps.get`
+   * смотрит сначала в cordis, потом сюда — без зависимости от семантики сервисов.
+   */
+  const shared = new Map();
+
   const deps = {
     logger,
+    /** Положить значение в общий реестр плагина (видно всем фичам через `get`). */
+    expose(name, value) {
+      shared.set(String(name), value ?? null);
+    },
+    /** Взять значение из общего реестра плагина. */
+    shared(name) {
+      return shared.get(String(name)) ?? null;
+    },
     /** Сервис из контекста: нет сервиса (или ctx без `get`) — null, не исключение. */
     get(service) {
+      if (shared.has(String(service))) return shared.get(String(service)) ?? null;
       try {
         if (typeof ctx?.get !== "function") return null;
         return ctx.get(service) ?? null;
@@ -232,41 +252,82 @@ export async function apply(ctx, config = {}) {
   let started = 0;
   /** Итог по фичам — он же попадает в трассировку старта. */
   const report = [];
+  /** Что уже запущено: повторный проход не должен поднимать фичу дважды. */
+  const applied = new Set();
 
-  for (const [index, feature] of registry.entries()) {
-    const label = typeof feature?.name === "string" && feature.name.trim() !== ""
-      ? feature.name.trim()
-      : `#${index}`;
-
+  /**
+   * Запустить одну фичу. Возвращает `true`, если она поднялась.
+   *
+   * @param {object} feature - фича из реестра
+   * @param {string} label - имя для лога
+   * @param {string[]} [into] - куда писать итог (по умолчанию в отчёт старта)
+   */
+  async function runFeature(feature, label, into = report) {
     if (typeof feature?.apply !== "function") {
       logger.warn(`фича ${label}: нет apply — пропущена`);
-      report.push(`${label}:no-apply`);
-      continue;
+      into.push(`${label}:no-apply`);
+      return false;
     }
-
     const needs = Array.isArray(feature.needs) ? feature.needs.map(String) : [];
     const missing = needs.filter((service) => deps.get(service) === null);
     if (missing.length > 0) {
       logger.warn(`фича ${label}: в контексте нет ${missing.join(", ")} — пропущена, плагин работает без неё`);
-      report.push(`${label}:нет-${missing.join("/")}`);
-      continue;
+      into.push(`${label}:нет-${missing.join("/")}`);
+      return false;
     }
-
     try {
       // Фича может быть асинхронной (например, ждёт `credentials.resolve`):
       // дожидаемся её, иначе следующая фича проверит свои `needs` до того, как
       // сервис появится, и будет пропущена навсегда.
       const result = feature.apply(ctx, settings, deps);
       if (result !== null && typeof result?.then === "function") await result;
-      started += 1;
-      report.push(`${label}:ok`);
+      applied.add(label);
+      into.push(`${label}:ok`);
+      return true;
     } catch (error) {
       logger.warn(`фича ${label} упала: ${describeError(error)}`);
-      report.push(`${label}:упала(${describeError(error)})`);
+      into.push(`${label}:упала(${describeError(error)})`);
       // Текст и голова стека — в трассировку: консоль хоста не видна без отладки.
       const stack = String(error?.stack ?? "").split("\n").slice(1, 4).join(" | ");
       recordBootTrace(logger, `ошибка фичи ${label}: ${describeError(error)}${stack ? ` @ ${stack}` : ""}`);
+      return false;
     }
+  }
+
+  /**
+   * Повторный проход по пропущенным фичам.
+   *
+   * Зачем: часть фич ждёт сервисов, которых на старте ещё нет. `remoteTransport`
+   * появляется только после привязки бота (`/remote connect`) — и тогда
+   * `reliability`, `answerer` и `approvals` надо поднять, иначе вопросы некому
+   * отправлять. Реестр идёт в исходном порядке: `reliability` кладёт `deliver`,
+   * `answerer` его берёт.
+   *
+   * @param {string} reason - что изменилось (для трассировки)
+   * @returns {Promise<string[]>} имена поднятых фич
+   */
+  async function retryPending(reason) {
+    const retried = [];
+    for (const [index, feature] of registry.entries()) {
+      const label = typeof feature?.name === "string" && feature.name.trim() !== ""
+        ? feature.name.trim()
+        : `#${index}`;
+      if (applied.has(label)) continue;
+      const needs = Array.isArray(feature?.needs) ? feature.needs.map(String) : [];
+      if (needs.some((service) => deps.get(service) === null)) continue;
+      if (await runFeature(feature, label, [])) retried.push(label);
+    }
+    if (retried.length > 0) recordBootTrace(logger, `доподняты фичи (${reason}): ${retried.join(", ")}`);
+    return retried;
+  }
+
+  deps.retryPending = retryPending;
+
+  for (const [index, feature] of registry.entries()) {
+    const label = typeof feature?.name === "string" && feature.name.trim() !== ""
+      ? feature.name.trim()
+      : `#${index}`;
+    if (await runFeature(feature, label)) started += 1;
     if (disposed) {
       logger.warn("плагин выгружен во время запуска фич — остальные не запускаю");
       break;

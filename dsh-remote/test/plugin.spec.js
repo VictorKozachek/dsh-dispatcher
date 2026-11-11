@@ -142,7 +142,13 @@ test("apply поднимается на пустом ctx без сервисов
   assert.deepEqual(messages(calls, "error"), []);
   assert.match(messages(calls, "info").join("\n"), /каркас поднят/);
   assert.deepEqual(effects.map((item) => item.label), ["dsh-remote: dispose"], "cleanup — через ctx.effect");
-  assert.deepEqual(handlers.map((item) => item.event), ["dispose"], "событие dispose — хук для хостов");
+  // Ответчик вопросов и подтверждений подписан всегда: фасад транспорта существует
+  // с самого старта, а без живого канала он отдаёт запрос GUI (`next()`).
+  assert.deepEqual(
+    handlers.map((item) => item.event),
+    ["dispose", "user-questions/request", "approval/request"],
+    "подписки: dispose — хук для хостов, ответчики — на старте",
+  );
 });
 
 test("apply не падает на ctx без logger, get и on", async () => {
@@ -244,7 +250,8 @@ test("выгрузка плагина через ctx.effect снимает ре�
   assert.equal(released, 1, "выгрузка плагина снимает ресурс");
 
   // Идемпотентность: событие dispose от хоста после выгрузки ничего не ломает.
-  for (const { handler } of fake.handlers) handler();
+  // Чужие подписки (ответчики) здесь не зовём: им нужен waterfall-контракт.
+  for (const { event, handler } of fake.handlers) if (event === "dispose") handler();
   assert.equal(released, 1, "повторное снятие — no-op");
 });
 

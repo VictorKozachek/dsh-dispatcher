@@ -439,12 +439,24 @@ test("фича answerer из реестра: с транспортом слуш�
   assert.equal(transport.subscribed, false);
 });
 
-test("фича answerer без транспорта не поднимается: вопрос уходит в GUI", async () => {
+test("фича answerer без живого канала: подписка есть, вопрос уходит в GUI", async () => {
   const ctx = fakeContext();
 
   await assert.doesNotReject(() => apply(ctx, {}));
 
-  assert.equal((ctx.hooks.get(EVENT) ?? []).length, 0, "без транспорта слушателя нет");
+  // Фасад транспорта команды создают сразу (он же точка подключения), поэтому
+  // ответчик подписан; но канала внутри нет — и запрос обязан уйти в GUI.
+  const list = ctx.hooks.get(EVENT) ?? [];
+  assert.equal(list.length, 1, "ответчик подписан на waterfall");
+
+  let delegated = 0;
+  const controller = new AbortController();
+  const outcome = await list[0].handler(
+    { questions: [{ id: "q1", question: "Продолжать?" }], agent: { id: "s" }, signal: controller.signal },
+    async () => { delegated += 1; return { answers: [{ id: "q1", selected: ["GUI"] }] }; },
+  );
+  assert.equal(delegated, 1, "без канала вызывается next() — вопрос уходит в GUI");
+  assert.deepEqual(outcome.answers, [{ id: "q1", selected: ["GUI"] }]);
 });
 
 test("вопрос получает роль и задачу из контекста сессии (006)", async (t) => {
