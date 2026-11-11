@@ -147,6 +147,12 @@ async function ensureTransport(ctx, store, deps, facade, isDisposed = () => fals
     // Канал из config.telegram (004) мы не создавали — его не гасим: без привязки
     // в состоянии он и есть рабочий канал.
     const adopted = facade.current;
+    const boundId = typeof binding?.transport === "string" ? binding.transport : null;
+    if (boundId !== null) {
+      // 038: привязка на другой транспорт (relay/max) — config-канал не активен.
+      if (adopted !== null && adopted.id === boundId) return adopted;
+      return null;
+    }
     if (adopted !== null && adopted.__bindingKey === undefined) return adopted;
     if (adopted !== null) await facade.stop();
     return null;
