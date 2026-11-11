@@ -310,9 +310,13 @@ test("трассировка старта: путь из DSH_HOME и строк�
     }
     const file = bootTraceFile({ DSH_HOME: dir });
     const lines = fs.readFileSync(file, "utf8").trim().split("\n");
-    assert.equal(lines.length, 2, "две строки на запуск: старт и итог по фичам");
+    assert.ok(lines.length >= 2, "как минимум старт и итог по фичам");
     assert.match(lines[0], /^\d{4}-\d{2}-\d{2}T.*apply pid=\d+$/, "старт: время, маркер и pid");
-    assert.match(lines[1], /features запущено \d+\/\d+:/, "итог: сколько фич поднялось");
+    assert.match(lines[lines.length - 1], /features запущено \d+\/\d+:/, "итог: сколько фич поднялось");
+    assert.ok(
+      lines.some((line) => /step commands:старт pid=\d+$/.test(line)),
+      "видно шаги фичи commands",
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

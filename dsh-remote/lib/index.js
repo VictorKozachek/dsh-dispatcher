@@ -209,6 +209,8 @@ export async function apply(ctx, config = {}) {
      * `timers` снимают сторож, `transports` останавливают поллеры/WS,
      * `commands` — фасад. По умолчанию — `other`.
      */
+    /** Точка трассировки шага фичи (пишется в boot.log). */
+    trace: (message) => recordBootTrace(logger, `step ${message}`),
     onDispose(disposer, phase = "other") {
       if (typeof disposer !== "function") return;
       const effective = DISPOSE_PHASES.includes(phase) ? phase : "other";
@@ -260,7 +262,10 @@ export async function apply(ctx, config = {}) {
       report.push(`${label}:ok`);
     } catch (error) {
       logger.warn(`фича ${label} упала: ${describeError(error)}`);
-      report.push(`${label}:упала`);
+      report.push(`${label}:упала(${describeError(error)})`);
+      // Текст и голова стека — в трассировку: консоль хоста не видна без отладки.
+      const stack = String(error?.stack ?? "").split("\n").slice(1, 4).join(" | ");
+      recordBootTrace(logger, `ошибка фичи ${label}: ${describeError(error)}${stack ? ` @ ${stack}` : ""}`);
     }
     if (disposed) {
       logger.warn("плагин выгружен во время запуска фич — остальные не запускаю");

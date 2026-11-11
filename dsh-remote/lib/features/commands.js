@@ -203,7 +203,10 @@ export const commandsFeature = {
   needs: [],
   async apply(ctx, config, deps) {
     const log = (message) => deps.logger.debug(message);
+    const trace = deps.trace ?? (() => {});
+    trace("commands:старт");
     const store = createStore({ log });
+    trace("commands:store создан");
 
     /** Выгрузили ли плагин, пока мы ждали credentials.resolve. */
     let disposed = false;
@@ -230,6 +233,7 @@ export const commandsFeature = {
     // Фасад регистрируем всегда: он же управляет каналом из config.telegram (004),
     // который фича telegram положит внутрь (adopt), а connect/disconnect смогут
     // остановить и заменить.
+    trace("commands:сервисы provide");
     const existing = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
     const facade = existing?.__isTransportFacade === true ? existing : createTransportFacade();
     if (existing !== null && existing !== facade) facade.set(existing);
@@ -273,12 +277,17 @@ export const commandsFeature = {
     // 012: в мультиканальном режиме фасад пуст, каналы живут в реестре —
     // status/on должны видеть хотя бы один живой канал.
     const currentChannel = () => facade.current ?? [...transportRegistry.values()][0] ?? null;
+    trace("commands:createRemoteCommands");
     const remote = createRemoteCommands({ ctx, store, log, ensureTransport: ensure, currentChannel });
+    trace("commands:register");
     deps.onDispose(remote.register(), "commands");
+    trace("commands:зарегистрирована");
 
     // Привязка из прошлого запуска: поднимаем канал до того, как каркас дойдёт до
     // фичи ответчика, — её `needs` уже будут выполнены.
+    trace("commands:ensureAtStart");
     const transport = await ensureAtStart();
+    trace(`commands:ensureAtStart готов (${transport === null ? "канала нет" : transport.id ?? "канал"})`);
     if (transport !== null) answererReady = true;
 
     deps.logger.info("фича commands: /remote зарегистрирована");
