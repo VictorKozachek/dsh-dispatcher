@@ -239,7 +239,7 @@ export const answererFeature = {
       hybrid: () => (store?.read?.().hybrid ?? { enabled: false }),
       registry,
       quickReplies: config?.quickReplies,
-      lang: () => resolveLanguage({ explicit: store?.read?.().lang ?? null }),
+      lang: () => resolveLanguage({ explicit: store?.read?.().lang ?? config?.lang ?? null }),
       reliability,
       metrics: deps.get("remoteMetrics") ?? null,
       deliver: reliability === null ? null : (argument) => reliability.deliver(argument),

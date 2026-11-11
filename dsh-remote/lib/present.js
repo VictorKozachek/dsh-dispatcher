@@ -27,29 +27,11 @@ import { DEFAULT_CAPS } from "./transport/base.js";
 import { normalizeQuickReplies } from "./quick-replies.js";
 import { DEFAULT_LANG, normalizeLang, t } from "./i18n.js";
 
-/** Кнопка свободного ответа: переключает вопрос в режим ожидания текста. */
-export const FREE_TEXT_LABEL = "Другой ответ…";
-
-/** Подсказка под вопросом без вариантов: как ответить из мессенджера. */
-export const FREE_TEXT_HINT = "↩︎ Ответьте текстом на это сообщение.";
-
-/** 044: подсказка, когда есть и быстрые кнопки, и возможность написать текст. */
-export const QUICK_REPLY_HINT = "↩︎ Или ответьте текстом на это сообщение.";
-
-/** Кнопка «вариантов больше, чем влезает» — раскрывает остальные. */
-export const MORE_LABEL = "Показать ещё";
-
 /** `optionId` кнопки свободного ответа в `callback_data`. */
 export const FREE_TEXT_OPTION = "free";
 
 /** `optionId` кнопки «Показать ещё» в `callback_data`. */
 export const MORE_OPTION = "more";
-
-/** Подсказка для multiSelect: одна кнопка-тумблер на вариант. */
-export const MULTISELECT_HINT = "Можно выбрать несколько вариантов.";
-
-/** Маркер усечения: честно говорит, что текст не влез целиком. */
-export const TRUNCATION_MARKER = "…обрезано";
 
 /** Предел длины имени воркспейса в шапке. */
 export const WORKSPACE_LIMIT = 32;

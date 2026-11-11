@@ -455,6 +455,8 @@ export function createRemoteCommands({
   ensureTransport = null,
   /** Живой транспорт канала (фасад): null, если канала нет. */
   currentChannel = null,
+  /** 046: язык из конфига плагина (если `/remote lang` ещё не задан). */
+  lang = null,
   testAnswerTimeoutMs = 30 * 60 * 1000,
   setTimeout: setTimeoutImpl = setTimeout,
 } = {}) {
@@ -1124,7 +1126,7 @@ export function createRemoteCommands({
   /** 046: язык команд: явная настройка состояния → локаль DSH → ru. */
   function currentLang() {
     try {
-      return resolveLanguage({ explicit: store.read().lang });
+      return resolveLanguage({ explicit: store.read().lang ?? lang });
     } catch {
       return DEFAULT_LANG;
     }
