@@ -45,6 +45,14 @@ import { createAudit } from "./audit.js";
 import { DEFAULT_KEEP, vacuum } from "./rotate.js";
 import { formatStats } from "./metrics.js";
 import { DEFAULT_LANG, LANGS, normalizeLang, resolveLanguage, t } from "./i18n.js";
+
+/** Язык текущего вызова команд: `t()` для строк, вынесенных в словарь (049). */
+let commandLang = DEFAULT_LANG;
+
+/** Перевод строки вывода команд на язык текущего вызова. */
+function tx(key, params = {}) {
+  return t(key, params, commandLang);
+}
 import { randomUUID } from "node:crypto";
 
 /**
@@ -87,8 +95,8 @@ export const MAX_TOKEN_REF = credentialRef("DSH_REMOTE_MAX_TOKEN");
 export function transportLabel(transport) {
   if (transport === "telegram") return "Telegram";
   if (transport === "max") return "MAX";
-  if (transport === "relay") return "релей";
-  return typeof transport === "string" && transport !== "" ? transport : "канал";
+  if (transport === "relay") return tx("commands.transportLabel.1");
+  return typeof transport === "string" && transport !== "" ? transport : tx("commands.transportLabel.2");
 }
 
 /** Ссылка на секрет транспорта: при переключении канала чистим именно её. */
@@ -105,7 +113,7 @@ export function tokenRefFor(transport) {
 export function switchNoteFor(previousTransport, nextTransport) {
   if (previousTransport === null || previousTransport === undefined) return null;
   if (previousTransport === nextTransport) return null;
-  return `${transportLabel(previousTransport)} отключён, ${transportLabel(nextTransport)} подключён`;
+  return tx("commands.switchNoteFor.1", { p0: transportLabel(previousTransport), p1: transportLabel(nextTransport) });
 }
 
 /** Адрес Bot API; переопределяется в тестах. */
@@ -174,10 +182,10 @@ export function formatDoctorReport(checks) {
   const failed = list.filter((check) => check.level === "fail").length;
   const warned = list.filter((check) => check.level === "warn").length;
   const summary = failed > 0
-    ? `есть проблемы: ${failed} fail, ${warned} warn — сделайте шаги из подсказок`
+    ? tx("commands.formatDoctorReport.1", { p0: failed, p1: warned })
     : warned > 0
-      ? `работает, но есть предупреждения: ${warned}`
-      : "всё в порядке";
+      ? tx("commands.formatDoctorReport.2", { p0: warned })
+      : tx("commands.formatDoctorReport.3");
   return [...lines, "", summary].join("\n");
 }
 
@@ -206,9 +214,9 @@ export async function runDoctorChecks({
 
   add(
     version === null ? "warn" : "ok",
-    "плагин",
-    version === null ? "версия не прочитана из package.json" : `dsh-remote ${version}`,
-    version === null ? "переустановите пакет: bin/install-remote.sh" : undefined,
+    tx("commands.runDoctorChecks.1"),
+    version === null ? tx("commands.runDoctorChecks.2") : `dsh-remote ${version}`,
+    version === null ? tx("commands.runDoctorChecks.3") : undefined,
   );
 
   // --- токен ---------------------------------------------------------------
@@ -219,9 +227,9 @@ export async function runDoctorChecks({
   let token = null;
   const access = credentials;
   if (access === null || typeof access?.availableFor !== "function") {
-    add("fail", "токен", "ctx.credentials недоступен", "задайте секрет или токен в окружении");
+    add("fail", tx("commands.runDoctorChecks.4"), tx("commands.runDoctorChecks.5"), tx("commands.runDoctorChecks.6"));
   } else if (!access.availableFor(tokenRef)) {
-    add("fail", "токен", `нет ссылки ${tokenRef}`, "получите токен у бота и выполните /remote connect");
+    add("fail", tx("commands.runDoctorChecks.4"), tx("commands.runDoctorChecks.7", { p0: tokenRef }), tx("commands.runDoctorChecks.8"));
   } else {
     try {
       token = await access.resolve(tokenRef);
@@ -229,13 +237,13 @@ export async function runDoctorChecks({
       token = null;
     }
     if (typeof token !== "string" || token === "") {
-      add("fail", "токен", `${tokenRef} не разрешился`, "проверьте секрет: /remote connect");
+      add("fail", tx("commands.runDoctorChecks.4"), tx("commands.runDoctorChecks.9", { p0: tokenRef }), tx("commands.runDoctorChecks.10"));
       token = null;
     } else {
       const info = typeof access.describe === "function" ? await access.describe(tokenRef).catch(() => null) : null;
       const source = typeof info?.source === "string" ? info.source : "unknown";
-      const readonly = info?.writable === false ? ", только чтение" : "";
-      add("ok", "токен", `${tokenRef} найден (источник: ${source}${readonly})`);
+      const readonly = info?.writable === false ? tx("commands.runDoctorChecks.11") : "";
+      add("ok", tx("commands.runDoctorChecks.4"), tx("commands.runDoctorChecks.12", { p0: tokenRef, p1: source, p2: readonly }));
     }
   }
 
@@ -245,17 +253,17 @@ export async function runDoctorChecks({
     try {
       health = await transport.healthCheck?.();
     } catch (error) {
-      add("fail", "канал", `MAX: healthCheck упал: ${humanError(error, token)}`, "проверьте сеть и токен MAX; webhook требует HTTPS:443 — используйте long polling");
+      add("fail", tx("commands.runDoctorChecks.13"), tx("commands.runDoctorChecks.14", { p0: humanError(error, token) }), tx("commands.runDoctorChecks.15"));
     }
     if (health !== null) {
       // 048: показываем активный хост — видно, что сработал фолбэк на api.
       const hostNote = maxHostNote(transport);
       add(
         health?.ok === true ? "ok" : "fail",
-        "канал",
-        `MAX: ${health?.detail ?? "?"}; marker ${transport.marker ?? "?"}; polling ${transport.polling === true ? "да" : "нет"}`
+        tx("commands.runDoctorChecks.13"),
+        tx("commands.runDoctorChecks.16", { p0: health?.detail ?? "?", p1: transport.marker ?? "?", p2: transport.polling === true ? tx("commands.runDoctorChecks.49") : tx("commands.runDoctorChecks.50") })
           + `${hostNote === null ? "" : `; ${hostNote}`}`,
-        health?.ok === true ? undefined : "проверьте токен MAX и сеть; webhook требует публичного HTTPS:443 — используйте long polling",
+        health?.ok === true ? undefined : tx("commands.runDoctorChecks.17"),
       );
     }
   }
@@ -268,52 +276,52 @@ export async function runDoctorChecks({
       add(
         typeof username === "string" && username !== "" ? "ok" : "warn",
         "getMe",
-        typeof username === "string" && username !== "" ? `бот @${username} на связи` : "Telegram ответил без username",
-        typeof username === "string" && username !== "" ? undefined : "проверьте токен у @BotFather",
+        typeof username === "string" && username !== "" ? tx("commands.runDoctorChecks.18", { p0: username }) : tx("commands.runDoctorChecks.19"),
+        typeof username === "string" && username !== "" ? undefined : tx("commands.runDoctorChecks.20"),
       );
     } catch (error) {
-      add("fail", "getMe", `Telegram не ответил: ${humanError(error, token)}`, "проверьте сеть и токен; токен можно перевыпустить у @BotFather");
+      add("fail", "getMe", tx("commands.runDoctorChecks.21", { p0: humanError(error, token) }), tx("commands.runDoctorChecks.22"));
     }
   } else if (activeTransport === "telegram" && token !== null) {
-    add("warn", "getMe", "проверка вне плагина недоступна");
+    add("warn", "getMe", tx("commands.runDoctorChecks.23"));
   }
 
   // --- поллеры -------------------------------------------------------------
   const lock = typeof store?.lockState === "function" ? store.lockState() : null;
   if (lock === null) {
-    add("warn", "поллеры", "состояние не подключено", "проверьте установку плагина");
+    add("warn", tx("commands.runDoctorChecks.24"), tx("commands.runDoctorChecks.25"), tx("commands.runDoctorChecks.26"));
   } else if (lock.held !== true) {
-    add("ok", "поллеры", "lock свободен");
+    add("ok", tx("commands.runDoctorChecks.24"), tx("commands.runDoctorChecks.27"));
   } else if (lock.mine === true) {
-    add("ok", "поллеры", `lock держит этот процесс (pid ${lock.holder?.pid ?? "?"})`);
+    add("ok", tx("commands.runDoctorChecks.24"), tx("commands.runDoctorChecks.28", { p0: lock.holder?.pid ?? "?" }));
   } else {
     add(
       "warn",
-      "поллеры",
-      `lock держит pid ${lock.holder?.pid ?? "?"}`,
-      "второй поллер получит 409 Conflict: остановите лишний процесс (или дождитесь завершения connect)",
+      tx("commands.runDoctorChecks.24"),
+      tx("commands.runDoctorChecks.29", { p0: lock.holder?.pid ?? "?" }),
+      tx("commands.runDoctorChecks.30"),
     );
   }
 
   // --- канал ---------------------------------------------------------------
   if (transport === null) {
-    add("warn", "канал", "транспорт не поднят", "привяжите бота: /remote connect");
+    add("warn", tx("commands.runDoctorChecks.13"), tx("commands.runDoctorChecks.31"), tx("commands.runDoctorChecks.32"));
   } else {
     const lastError = transport.lastError ?? null;
     const updateId = transport.lastUpdateId ?? null;
     if (lastError !== null) {
-      add("warn", "канал", `последняя ошибка: ${humanError(lastError, token)}`, "проверьте сеть и токен; поллинг повторяется сам с backoff");
+      add("warn", tx("commands.runDoctorChecks.13"), tx("commands.runDoctorChecks.33", { p0: humanError(lastError, token) }), tx("commands.runDoctorChecks.34"));
     } else if (Number.isFinite(updateId) && updateId >= 0) {
-      add("ok", "канал", `поллинг работает, последний update_id ${updateId}`);
+      add("ok", tx("commands.runDoctorChecks.13"), tx("commands.runDoctorChecks.35", { p0: updateId }));
     } else {
-      add("ok", "канал", "транспорт поднят");
+      add("ok", tx("commands.runDoctorChecks.13"), tx("commands.runDoctorChecks.36"));
     }
   }
 
   // --- состояние и права ---------------------------------------------------
   const statePath = typeof store?.paths?.file === "string" ? store.paths.file : null;
   if (statePath === null) {
-    add("warn", "состояние", "state.json не найден", "оно появится после /remote connect");
+    add("warn", tx("commands.runDoctorChecks.37"), tx("commands.runDoctorChecks.38"), tx("commands.runDoctorChecks.39"));
   } else {
     let text = null;
     let mode = null;
@@ -322,7 +330,7 @@ export async function runDoctorChecks({
       mode = fs.statSync(statePath).mode & 0o777;
     } catch (error) {
       const missing = error?.code === "ENOENT";
-      add(missing ? "warn" : "fail", "состояние", missing ? "файла ещё нет" : `не прочитан: ${humanError(error)}`, "оно появится после /remote connect");
+      add(missing ? "warn" : "fail", tx("commands.runDoctorChecks.37"), missing ? tx("commands.runDoctorChecks.40") : tx("commands.runDoctorChecks.41", { p0: humanError(error) }), tx("commands.runDoctorChecks.39"));
     }
     if (text !== null) {
       // Права проверяем независимо от содержимого: битый JSON — отдельная
@@ -330,24 +338,24 @@ export async function runDoctorChecks({
       if (mode !== null) {
         add(
           mode === 0o600 ? "ok" : "warn",
-          "права",
+          tx("commands.runDoctorChecks.42"),
           `state.json: ${mode.toString(8)}`,
-          mode === 0o600 ? undefined : `должно быть 600: chmod 600 ${statePath}`,
+          mode === 0o600 ? undefined : tx("commands.runDoctorChecks.43", { p0: statePath }),
         );
       }
       let parsed = null;
       try {
         parsed = JSON.parse(text);
       } catch {
-        add("fail", "состояние", "битый JSON", "удалите файл и выполните /remote connect заново");
+        add("fail", tx("commands.runDoctorChecks.37"), tx("commands.runDoctorChecks.44"), tx("commands.runDoctorChecks.45"));
       }
       if (parsed !== null && typeof parsed === "object") {
         const binding = parsed.bindings ?? null;
         add(
           binding === null ? "warn" : "ok",
-          "состояние",
-          binding === null ? "привязки нет" : `привязка: ${binding.transport ?? "telegram"} @${binding.botUsername ?? "?"}`,
-          binding === null ? "выполните /remote connect" : undefined,
+          tx("commands.runDoctorChecks.37"),
+          binding === null ? tx("commands.runDoctorChecks.46") : tx("commands.runDoctorChecks.47", { p0: binding.transport ?? "telegram", p1: binding.botUsername ?? "?" }),
+          binding === null ? tx("commands.runDoctorChecks.48") : undefined,
         );
       }
     }
@@ -369,7 +377,7 @@ function failure(text) {
 
 /** Текст ошибки без стека и без токена (токен вырезаем до показа человеку). */
 function humanError(error, token) {
-  const message = error instanceof Error ? (error.message || error.name) : String(error ?? "неизвестная ошибка");
+  const message = error instanceof Error ? (error.message || error.name) : String(error ?? tx("commands.humanError.1"));
   return token === undefined || token === null || token === "" ? message : message.split(token).join("<token>");
 }
 
@@ -384,10 +392,10 @@ function maxHostNote(transport) {
   if (active === "") return null;
   if (endpoint.fallbackUsed === true) {
     const primary = maxHostOf(endpoint.primary ?? "");
-    return `хост ${active} (фолбэк, ${primary === "" ? "platform-api2.max.ru" : primary} — TLS)`;
+    return tx("commands.maxHostNote.1", { p0: active, p1: primary === "" ? "platform-api2.max.ru" : primary });
   }
-  if (endpoint.fallback === null) return `хост ${active} (задан maxApiBase/MAX_API_BASE)`;
-  return `хост ${active}`;
+  if (endpoint.fallback === null) return tx("commands.maxHostNote.2", { p0: active });
+  return tx("commands.maxHostNote.3", { p0: active });
 }
 
 /** Шесть цифр pairing-кода. */
@@ -503,7 +511,7 @@ export function createRemoteCommands({
   async function askStep(invocation, { id, question, options }) {
     const service = serviceOf(ctx, "userQuestions");
     if (typeof service?.ask !== "function") {
-      throw new Error("локальные вопросы недоступны: нет ctx.userQuestions");
+      throw new Error(tx("commands.askStep.1"));
     }
     const item = {
       id,
@@ -533,7 +541,7 @@ export function createRemoteCommands({
         ...(signal === undefined ? {} : { signal }),
       });
     } catch (error) {
-      throw new Error(`Telegram ${method}: сеть недоступна (${humanError(error, token)})`);
+      throw new Error(tx("commands.telegramCall.1", { p0: method, p1: humanError(error, token) }));
     }
     let body = null;
     try {
@@ -543,7 +551,7 @@ export function createRemoteCommands({
     }
     if (body?.ok === true) return body.result;
     const status = Number(response?.status ?? 0);
-    const error = new Error(`Telegram ${method}: ${status} ${humanError(body?.description ?? "без описания", token)}`);
+    const error = new Error(tx("commands.telegramCall.2", { p0: method, p1: status, p2: humanError(body?.description ?? tx("commands.pollForCode.4"), token) }));
     error.code = status;
     error.retryAfterSec = Math.max(0, Number(body?.parameters?.retry_after ?? 0));
     throw error;
@@ -556,7 +564,7 @@ export function createRemoteCommands({
   async function pollForCode({ token, code, deadline, signal }) {
     let offset = 0;
     while (now() < deadline) {
-      if (signal?.aborted) throw new Error("подключение отменено");
+      if (signal?.aborted) throw new Error(tx("commands.pollForCode.1"));
       let updates;
       try {
         updates = await telegramCall(token, "getUpdates", {
@@ -566,10 +574,10 @@ export function createRemoteCommands({
         }, { signal });
       } catch (error) {
         if (error?.code === 409) {
-          throw new Error("на этот токен уже запущен другой поллер — остановите его и повторите /remote connect");
+          throw new Error(tx("commands.pollForCode.2"));
         }
         if (error?.code === 429) await sleep(Math.max(1000, error.retryAfterSec * 1000));
-        else if (error?.code === 401) throw new Error("Telegram не принял токен — проверьте его и повторите");
+        else if (error?.code === 401) throw new Error(tx("commands.pollForCode.3"));
         else await sleep(PAIRING_POLL_INTERVAL_MS);
         continue;
       }
@@ -593,16 +601,18 @@ export function createRemoteCommands({
    * упадёт, состояние не останется «наполовину обновлённым».
    */
   function planConnectScope(answer, invocation) {
-    const selected = answer.selected[0] ?? "";
-    if (/все проекты/i.test(selected)) {
-      return { plan: { kind: "global" }, note: "включён для всех проектов" };
+    const selected = String(answer.selected[0] ?? "").toLowerCase();
+    // Метки локализованы (049): сравниваем с обоими языками словаря.
+    const labels = (key) => [t(key, {}, "ru"), t(key, {}, "en")].map((label) => label.toLowerCase());
+    if (labels("commands.connect.16").includes(selected)) {
+      return { plan: { kind: "global" }, note: tx("commands.planConnectScope.1") };
     }
-    if (/только этот проект/i.test(selected)) {
+    if (labels("commands.connect.15").includes(selected)) {
       const { cwd } = sessionInfo(invocation);
-      if (cwd === null) return { plan: null, note: "привязка есть, но режим не включён: у сессии нет cwd" };
-      return { plan: { kind: "workspace", id: cwd }, note: `включён для воркспейса ${cwd}` };
+      if (cwd === null) return { plan: null, note: tx("commands.planConnectScope.2") };
+      return { plan: { kind: "workspace", id: cwd }, note: tx("commands.planConnectScope.3", { p0: cwd }) };
     }
-    return { plan: null, note: "режим пока выключен: включите его /remote on" };
+    return { plan: null, note: tx("commands.planConnectScope.4") };
   }
 
   /**
@@ -618,7 +628,7 @@ export function createRemoteCommands({
         try {
           await facade.stop();
         } catch (error) {
-          log(`фасад.stop при переключении: ${humanError(error)}`);
+          log(tx("commands.stopTransportChannels.1", { p0: humanError(error) }));
         }
       }
     }
@@ -629,7 +639,7 @@ export function createRemoteCommands({
         try {
           await channel.stop();
         } catch (error) {
-          log(`канал ${transportId}.stop при переключении: ${humanError(error)}`);
+          log(tx("commands.stopTransportChannels.2", { p0: transportId, p1: humanError(error) }));
         }
         try {
           channels.delete?.(channel.id);
@@ -656,12 +666,12 @@ export function createRemoteCommands({
     // закрыть сообщения), затем останавливаем его. Иначе вопрос остался бы с
     // кнопками, а ответ закрывал бы уже новый канал.
     try {
-      const cancellation = await ctx?.get?.("remoteAnswerer")?.cancelChannel?.(previousTransport, "канал отключён");
+      const cancellation = await ctx?.get?.("remoteAnswerer")?.cancelChannel?.(previousTransport, tx("commands.retireActiveChannel.1"));
       if (Number.isFinite(cancellation) && cancellation > 0) {
-        log(`переключение канала: снято открытых вопросов — ${cancellation}`);
+        log(tx("commands.retireActiveChannel.2", { p0: cancellation }));
       }
     } catch (error) {
-      log(`переключение канала: открытые вопросы не сняты (${humanError(error)})`);
+      log(tx("commands.retireActiveChannel.3", { p0: humanError(error) }));
     }
     await stopTransportChannels(previousTransport);
 
@@ -672,14 +682,14 @@ export function createRemoteCommands({
       if (described?.present === true) {
         if (described.writable === true) {
           secretNote = (await credentials.unset(ref))
-            ? `токен ${ref} удалён`
-            : `токен ${ref} удалить не удалось — удалите вручную`;
+            ? tx("commands.retireActiveChannel.4", { p0: ref })
+            : tx("commands.retireActiveChannel.5", { p0: ref });
         } else {
-          secretNote = `токен ${ref} остался в окружении (источник только для чтения)`;
+          secretNote = tx("commands.retireActiveChannel.6", { p0: ref });
         }
       }
     } catch (error) {
-      log(`секрет прежнего канала не очищен: ${humanError(error)}`);
+      log(tx("commands.retireActiveChannel.7", { p0: humanError(error) }));
     }
 
     return {
@@ -701,36 +711,36 @@ export function createRemoteCommands({
   async function connectRelay(invocation) {
     const urlAnswer = await askStep(invocation, {
       id: "remote-connect-relay-url",
-      question: "URL релея (например https://relay.example): в ответе «Другой ответ».",
+      question: tx("commands.connectRelay.1"),
     });
     const url = String(urlAnswer.custom ?? "").trim().replace(/\/+$/, "");
     if (url === "" || !/^https?:\/\//.test(url)) {
-      return failure("URL релея должен начинаться с http:// или https:// — привязка отменена");
+      return failure(tx("commands.connectRelay.2"));
     }
 
     const tokenAnswer = await askStep(invocation, {
       id: "remote-connect-relay-token",
-      question: `Токен агента релея (RELAY_AGENT_TOKEN сервера) — сохраним как ${RELAY_TOKEN_REF}. В ответе «Другой ответ».`,
+      question: tx("commands.connectRelay.3", { p0: RELAY_TOKEN_REF }),
     });
     const token = String(tokenAnswer.custom ?? "").trim();
-    if (token === "") return failure("токен не получен — привязка отменена");
+    if (token === "") return failure(tx("commands.connectRelay.4"));
 
     let health;
     try {
       health = await relayHealth(url, token);
     } catch (error) {
-      return failure(`релей недоступен: ${humanError(error, token)}`);
+      return failure(tx("commands.connectRelay.5", { p0: humanError(error, token) }));
     }
-    if (!health.ok) return failure(`релей не подтвердил себя: ${health.detail}`);
+    if (!health.ok) return failure(tx("commands.connectRelay.6", { p0: health.detail }));
     // Публичный /healthz не проверяет токен: нужен авторизованный пробник,
     // иначе неверный токен сохранится и всплывёт только на отправке вопроса.
     const probe = await relayAuthProbe(url, token);
-    if (!probe.ok) return failure(`релей не принял токен агента: ${probe.detail} — привязка отменена`);
+    if (!probe.ok) return failure(tx("commands.connectRelay.7", { p0: probe.detail }));
 
     const scopeAnswer = await askStep(invocation, {
       id: "remote-connect-scope",
-      question: "Включить удалённый режим?",
-      options: ["Только этот проект", "Все проекты", "Пока не включать"],
+      question: tx("commands.connectRelay.8"),
+      options: [tx("commands.connectRelay.9"), tx("commands.connectRelay.10"), tx("commands.connectRelay.11")],
     });
     const scope = planConnectScope(scopeAnswer, invocation);
     // 038: прежний канал отключаем ДО записи новой привязки.
@@ -749,36 +759,36 @@ export function createRemoteCommands({
         return state;
       });
     } catch (error) {
-      return failure(`привязка не сохранена: ${humanError(error, token)}`);
+      return failure(tx("commands.connectRelay.12", { p0: humanError(error, token) }));
     }
     const saved = await credentials.set(RELAY_TOKEN_REF, token);
     const tokenNote = saved
-      ? `токен сохранён как ${RELAY_TOKEN_REF}`
+      ? tx("commands.connectRelay.13", { p0: RELAY_TOKEN_REF })
       : credentials.available
-        ? `токен не сохранён: источник ${RELAY_TOKEN_REF} только для чтения`
-        : `токен взят из окружения (${RELAY_TOKEN_REF}) и не сохранён`;
+        ? tx("commands.connectRelay.14", { p0: RELAY_TOKEN_REF })
+        : tx("commands.connectRelay.15", { p0: RELAY_TOKEN_REF });
 
     // 038: поднимаем канал сразу, чтобы после переключения вопрос шёл в релей,
     // а не в прежний (уже остановленный) транспорт.
-    let channelNote = "канал поднимется при следующей загрузке профиля (или после /remote on)";
+    let channelNote = tx("commands.connectRelay.16");
     if (typeof ensureTransport === "function") {
       try {
         const started = await ensureTransport();
         if (started === null) {
-          channelNote = "привязка сохранена, но канал не поднят: проверьте /remote status";
+          channelNote = tx("commands.connectRelay.17");
         } else {
-          channelNote = "канал поднят: вопросы уходят в релей";
+          channelNote = tx("commands.connectRelay.18");
         }
       } catch (error) {
-        log(`ensureTransport после привязки релея: ${humanError(error, token)}`);
-        channelNote = "канал не поднялся — проверьте /remote status";
+        log(tx("commands.connectRelay.19", { p0: humanError(error, token) }));
+        channelNote = tx("commands.connectRelay.20");
       }
     }
 
     return success([
       ...(retired.switchNote === null ? [] : [retired.switchNote]),
       ...(retired.secretNote === null ? [] : [retired.secretNote]),
-      `релей привязан: ${url} (${health.detail})`,
+      tx("commands.connectRelay.21", { p0: url, p1: health.detail }),
       tokenNote,
       scope.note,
       channelNote,
@@ -796,11 +806,11 @@ export function createRemoteCommands({
         method: "GET",
         headers: { authorization: `Bearer ${token}`, "x-relay-version": "1" },
       });
-      if (response.status === 404) return { ok: true, detail: "токен принят" };
+      if (response.status === 404) return { ok: true, detail: tx("commands.relayAuthProbe.1") };
       if (response.status === 401 || response.status === 403) {
         return { ok: false, detail: `unauthorized (HTTP ${response.status})` };
       }
-      return { ok: false, detail: `неожиданный ответ HTTP ${response.status}` };
+      return { ok: false, detail: tx("commands.relayAuthProbe.2", { p0: response.status }) };
     } catch (error) {
       return { ok: false, detail: humanError(error, token) };
     }
@@ -826,11 +836,11 @@ export function createRemoteCommands({
   async function connectMax(invocation) {
     const tokenAnswer = await askStep(invocation, {
       id: "remote-connect-max-token",
-      question: "Токен бота MAX (business.max.ru/self → «Чат-боты» → ⋮ → «Настройки») — "
-        + `сохраним как ${MAX_TOKEN_REF}. В ответе «Другой ответ».`,
+      question: tx("commands.connectMax.1")
+        + tx("commands.connectMax.2", { p0: MAX_TOKEN_REF }),
     });
     const token = String(tokenAnswer.custom ?? "").trim();
-    if (token === "") return failure("токен MAX не получен — привязка отменена");
+    if (token === "") return failure(tx("commands.connectMax.3"));
 
     let me;
     try {
@@ -839,13 +849,13 @@ export function createRemoteCommands({
       // 048: TLS/сеть — это не «не принял токен»: у ошибки уже есть свой текст
       // про Russian Trusted CA и два варианта решения.
       if (error?.code === "MAX_TLS" || error?.code === "MAX_NETWORK") return failure(humanError(error, token));
-      return failure(`MAX не принял токен: ${humanError(error, token)}`);
+      return failure(tx("commands.connectMax.4", { p0: humanError(error, token) }));
     }
-    const botName = typeof me?.name === "string" && me.name !== "" ? me.name : "MAX-бот";
+    const botName = typeof me?.name === "string" && me.name !== "" ? me.name : tx("commands.connectMax.5");
     // 048: если api2 не прошёл TLS, pairing доопрашиваем по рабочему хосту.
     const pairingBase = me?.fallbackUsed === true && typeof me.apiBase === "string" ? me.apiBase : maxApiBase;
     if (me?.fallbackUsed === true) {
-      log(`MAX: ${maxHostOf(me.primaryBase)} недоступен по TLS — работаю через ${maxHostOf(me.apiBase)} (048)`);
+      log(tx("commands.connectMax.6", { p0: maxHostOf(me.primaryBase), p1: maxHostOf(me.apiBase) }));
     }
 
     const code = pairingCode(random);
@@ -854,9 +864,9 @@ export function createRemoteCommands({
     const pollDeadline = now() + Math.max(1_000, Math.floor(maxPairingDeadlineMs));
     await askStep(invocation, {
       id: "remote-connect-max-send-code",
-      question: `Откройте бота «${botName}» в MAX и отправьте ему код ${code} в течение 2 минут `
-        + "(бот MAX заводится только на юрлицо/ИП/самозанятого РФ). Отправили? Нажмите «Отправил».",
-      options: ["Отправил"],
+      question: tx("commands.connectMax.7", { p0: botName, p1: code })
+        + tx("commands.connectMax.8"),
+      options: [tx("commands.connectMax.9")],
     });
 
     let match;
@@ -877,35 +887,35 @@ export function createRemoteCommands({
       });
     } catch (error) {
       if (error?.name === "AbortError" || invocation?.signal?.aborted === true) {
-        return failure("привязка MAX отменена — опрос остановлен");
+        return failure(tx("commands.connectMax.10"));
       }
       const status = Number(error?.status ?? 0);
       if (status === 401 || status === 403) {
-        return failure("MAX не принял токен или бот не активирован: проверьте токен и нажмите Start у бота в MAX");
+        return failure(tx("commands.connectMax.11"));
       }
       if (status === 429) {
-        return failure(`MAX ограничил частоту запросов (429${error?.retryAfterMs ? `, retry_after ${Math.round(error.retryAfterMs / 1000)} с` : ""}) — повторите /remote connect позже`);
+        return failure(tx("commands.connectMax.12", { p0: error?.retryAfterMs ? tx("commands.connectMax.32", { p0: Math.round(error.retryAfterMs / 1000) }) : "" }));
       }
-      return failure(`не удалось получить код из MAX: ${humanError(error, token)}`);
+      return failure(tx("commands.connectMax.13", { p0: humanError(error, token) }));
     }
     if (match === null) {
       if (stats.lastError?.status === 429) {
-        return failure(`MAX ограничил частоту запросов (429${stats.lastError.retryAfterMs ? `, retry_after ${Math.round(stats.lastError.retryAfterMs / 1000)} с` : ""}) — повторите /remote connect позже`);
+        return failure(tx("commands.connectMax.12", { p0: stats.lastError.retryAfterMs ? tx("commands.connectMax.32", { p0: Math.round(stats.lastError.retryAfterMs / 1000) }) : "" }));
       }
       if (stats.lastError?.code === "MAX_TIMEOUT" || Number(stats.lastError?.status) >= 500) {
-        const reason = stats.lastError?.code === "MAX_TIMEOUT" ? "таймаут запроса" : `HTTP ${stats.lastError?.status}`;
-        return failure(`MAX временно недоступен (${reason}) — проверьте сеть и повторите /remote connect`);
+        const reason = stats.lastError?.code === "MAX_TIMEOUT" ? tx("commands.connectMax.14") : `HTTP ${stats.lastError?.status}`;
+        return failure(tx("commands.connectMax.15", { p0: reason }));
       }
       const types = stats.types.size === 0 ? "—" : [...stats.types].join(", ");
       const seconds = Math.round(Math.max(1_000, maxPairingDeadlineMs) / 1000);
-      return failure(`код ${code} не пришёл боту MAX за ${seconds} с; апдейтов: ${stats.updates}; `
-        + `типы: ${types}; хост: ${stats.host ?? "?"} — проверьте, что написали боту и нажали Start`);
+      return failure(tx("commands.connectMax.16", { p0: code, p1: seconds, p2: stats.updates })
+        + tx("commands.connectMax.17", { p0: types, p1: stats.host ?? "?" }));
     }
 
     const scopeAnswer = await askStep(invocation, {
       id: "remote-connect-scope",
-      question: "Включить удалённый режим?",
-      options: ["Только этот проект", "Все проекты", "Пока не включать"],
+      question: tx("commands.connectMax.18"),
+      options: [tx("commands.connectMax.19"), tx("commands.connectMax.20"), tx("commands.connectMax.21")],
     });
     const scope = planConnectScope(scopeAnswer, invocation);
     // 038: прежний канал отключаем ДО записи новой привязки.
@@ -926,33 +936,33 @@ export function createRemoteCommands({
         return state;
       });
     } catch (error) {
-      return failure(`привязка не сохранена: ${humanError(error, token)}`);
+      return failure(tx("commands.connectMax.22", { p0: humanError(error, token) }));
     }
 
     const saved = await credentials.set(MAX_TOKEN_REF, token);
     const tokenNote = saved
-      ? `токен сохранён как ${MAX_TOKEN_REF}`
+      ? tx("commands.connectMax.23", { p0: MAX_TOKEN_REF })
       : credentials.available
-        ? `токен не сохранён: источник ${MAX_TOKEN_REF} только для чтения`
-        : `токен взят из окружения (${MAX_TOKEN_REF}) и не сохранён`;
+        ? tx("commands.connectMax.24", { p0: MAX_TOKEN_REF })
+        : tx("commands.connectMax.25", { p0: MAX_TOKEN_REF });
 
-    let channelNote = "канал поднимется при следующей загрузке профиля (или после /remote on)";
+    let channelNote = tx("commands.connectMax.26");
     if (typeof ensureTransport === "function") {
       try {
         const started = await ensureTransport();
         channelNote = started === null
-          ? "привязка сохранена, но канал не поднят: проверьте /remote status"
-          : "канал поднят: вопросы уходят в MAX";
+          ? tx("commands.connectMax.27")
+          : tx("commands.connectMax.28");
       } catch (error) {
-        log(`ensureTransport после привязки MAX: ${humanError(error, token)}`);
-        channelNote = "канал не поднялся — проверьте /remote status";
+        log(tx("commands.connectMax.29", { p0: humanError(error, token) }));
+        channelNote = tx("commands.connectMax.30");
       }
     }
 
     return success([
       ...(retired.switchNote === null ? [] : [retired.switchNote]),
       ...(retired.secretNote === null ? [] : [retired.secretNote]),
-      `бот MAX «${botName}» привязан (чат ${match.chatId}, человек ${match.userId})`,
+      tx("commands.connectMax.31", { p0: botName, p1: match.chatId, p2: match.userId }),
       tokenNote,
       scope.note,
       channelNote,
@@ -965,11 +975,11 @@ export function createRemoteCommands({
     // вопрос про токен. Поэтому сначала просим выключить.
     const modeInfo = sessionInfo(invocation);
     if (registry.resolve({ sessionId: modeInfo.sessionId, workspace: modeInfo.cwd }).enabled) {
-      return failure("сначала выключите удалённый режим (/remote off): иначе шаги connect уйдут в мессенджер");
+      return failure(tx("commands.connect.1"));
     }
     const lock = store.acquireLock();
     if (!lock.ok) {
-      return failure(`другой процесс уже настраивает бота (pid ${lock.holder?.pid ?? "?"}) — закройте его и повторите`);
+      return failure(tx("commands.connect.2", { p0: lock.holder?.pid ?? "?" }));
     }
 
     let token = null;
@@ -978,8 +988,8 @@ export function createRemoteCommands({
       // (`DSH_REMOTE_RELAY_TOKEN`), и без Telegram-секрета его тоже можно подключить.
       const choice = await askStep(invocation, {
         id: "remote-connect-transport",
-        question: "Какой транспорт подключить?",
-        options: ["Telegram", "Relay (свой сервер)", "MAX"],
+        question: tx("commands.connect.3"),
+        options: ["Telegram", tx("commands.connect.4"), "MAX"],
       });
       if (choice.selected[0]?.startsWith("MAX") === true) {
         return await connectMax(invocation);
@@ -988,43 +998,43 @@ export function createRemoteCommands({
         return await connectRelay(invocation);
       }
       if (!credentials.availableFor(TELEGRAM_TOKEN_REF)) {
-        return failure(`токен неоткуда взять: нет ctx.credentials и нет переменной ${TELEGRAM_TOKEN_REF}`);
+        return failure(tx("commands.connect.5", { p0: TELEGRAM_TOKEN_REF }));
       }
 
       const tokenAnswer = await askStep(invocation, {
         id: "remote-connect-token",
-        question: "Пришлите токен бота от @BotFather (в ответе «Другой ответ»).",
+        question: tx("commands.connect.6"),
       });
       token = tokenAnswer.custom;
-      if (token === "") return failure("токен не получен — привязка отменена");
-      if (!looksLikeToken(token)) return failure("это не похоже на токен бота: нужен вид <цифры>:<строка>");
+      if (token === "") return failure(tx("commands.connect.7"));
+      if (!looksLikeToken(token)) return failure(tx("commands.connect.8"));
 
       const me = await telegramCall(token, "getMe");
       const botUsername = typeof me?.username === "string" ? me.username : null;
-      if (botUsername === null) return failure("Telegram не подтвердил токен — привязка отменена");
+      if (botUsername === null) return failure(tx("commands.connect.9"));
 
       const code = pairingCode(random);
       const deadline = now() + pairingTtlMs;
       await askStep(invocation, {
         id: "remote-connect-send-code",
-        question: `Отправьте боту @${botUsername} код ${code} в течение 10 минут. Отправили? Нажмите «Отправил».`,
-        options: ["Отправил"],
+        question: tx("commands.connect.10", { p0: botUsername, p1: code }),
+        options: [tx("commands.connect.11")],
       });
 
       const match = await pollForCode({ token, code, deadline, signal: invocation?.signal });
       if (match === null) {
-        return failure(`код ${code} не пришёл боту за 10 минут — привязки нет, повторите /remote connect`);
+        return failure(tx("commands.connect.12", { p0: code }));
       }
       if (match.chatId === null || match.userId === null) {
-        return failure("не удалось определить чат и человека из сообщения — привязка отменена");
+        return failure(tx("commands.connect.13"));
       }
 
       // Сначала спрашиваем про режим: если человек закроет вопрос, привязка не
       // появится «наполовину» — состояние меняется одним заходом в конце.
       const scopeAnswer = await askStep(invocation, {
         id: "remote-connect-scope",
-        question: "Включить удалённый режим?",
-        options: ["Только этот проект", "Все проекты", "Пока не включать"],
+        question: tx("commands.connect.14"),
+        options: [tx("commands.connect.15"), tx("commands.connect.16"), tx("commands.connect.17")],
       });
 
       const scope = planConnectScope(scopeAnswer, invocation);
@@ -1045,27 +1055,27 @@ export function createRemoteCommands({
           return state;
         });
       } catch (error) {
-        return failure(`привязка не сохранена: ${humanError(error, token)}`);
+        return failure(tx("commands.connect.18", { p0: humanError(error, token) }));
       }
 
       const saved = await credentials.set(TELEGRAM_TOKEN_REF, token);
       const tokenNote = saved
-        ? `токен сохранён как ${TELEGRAM_TOKEN_REF}`
+        ? tx("commands.connect.19", { p0: TELEGRAM_TOKEN_REF })
         : credentials.available
-          ? `токен не сохранён: источник ${TELEGRAM_TOKEN_REF} только для чтения`
-          : `токен взят из окружения (${TELEGRAM_TOKEN_REF}) и не сохранён`;
+          ? tx("commands.connect.20", { p0: TELEGRAM_TOKEN_REF })
+          : tx("commands.connect.21", { p0: TELEGRAM_TOKEN_REF });
       const scopeNote = scope.note;
 
       // Транспорт мог подняться ещё до привязки (фича telegram спит без неё), а
       // мог и не подняться вовсе (привязки не было при старте профиля). Просим
       // фичу поднять канал из состояния и, если сервис уже есть, — стартовать.
-      let channelNote = "канал поднимется при следующей загрузке профиля";
+      let channelNote = tx("commands.connect.22");
       let transport = null;
       if (typeof ensureTransport === "function") {
         try {
           transport = await ensureTransport();
         } catch (error) {
-          log(`ensureTransport после привязки: ${humanError(error, token)}`);
+          log(tx("commands.connect.23", { p0: humanError(error, token) }));
         }
       }
       if (transport === null) transport = liveTransport();
@@ -1074,26 +1084,26 @@ export function createRemoteCommands({
           const started = await transport.start();
           const live = liveTransport() ?? transport;
           if (started === false || live === null) {
-            channelNote = "привязка сохранена, но канал не поднят: проверьте /remote status";
+            channelNote = tx("commands.connect.24");
           } else {
-            channelNote = "канал поднят: вопросы уходят в мессенджер";
+            channelNote = tx("commands.connect.25");
           }
         } catch (error) {
-          log(`transport.start после привязки: ${humanError(error, token)}`);
-          channelNote = "канал не поднялся — проверьте /remote status";
+          log(tx("commands.connect.26", { p0: humanError(error, token) }));
+          channelNote = tx("commands.connect.27");
         }
       }
 
       return success([
         ...(retired.switchNote === null ? [] : [retired.switchNote]),
         ...(retired.secretNote === null ? [] : [retired.secretNote]),
-        `бот @${botUsername} привязан (чат ${match.chatId}, человек ${match.userId})`,
+        tx("commands.connect.28", { p0: botUsername, p1: match.chatId, p2: match.userId }),
         tokenNote,
         scopeNote,
         channelNote,
       ].join("\n"));
     } catch (error) {
-      return failure(`подключение не удалось: ${humanError(error, token)}`);
+      return failure(tx("commands.connect.29", { p0: humanError(error, token) }));
     } finally {
       store.releaseLock();
     }
@@ -1107,17 +1117,17 @@ export function createRemoteCommands({
       // его доставить, и сессия висит. Требуем привязку и живой канал.
       const state = store.read();
       if (state.bindings === null && liveTransport() === null) {
-        return failure("сначала привяжите бота: /remote connect");
+        return failure(tx("commands.setMode.1"));
       }
       if (typeof ensureTransport === "function") {
         try {
           await ensureTransport();
         } catch (error) {
-          return failure(`канал не поднят: ${humanError(error)}`);
+          return failure(tx("commands.setMode.2", { p0: humanError(error) }));
         }
       }
       const channel = liveTransport();
-      if (channel === null) return failure("канал не поднят: проверьте токен и /remote status");
+      if (channel === null) return failure(tx("commands.setMode.3"));
     }
     try {
       if (flags.has("hybrid")) store.setHybrid({ enabled });
@@ -1125,27 +1135,27 @@ export function createRemoteCommands({
       if (flags.has("all")) {
         store.setEnabled({ kind: "global" }, enabled);
         const decision = registry.resolve({ sessionId, workspace: cwd });
-        return success(`режим ${enabled ? "включён" : "выключен"} глобально\n${describeEffective(decision)}`);
+        return success(tx("commands.setMode.4", { p0: enabled ? tx("commands.setMode.10") : tx("commands.setMode.11"), p1: describeEffective(decision) }));
       }
       if (flags.has("session")) {
-        if (sessionId === null) return failure("не вижу id сессии — используйте --all или запустите из сессии");
+        if (sessionId === null) return failure(tx("commands.setMode.5"));
         store.setEnabled({ kind: "session", id: sessionId }, enabled);
-        return success(`режим ${enabled ? "включён" : "выключен"} для сессии ${sessionId}\n${describeEffective(registry.resolve({ sessionId, workspace: cwd }))}`);
+        return success(tx("commands.setMode.6", { p0: enabled ? tx("commands.setMode.10") : tx("commands.setMode.11"), p1: sessionId, p2: describeEffective(registry.resolve({ sessionId, workspace: cwd })) }));
       }
       if (cwd === null) {
-        return failure("не вижу cwd сессии — используйте --all (все проекты) или --session (эта сессия)");
+        return failure(tx("commands.setMode.7"));
       }
       store.setEnabled({ kind: "workspace", id: cwd }, enabled);
-      return success(`режим ${enabled ? "включён" : "выключен"} для воркспейса ${cwd}\n${describeEffective(registry.resolve({ sessionId, workspace: cwd }))}`);
+      return success(tx("commands.setMode.8", { p0: enabled ? tx("commands.setMode.10") : tx("commands.setMode.11"), p1: cwd, p2: describeEffective(registry.resolve({ sessionId, workspace: cwd })) }));
     } catch (error) {
-      return failure(`не удалось изменить режим: ${humanError(error)}`);
+      return failure(tx("commands.setMode.9", { p0: humanError(error) }));
     }
   }
 
   /** Человеческое описание эффективного режима. */
   function describeEffective(decision) {
-    const scope = decision.scope === "session" ? "сессия" : decision.scope === "workspace" ? "воркспейс" : decision.scope === "global" ? "глобально" : "нет настройки";
-    return `эффективно: ${decision.enabled ? "включён" : "выключен"} (${scope})`;
+    const scope = decision.scope === "session" ? tx("commands.describeEffective.1") : decision.scope === "workspace" ? tx("commands.describeEffective.2") : decision.scope === "global" ? tx("commands.describeEffective.3") : tx("commands.describeEffective.4");
+    return tx("commands.describeEffective.5", { p0: decision.enabled ? tx("commands.describeEffective.6") : tx("commands.describeEffective.7"), p1: scope });
   }
 
   /** `/remote status`. */
@@ -1187,36 +1197,36 @@ export function createRemoteCommands({
       lines.push(t("commands.status.notBound", {}, lang));
     } else if (state.bindings === null) {
       // Канал живёт из config профиля (004): привязки через /remote connect нет.
-      lines.push("бот не привязан через /remote connect; канал поднят из config профиля");
+      lines.push(tx("commands.status.1"));
     } else {
       const created = Number.isFinite(state.bindings.createdAt)
         ? new Date(state.bindings.createdAt).toISOString()
         : "?";
       if (state.bindings.transport === "relay") {
         const relay = liveTransport();
-        const health = typeof relay?.healthCheck === "function" ? await relay.healthCheck() : { ok: false, detail: "канал не поднят" };
-        lines.push(`релей: ${state.bindings.url ?? "?"}, ${health.ok ? "на связи" : `нет связи (${health.detail})`}`
-          + `${Number.isFinite(relay?.pending) ? `, ждёт ответа: ${relay.pending}` : ""}`);
+        const health = typeof relay?.healthCheck === "function" ? await relay.healthCheck() : { ok: false, detail: tx("commands.status.2") };
+        lines.push(tx("commands.status.3", { p0: state.bindings.url ?? "?", p1: health.ok ? tx("commands.status.23") : tx("commands.status.24", { p0: health.detail }) })
+          + tx("commands.status.4", { p0: Number.isFinite(relay?.pending) ? tx("commands.status.25", { p0: relay.pending }) : "" }));
         const e2e = relay?.e2e ?? null;
         lines.push(e2e === null
-          ? "e2e: выключен — тело вопроса и варианты идут открытым текстом"
-          : `e2e: включён (keyId ${e2e.keyId}, alg ${e2e.alg}) — тело вопроса и варианты шифруются`);
+          ? tx("commands.status.5")
+          : tx("commands.status.6", { p0: e2e.keyId, p1: e2e.alg }));
       } else if (state.bindings.transport === "max") {
         const live = liveTransport();
         const marker = Number.isFinite(live?.marker) ? live.marker : Number.isFinite(state.bindings.marker) ? state.bindings.marker : null;
         const lastError = live?.lastError ?? null;
-        lines.push(`бот MAX: «${state.bindings.botUsername ?? "?"}», чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
-        lines.push(`max: long polling ${live?.polling === true ? "работает" : "не запущен"}, marker ${marker ?? "?"}`
-          + `${lastError === null ? "" : `, последняя ошибка: ${humanError(lastError)}`}`);
+        lines.push(tx("commands.status.7", { p0: state.bindings.botUsername ?? "?", p1: state.bindings.chatId, p2: state.bindings.userId, p3: created }));
+        lines.push(tx("commands.status.8", { p0: live?.polling === true ? tx("commands.status.26") : tx("commands.status.27"), p1: marker ?? "?" })
+          + tx("commands.status.4", { p0: lastError === null ? "" : tx("commands.status.28", { p0: humanError(lastError) }) }));
         const hostNote = maxHostNote(live);
         if (hostNote !== null) lines.push(`max: ${hostNote}`);
-        lines.push("max: webhook недоступен без публичного HTTPS:443 — используется long polling");
+        lines.push(tx("commands.status.9"));
       } else {
-        lines.push(`бот: @${state.bindings.botUsername ?? "?"} (${state.bindings.transport}), чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
+        lines.push(tx("commands.status.10", { p0: state.bindings.botUsername ?? "?", p1: state.bindings.transport, p2: state.bindings.chatId, p3: state.bindings.userId, p4: created }));
       }
       // 038: история переключения — какой канал был активным до текущего.
       if (typeof state.bindings.previousTransport === "string" && state.bindings.previousTransport !== "") {
-        lines.push(`прежний канал: ${transportLabel(state.bindings.previousTransport)} (отключён)`);
+        lines.push(tx("commands.status.11", { p0: transportLabel(state.bindings.previousTransport) }));
       }
     }
 
@@ -1228,45 +1238,45 @@ export function createRemoteCommands({
     if (described.source === null) {
       lines.push(t("commands.status.secret", { ref: activeSecretRef }, lang));
     } else {
-      lines.push(`секрет: ${activeSecretRef} — источник ${described.source}${described.writable ? " (запись разрешена)" : " (только чтение)"}`);
+      lines.push(tx("commands.status.12", { p0: activeSecretRef, p1: described.source, p2: described.writable ? tx("commands.status.29") : tx("commands.status.30") }));
     }
 
-    const hybridState = state.hybrid.enabled ? `вкл, ждём ${Math.round(state.hybrid.waitMs / 1000)} с` : "выкл";
+    const hybridState = state.hybrid.enabled ? tx("commands.status.13", { p0: Math.round(state.hybrid.waitMs / 1000) }) : tx("commands.status.14");
     lines.push(t("commands.status.hybrid", { state: hybridState }, lang));
     const hybridStats = ctx?.get?.("remoteAnswerer")?.stats ?? null;
     if (hybridStats !== null && (hybridStats.hybridHanded > 0 || hybridStats.hybridPhoneAnswers > 0)) {
-      lines.push(`гибрид-метрика: в GUI ${hybridStats.hybridHanded}, ответов из телефона после GUI ${hybridStats.hybridPhoneAnswers}`);
+      lines.push(tx("commands.status.15", { p0: hybridStats.hybridHanded, p1: hybridStats.hybridPhoneAnswers }));
     }
     const approvalAudit = audit.stats();
-    lines.push(`подтверждения: удалённо ${approvalAudit.remote}, в GUI ${approvalAudit.gui}, без ответа ${approvalAudit.timeout} (всего ${approvalAudit.total})`);
-    lines.push(`режим: глобально ${state.enabled.global ? "вкл" : "выкл"}; проект ${cwd === null ? "?" : cwd} ${cwd !== null && state.enabled.workspaces[cwd] === true ? "вкл" : "выкл"}; сессия ${sessionId === null ? "?" : sessionId} ${sessionId !== null && state.enabled.sessions[sessionId] === true ? "вкл" : "выкл"}`);
+    lines.push(tx("commands.status.16", { p0: approvalAudit.remote, p1: approvalAudit.gui, p2: approvalAudit.timeout, p3: approvalAudit.total }));
+    lines.push(tx("commands.status.17", { p0: state.enabled.global ? tx("commands.status.31") : tx("commands.status.14"), p1: cwd === null ? "?" : cwd, p2: cwd !== null && state.enabled.workspaces[cwd] === true ? tx("commands.status.31") : tx("commands.status.14"), p3: sessionId === null ? "?" : sessionId, p4: sessionId !== null && state.enabled.sessions[sessionId] === true ? tx("commands.status.31") : tx("commands.status.14") }));
     lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
 
     // 025: действующая политика подтверждений (публикует ответчик approvals 024).
     try {
       const policy = ctx?.get?.("remoteApprovalPolicy") ?? null;
       if (policy !== null && typeof policy?.describe === "function") {
-        for (const line of policy.describe()) lines.push(line);
+        for (const line of policy.describe(currentLang())) lines.push(line);
       } else {
         lines.push(t("commands.status.approvals", {}, lang));
       }
     } catch (error) {
-      lines.push(`approvals: политика не прочитана (${humanError(error)})`);
+      lines.push(tx("commands.status.18", { p0: humanError(error) }));
     }
 
     const channels = Object.entries(state.channels ?? {});
     if (channels.length === 0) {
-      lines.push("каналы проектов: нет — все вопросы идут в общий чат");
+      lines.push(tx("commands.status.19"));
     } else {
       for (const [name, perTransport] of channels) {
         for (const [transportId, channel] of Object.entries(perTransport)) {
-          lines.push(`канал ${name} (${transportId}): чат ${channel.chatId}${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
+          lines.push(tx("commands.status.20", { p0: name, p1: transportId, p2: channel.chatId, p3: channel.threadId === undefined ? "" : tx("commands.status.32", { p0: channel.threadId }) }));
         }
       }
     }
 
     const lock = store.lockState();
-    lines.push(lock.held ? `поллер: занят (pid ${lock.holder?.pid ?? "?"})` : "поллер: свободен");
+    lines.push(lock.held ? tx("commands.status.21", { p0: lock.holder?.pid ?? "?" }) : tx("commands.status.22"));
 
     return success(lines.join("\n"));
   }
@@ -1280,14 +1290,14 @@ export function createRemoteCommands({
         .map((part) => String(part).padStart(2, "0"))
         .join(":");
     const decision = entry.decision === "remote"
-      ? "удалённо"
+      ? tx("commands.auditLine.1")
       : entry.decision === "gui"
         ? "GUI"
-        : entry.decision === "late" ? "поздний" : "таймаут";
+        : entry.decision === "late" ? tx("commands.auditLine.2") : tx("commands.auditLine.3");
     const parts = [time, entry.toolName ?? "?", entry.outcome ?? "?", decision];
     if (typeof entry.channel === "string" && entry.channel !== "") parts.push(entry.channel);
-    if (typeof entry.answeredBy === "string" && entry.answeredBy !== "") parts.push(`ответил ${entry.answeredBy}`);
-    if (Number.isFinite(entry.waitedMs)) parts.push(`ждали ${Math.round(entry.waitedMs / 1000)} с`);
+    if (typeof entry.answeredBy === "string" && entry.answeredBy !== "") parts.push(tx("commands.auditLine.4", { p0: entry.answeredBy }));
+    if (Number.isFinite(entry.waitedMs)) parts.push(tx("commands.auditLine.5", { p0: Math.round(entry.waitedMs / 1000) }));
     if (typeof entry.callId === "string" && entry.callId !== "") parts.push(`call ${entry.callId}`);
     return `  ${parts.join(" · ")}`;
   }
@@ -1305,17 +1315,17 @@ export function createRemoteCommands({
     if (raw !== undefined && raw !== "") {
       const parsed = Number.parseInt(String(raw), 10);
       if (!Number.isFinite(parsed) || parsed <= 0) {
-        return failure("usage: /remote audit [N], где N — целое больше нуля");
+        return failure(tx("commands.auditCommand.1"));
       }
       limit = Math.min(parsed, 200);
     }
     const entries = audit.tail(limit);
     if (entries.length === 0) {
-      return success("журнал подтверждений пуст: удалённых решений ещё не было");
+      return success(tx("commands.auditCommand.2"));
     }
     const summary = audit.stats();
     return success([
-      `Последние ${entries.length} из ${summary.total} решений по подтверждениям:`,
+      tx("commands.auditCommand.3", { p0: entries.length, p1: summary.total }),
       ...entries.map(auditLine),
     ].join("\n"));
   }
@@ -1323,17 +1333,17 @@ export function createRemoteCommands({
   /** `/remote test` — отправить тестовый вопрос через живой транспорт. */
   async function testChannel(invocation) {
     const state = store.read();
-    if (state.bindings === null && liveTransport() === null) return failure("бот не привязан: /remote connect");
+    if (state.bindings === null && liveTransport() === null) return failure(tx("commands.testChannel.1"));
     const transport = liveTransport();
     if (transport === null || typeof transport.sendQuestion !== "function") {
-      return failure("канал не поднят: /remote connect");
+      return failure(tx("commands.testChannel.2"));
     }
     const shortId = String(Math.floor(random() * 0xffffffff)).padStart(8, "0").slice(0, 8);
     const question = {
       shortId,
-      title: "Проверка канала",
-      body: "Это тестовый вопрос от dsh-remote. Ответьте любым вариантом.",
-      options: [{ id: "o1", label: "Ок" }],
+      title: tx("commands.testChannel.3"),
+      body: tx("commands.testChannel.4"),
+      options: [{ id: "o1", label: tx("commands.testChannel.5") }],
     };
     // Тестовый вопрос не проходит через ответчик (у него свой реестр), поэтому
     // ответ на кнопку закрываем здесь: сообщение не останется с кнопками.
@@ -1352,22 +1362,22 @@ export function createRemoteCommands({
         off = transport.onAnswer((event) => {
           if (event?.shortId !== shortId) return;
           cleanup();
-          void transport.closeQuestion?.(question, "тест пройден");
+          void transport.closeQuestion?.(question, tx("commands.testChannel.6"));
         });
         // Если человек так и не нажал — подписка не должна жить вечно.
         timer = setTimeoutImpl(() => {
           cleanup();
-          log(`/remote test: ответа на тестовый вопрос ${shortId} не было — подписка снята`);
+          log(tx("commands.testChannel.7", { p0: shortId }));
         }, testAnswerTimeoutMs);
         timer?.unref?.();
       }
       await transport.sendQuestion(question);
     } catch (error) {
       cleanup();
-      return failure(`отправить не удалось: ${humanError(error)}`);
+      return failure(tx("commands.testChannel.8", { p0: humanError(error) }));
     }
     store.addRecent({ shortId, sessionId: sessionInfo(invocation).sessionId, status: "test" });
-    return success("тестовый вопрос отправлен — нажмите кнопку в мессенджере, сообщение закроется");
+    return success(tx("commands.testChannel.9"));
   }
 
   /** `/remote who` — кто мы и в каком режиме. */
@@ -1375,8 +1385,8 @@ export function createRemoteCommands({
     const { sessionId, cwd } = sessionInfo(invocation);
     const decision = registry.resolve({ sessionId, workspace: cwd });
     return success([
-      `сессия: ${sessionId ?? "?"}`,
-      `воркспейс: ${cwd ?? "?"}`,
+      tx("commands.who.1", { p0: sessionId ?? "?" }),
+      tx("commands.who.2", { p0: cwd ?? "?" }),
       describeEffective(decision),
     ].join("\n"));
   }
@@ -1391,25 +1401,25 @@ export function createRemoteCommands({
 
     if (action === "list" || action === undefined) {
       const channels = Object.entries(store.read().channels ?? {});
-      if (channels.length === 0) return success("каналы проектов не заданы: все вопросы идут в общий чат");
+      if (channels.length === 0) return success(tx("commands.channelCommand.1"));
       const lines = [];
       for (const [name, perTransport] of channels) {
         for (const [transportId, channel] of Object.entries(perTransport)) {
-          lines.push(`${name} (${transportId}) → чат ${channel.chatId}${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
+          lines.push(tx("commands.channelCommand.2", { p0: name, p1: transportId, p2: channel.chatId, p3: channel.threadId === undefined ? "" : tx("commands.channelCommand.15", { p0: channel.threadId }) }));
         }
       }
       return success(lines.join("\n"));
     }
 
     if (action === "remove") {
-      if (typeof target !== "string" || target === "") return failure("укажите проект: /remote channel remove <проект>");
+      if (typeof target !== "string" || target === "") return failure(tx("commands.channelCommand.3"));
       const key = target.trim().replace(/[\\/]+$/, "").split(/[\\/]/).pop();
-      if (!(key in (store.read().channels ?? {}))) return failure(`у проекта ${key} нет своего канала — он и так в общем чате`);
+      if (!(key in (store.read().channels ?? {}))) return failure(tx("commands.channelCommand.4", { p0: key }));
       const transport = flagValues?.get("transport") ?? null;
       store.removeChannel(target, transport);
       return success(transport === null
-        ? `проект ${key} снова идёт в общий чат`
-        : `у проекта ${key} убран канал транспорта ${transport}`);
+        ? tx("commands.channelCommand.5", { p0: key })
+        : tx("commands.channelCommand.6", { p0: key, p1: transport }));
     }
 
     // set: `/remote channel <проект> <chatId> [threadId]`
@@ -1418,22 +1428,22 @@ export function createRemoteCommands({
     // У групп и супергрупп Telegram chat_id отрицательный (форумы с топиками тоже),
     // поэтому требуем лишь целое ненулевое число.
     if (!Number.isInteger(numericChat) || numericChat === 0) {
-      return failure("chatId должен быть целым ненулевым числом (у групп и супергрупп он отрицательный): "
-        + "/remote channel <проект> <chatId>");
+      return failure(tx("commands.channelCommand.7")
+        + tx("commands.channelCommand.8"));
     }
     const bindingChat = store.read().bindings?.chatId;
     // Чужой чат: бот может быть в нём не участником, и тогда ответы не придут.
     // Осознанный обход — --force (человек знает, что бот добавлен в чат).
     if (bindingChat !== undefined && bindingChat !== null && String(bindingChat) !== String(numericChat) && !flags.has("force")) {
-      return failure(`чат ${numericChat} не совпадает с привязанным (${bindingChat}): это чужой чат. `
-        + "Если бот действительно добавлен туда, повторите с --force");
+      return failure(tx("commands.channelCommand.9", { p0: numericChat, p1: bindingChat })
+        + tx("commands.channelCommand.10"));
     }
     const transport = flagValues?.get("transport") ?? null;
     let channel = { chatId: numericChat };
     if (threadIdRaw !== undefined && threadIdRaw !== "") {
       const numericThread = Number(threadIdRaw);
       if (!Number.isInteger(numericThread) || numericThread <= 0) {
-        return failure("threadId (топик форума) должен быть целым положительным числом");
+        return failure(tx("commands.channelCommand.11"));
       }
       channel = { chatId: numericChat, threadId: numericThread };
     }
@@ -1441,10 +1451,10 @@ export function createRemoteCommands({
     try {
       store.setChannel(name, channel, transport);
     } catch (error) {
-      return failure(`канал не сохранён: ${humanError(error)}`);
+      return failure(tx("commands.channelCommand.12", { p0: humanError(error) }));
     }
-    return success(`проект ${name} (${channel.transport ?? store.read().bindings?.transport ?? "default"}) → чат ${channel.chatId}`
-      + `${channel.threadId === undefined ? "" : `, топик ${channel.threadId}`}`);
+    return success(tx("commands.channelCommand.13", { p0: name, p1: channel.transport ?? store.read().bindings?.transport ?? "default", p2: channel.chatId })
+      + tx("commands.channelCommand.14", { p0: channel.threadId === undefined ? "" : tx("commands.channelCommand.15", { p0: channel.threadId }) }));
   }
 
   /**
@@ -1455,21 +1465,21 @@ export function createRemoteCommands({
    */
   async function vacuumCommand(invocation, flags) {
     const dir = typeof store?.paths?.dir === "string" ? store.paths.dir : null;
-    if (dir === null) return failure("хранилище не найдено: сначала /remote connect");
+    if (dir === null) return failure(tx("commands.vacuumCommand.1"));
     const dryRun = flags?.has?.("dry-run") === true;
     const result = vacuum(fs, { dir, keep: DEFAULT_KEEP, dryRun, log: (message) => log(message) });
-    const size = (bytes) => `${(bytes / 1024).toFixed(1)} КБ`;
+    const size = (bytes) => tx("commands.vacuumCommand.2", { p0: (bytes / 1024).toFixed(1) });
     const lines = [];
     if (result.removed.length === 0) {
-      lines.push(dryRun ? "удалять нечего: старых журналов нет" : "очистка не требуется: старых журналов нет");
+      lines.push(dryRun ? tx("commands.vacuumCommand.3") : tx("commands.vacuumCommand.4"));
     } else if (dryRun) {
-      lines.push(`--dry-run: будет удалено ${result.removed.length} файлов (${size(result.freedBytes)}):`);
+      lines.push(tx("commands.vacuumCommand.5", { p0: result.removed.length, p1: size(result.freedBytes) }));
       lines.push(...result.removed.map((item) => `  ${path.basename(item.path)} — ${size(item.size)}`));
     } else {
-      lines.push(`удалено ${result.removed.length} файлов, освобождено ${size(result.freedBytes)}:`);
+      lines.push(tx("commands.vacuumCommand.6", { p0: result.removed.length, p1: size(result.freedBytes) }));
       lines.push(...result.removed.map((item) => `  ${path.basename(item.path)} — ${size(item.size)}`));
     }
-    lines.push(`оставлено ротированных файлов: ${result.kept.length} (keep=${DEFAULT_KEEP})`);
+    lines.push(tx("commands.vacuumCommand.7", { p0: result.kept.length, p1: DEFAULT_KEEP }));
     return success(lines.join("\n"));
   }
 
@@ -1482,7 +1492,7 @@ export function createRemoteCommands({
   async function stats(invocation, flags) {
     const metrics = ctx?.get?.("remoteMetrics") ?? null;
     if (metrics === null || typeof metrics?.snapshot !== "function") {
-      return failure("метрики недоступны: плагин без фичи metrics (031)");
+      return failure(tx("commands.stats.1"));
     }
     // Живые размеры очередей: не мутируем метрики чтением, а кладём в снимок.
     const live = {};
@@ -1494,12 +1504,12 @@ export function createRemoteCommands({
       const approvals = ctx?.get?.("remoteApprovals") ?? null;
       if (Number.isFinite(approvals?.pendingOpen)) live.approvals_open = approvals.pendingOpen;
     } catch (error) {
-      log(`stats: размеры очередей не прочитаны (${humanError(error)})`);
+      log(tx("commands.stats.2", { p0: humanError(error) }));
     }
     const base = metrics.snapshot();
     const snapshot = { ...base, queues: { ...base.queues, ...live } };
     if (flags?.has?.("json") === true) return success(JSON.stringify(snapshot));
-    return success(formatStats(snapshot));
+    return success(formatStats(snapshot, currentLang()));
   }
 
   /**
@@ -1541,21 +1551,26 @@ export function createRemoteCommands({
       store,
       reliability: ctx?.get?.("remoteReliability") ?? null,
       supportedSchemaVersion: STATE_VERSION,
+      lang: currentLang(),
     });
     const report = buildReport(checks);
     if (flags?.has?.("json") === true) {
       return { ...success(serializeReport(report)), exitCode: report.exitCode };
     }
-    return { ...success(formatHealthReport(report)), exitCode: report.exitCode };
+    return { ...success(formatHealthReport(report, currentLang())), exitCode: report.exitCode };
   }
 
   async function disconnect(invocation) {
     const confirm = await askStep(invocation, {
       id: "remote-disconnect-confirm",
-      question: "Отвязать бота и выключить удалённый режим?",
-      options: ["Да, отвязать", "Нет"],
+      question: tx("commands.disconnect.1"),
+      options: [tx("commands.disconnect.2"), tx("commands.disconnect.3")],
     });
-    if (!/^Да/i.test(confirm.selected[0] ?? "")) return success("отключение отменено");
+    const confirmLabels = [t("commands.disconnect.2", {}, "ru"), t("commands.disconnect.2", {}, "en")]
+      .map((label) => label.toLowerCase());
+    if (!confirmLabels.includes(String(confirm.selected[0] ?? "").toLowerCase())) {
+      return success(tx("commands.disconnect.4"));
+    }
 
     // 038: чистим токен АКТИВНОГО канала, а не всегда Telegram.
     const activeTransport = (() => {
@@ -1572,18 +1587,18 @@ export function createRemoteCommands({
         return state;
       });
     } catch (error) {
-      return failure(`не удалось очистить привязку: ${humanError(error)}`);
+      return failure(tx("commands.disconnect.5", { p0: humanError(error) }));
     }
 
     const activeRef = tokenRefFor(activeTransport);
     const described = await credentials.describe(activeRef);
-    let secretNote = `секрет ${activeRef} оставлен`;
+    let secretNote = tx("commands.disconnect.6", { p0: activeRef });
     if (described.present && described.writable) {
       secretNote = (await credentials.unset(activeRef))
-        ? `секрет ${activeRef} удалён`
-        : `секрет ${activeRef} удалить не удалось — удалите вручную`;
+        ? tx("commands.disconnect.7", { p0: activeRef })
+        : tx("commands.disconnect.8", { p0: activeRef });
     } else if (described.present) {
-      secretNote = `секрет ${activeRef} из окружения — удалите переменную сами`;
+      secretNote = tx("commands.disconnect.9", { p0: activeRef });
     }
 
     const transport = ctx?.get?.("remoteTransport") ?? null;
@@ -1614,24 +1629,25 @@ export function createRemoteCommands({
         try {
           await channel.stop();
         } catch (error) {
-          log(`канал ${channel.id ?? "?"}.stop: ${humanError(error)}`);
+          log(tx("commands.disconnect.10", { p0: channel.id ?? "?", p1: humanError(error) }));
         }
       }
       try {
         registry.clear?.();
       } catch (error) {
-        log(`реестр каналов не очищен: ${humanError(error)}`);
+        log(tx("commands.disconnect.11", { p0: humanError(error) }));
       }
     }
 
     return success([
-      `привязка (${transportLabel(activeTransport)}) удалена, режим выключен`,
+      tx("commands.disconnect.12", { p0: transportLabel(activeTransport) }),
       secretNote,
     ].join("\n"));
   }
 
   /** Обработчик `/remote`: разбор и диспетчеризация. */
   async function handler(invocation) {
+    commandLang = currentLang();
     const { subcommand, flags, rest, flagValues } = parseRemoteArgs(invocation?.rawInput);
     try {
       switch (subcommand) {
@@ -1676,7 +1692,7 @@ export function createRemoteCommands({
 
   const definition = {
     name: "remote",
-    description: "удалённое управление вопросами: connect | on | off | status | test | who | disconnect",
+    description: tx("commands.help.1"),
     input: { hint: "connect|on|off|status|test|who|disconnect" },
     recordInput: false,
     handler,
@@ -1686,7 +1702,7 @@ export function createRemoteCommands({
   function register() {
     const commands = serviceOf(ctx, "commands");
     if (typeof commands?.register !== "function") {
-      log("команды: ctx.commands недоступен — /remote не зарегистрирован");
+      log(tx("commands.register.1"));
       return () => {};
     }
     return commands.register(definition) ?? (() => {});

@@ -118,24 +118,29 @@ export function createMetrics({ now = () => Date.now(), log = noopLog } = {}) {
   return { inc, observeLatency, transportError, gauge, snapshot, startedAt };
 }
 
+import { DEFAULT_LANG, normalizeLang, t } from "./i18n.js";
+
 /** Человеческий вывод `/remote stats`: короткие строки, без секретов. */
-export function formatStats(snapshot) {
+export function formatStats(snapshot, lang = DEFAULT_LANG) {
+  const code = normalizeLang(lang) ?? DEFAULT_LANG;
   const q = snapshot.questions;
   const a = snapshot.approvals;
   const d = snapshot.deliveries;
   const latency = snapshot.latency;
   const avg = latency.count > 0 ? Math.round(latency.sumMs / latency.count) : 0;
   const lines = [
-    `вопросы: задано ${q.asked}, отвечено ${q.answered}, истекло ${q.expired}, отменено ${q.cancelled}`,
-    `подтверждения: allowed-once ${a.allowed_once}, отклонено ${a.rejected}, unavailable ${a.unavailable}, cancelled ${a.cancelled}`,
-    `подтверждения: policy-GUI ${a.policy_gui}, таймаут ${a.timeout}, поздних ${a.late}`,
-    `доставки: отправлено ${d.sent}, ошибок ${d.failed}, повторов ${d.retried}`,
-    `очереди: доставок ${snapshot.queues.deliveries_pending}, таймеров ${snapshot.queues.timers_active}, подтверждений ${snapshot.queues.approvals_open}`,
-    `латентность ответа: наблюдений ${latency.count}, среднее ${avg} мс`,
-    `uptime: ${Math.round(snapshot.uptimeMs / 1000)} с`,
+    t("metrics.questions", { p0: q.asked, p1: q.answered, p2: q.expired, p3: q.cancelled }, code),
+    t("metrics.approvals", { p0: a.allowed_once, p1: a.rejected, p2: a.unavailable, p3: a.cancelled }, code),
+    t("metrics.approvalsExtra", { p0: a.policy_gui, p1: a.timeout, p2: a.late }, code),
+    t("metrics.deliveries", { p0: d.sent, p1: d.failed, p2: d.retried }, code),
+    t("metrics.queues", { p0: snapshot.queues.deliveries_pending, p1: snapshot.queues.timers_active, p2: snapshot.queues.approvals_open }, code),
+    t("metrics.latency", { p0: latency.count, p1: avg }, code),
+    t("metrics.uptime", { p0: Math.round(snapshot.uptimeMs / 1000) }, code),
   ];
   const errors = Object.entries(snapshot.errors ?? {});
-  if (errors.length > 0) lines.push(`ошибки транспортов: ${errors.map(([id, count]) => `${id}=${count}`).join(", ")}`);
+  if (errors.length > 0) {
+    lines.push(t("metrics.errors", { p0: errors.map(([id, count]) => `${id}=${count}`).join(", ") }, code));
+  }
   return lines.join("\n");
 }
 

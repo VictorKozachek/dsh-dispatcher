@@ -181,3 +181,52 @@ test("046: статическая проверка — в present/quick-replies 
     assert.deepEqual(offenders, [], `${file}: пользовательские строки — только через i18n.js`);
   }
 });
+
+test("049: в commands.js нет русских литералов вне словаря", async () => {
+  const fs = await import("node:fs");
+  const url = await import("node:url");
+  const file = url.fileURLToPath(new URL("../lib/commands.js", import.meta.url));
+  const stripComments = (source) => source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  const source = stripComments(fs.readFileSync(file, "utf8"));
+  const literal = /("([^"\\]|\\.)*"|`([^`\\]|\\.)*`)/g;
+  const offenders = [];
+  for (const match of source.matchAll(literal)) {
+    if (/[А-Яа-яЁё]/.test(match[0])) offenders.push(match[0].slice(0, 60));
+  }
+  assert.deepEqual(offenders, [], "пользовательские строки должны жить в i18n-commands.js");
+  assert.equal(/[А-Яа-яЁё]/.test(source), false, "в коде commands.js не осталось кириллицы");
+});
+
+test("049: вывод команд на EN без кириллицы, ключей и undefined", async (t) => {
+  const { store, remote, invoke } = harness(t);
+  await remote.handler(invoke("lang en"));
+  store.setLang("en");
+
+  const outputs = new Map();
+  for (const command of ["status", "help", "audit", "channel list", "vacuum --dry-run", "stats", "who"]) {
+    const result = await remote.handler(invoke(command));
+    outputs.set(command, result.text);
+    assert.doesNotMatch(result.text, /[А-Яа-яЁё]/, `${command}: кириллица в EN`);
+    assert.doesNotMatch(result.text, /commands\.[a-z]+\.\d+/, `${command}: ключ просочился`);
+    assert.doesNotMatch(result.text, /undefined/, `${command}: undefined в выводе`);
+    assert.doesNotMatch(result.text, /\$\{/, `${command}: сырой шаблон в выводе`);
+  }
+  assert.match(outputs.get("status"), /language: en/);
+  assert.match(outputs.get("audit"), /approval journal is empty|Last/);
+  assert.match(outputs.get("vacuum --dry-run"), /nothing to delete|cleanup not needed|no old journals/);
+});
+
+test("049: help и doctor на EN не содержат русских фрагментов", async (t) => {
+  const { store, remote, invoke } = harness(t);
+  await remote.handler(invoke("lang en"));
+  store.setLang("en");
+
+  const help = await remote.handler(invoke("help"));
+  assert.doesNotMatch(help.text, /[А-Яа-яЁё]/);
+
+  const doctor = await remote.handler(invoke("doctor"));
+  assert.doesNotMatch(doctor.text, /[А-Яа-яЁё]/, doctor.text);
+  assert.doesNotMatch(doctor.text, /undefined/);
+});
