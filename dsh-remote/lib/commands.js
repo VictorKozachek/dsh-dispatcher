@@ -947,11 +947,15 @@ export function createRemoteCommands({
       }
     }
 
-    const described = await credentials.describe(TELEGRAM_TOKEN_REF);
+    // 038: секрет показываем активного канала, а не всегда Telegram.
+    const activeSecretRef = typeof state.bindings?.transport === "string"
+      ? tokenRefFor(state.bindings.transport)
+      : TELEGRAM_TOKEN_REF;
+    const described = await credentials.describe(activeSecretRef);
     if (described.source === null) {
-      lines.push(`секрет: ${TELEGRAM_TOKEN_REF} — не найден`);
+      lines.push(`секрет: ${activeSecretRef} — не найден`);
     } else {
-      lines.push(`секрет: ${TELEGRAM_TOKEN_REF} — источник ${described.source}${described.writable ? " (запись разрешена)" : " (только чтение)"}`);
+      lines.push(`секрет: ${activeSecretRef} — источник ${described.source}${described.writable ? " (запись разрешена)" : " (только чтение)"}`);
     }
 
     lines.push(`гибрид: ${state.hybrid.enabled ? `вкл, ждём ${Math.round(state.hybrid.waitMs / 1000)} с` : "выкл"}`);

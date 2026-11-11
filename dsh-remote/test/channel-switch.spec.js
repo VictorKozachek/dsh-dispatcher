@@ -300,6 +300,18 @@ test("disconnect: чистит токен активного канала (ре�
   assert.equal(stand.order.includes("stop:relay") || stand.order.includes("stop:facade"), true);
 });
 
+test("status: показывает секрет активного канала (relay), а не всегда Telegram", async (t) => {
+  const stand = harness(t, {
+    bindings: { transport: "relay", url: "https://relay.example", botUsername: "relay", createdAt: 1, previousTransport: "telegram" },
+    credentials: fakeCredentials({ values: { [RELAY_TOKEN_REF]: RELAY_TOKEN } }),
+  });
+
+  const result = await stand.remote.handler(invoke("status"));
+  assert.equal(result.kind, "success", result.text);
+  assert.match(result.text, new RegExp(`секрет: ${RELAY_TOKEN_REF.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} — источник file`));
+  assert.equal(result.text.includes(`секрет: ${TELEGRAM_TOKEN_REF}`), false, "чужой секрет не выдаётся за активный");
+});
+
 test("status: показывает активный канал и прежний (отключён)", async (t) => {
   const stand = harness(t, {
     bindings: {
