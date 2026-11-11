@@ -332,7 +332,7 @@ ngrok http 8080
 #   → https://<случайное-имя>.ngrok-free.app
 
 # Tailscale (если уже настроен; HTTPS-имя в вашем tailnet)
-tailscale serve --bg https / http://127.0.0.1:8080
+tailscale serve --bg 8080   # https://<машина>.<tailnet>.ts.net → localhost:8080
 
 # SSH-туннель без аккаунта (localhost.run)
 ssh -R 80:127.0.0.1:8080 nokey@localhost.run
