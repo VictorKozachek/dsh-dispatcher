@@ -309,10 +309,10 @@ test("трассировка старта: путь из DSH_HOME и строк�
       else process.env.DSH_HOME = previousHome;
     }
     const file = bootTraceFile({ DSH_HOME: dir });
-    const text = fs.readFileSync(file, "utf8").trim();
-    assert.match(text, /^\d{4}-\d{2}-\d{2}T/, "строка начинается с ISO-времени");
-    assert.match(text, /apply pid=\d+/, "в строке есть pid");
-    assert.equal((text.match(/\n/g) ?? []).length, 0, "один запуск — одна строка");
+    const lines = fs.readFileSync(file, "utf8").trim().split("\n");
+    assert.equal(lines.length, 2, "две строки на запуск: старт и итог по фичам");
+    assert.match(lines[0], /^\d{4}-\d{2}-\d{2}T.*apply pid=\d+$/, "старт: время, маркер и pid");
+    assert.match(lines[1], /features запущено \d+\/\d+:/, "итог: сколько фич поднялось");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

@@ -51,11 +51,11 @@ export function bootTraceFile(env = process.env) {
 }
 
 /** Записать строку трассировки; сбой трассировки не мешает плагину. */
-function recordBootTrace(logger) {
+function recordBootTrace(logger, message = "apply") {
   try {
     const file = bootTraceFile();
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-    fs.appendFileSync(file, `${new Date().toISOString()} apply pid=${process.pid}\n`, { mode: 0o600 });
+    fs.appendFileSync(file, `${new Date().toISOString()} ${message} pid=${process.pid}\n`, { mode: 0o600 });
   } catch (error) {
     try {
       logger.warn(`трассировка старта не записалась: ${error?.message ?? error}`);
@@ -228,6 +228,8 @@ export async function apply(ctx, config = {}) {
   // Копия реестра: фича, добавленная во время обхода, не поедет в этом проходе.
   const registry = Array.isArray(features) ? [...features] : [];
   let started = 0;
+  /** Итог по фичам — он же попадает в трассировку старта. */
+  const report = [];
 
   for (const [index, feature] of registry.entries()) {
     const label = typeof feature?.name === "string" && feature.name.trim() !== ""
@@ -236,6 +238,7 @@ export async function apply(ctx, config = {}) {
 
     if (typeof feature?.apply !== "function") {
       logger.warn(`фича ${label}: нет apply — пропущена`);
+      report.push(`${label}:no-apply`);
       continue;
     }
 
@@ -243,6 +246,7 @@ export async function apply(ctx, config = {}) {
     const missing = needs.filter((service) => deps.get(service) === null);
     if (missing.length > 0) {
       logger.warn(`фича ${label}: в контексте нет ${missing.join(", ")} — пропущена, плагин работает без неё`);
+      report.push(`${label}:нет-${missing.join("/")}`);
       continue;
     }
 
@@ -253,8 +257,10 @@ export async function apply(ctx, config = {}) {
       const result = feature.apply(ctx, settings, deps);
       if (result !== null && typeof result?.then === "function") await result;
       started += 1;
+      report.push(`${label}:ok`);
     } catch (error) {
       logger.warn(`фича ${label} упала: ${describeError(error)}`);
+      report.push(`${label}:упала`);
     }
     if (disposed) {
       logger.warn("плагин выгружен во время запуска фич — остальные не запускаю");
@@ -263,4 +269,7 @@ export async function apply(ctx, config = {}) {
   }
 
   logger.info(`каркас поднят: фич ${registry.length}, запущено ${started}`);
+  // Одна строка «что поднялось» — по ней видно, дошёл ли плагин до фич и какие
+  // из них пропущены из-за отсутствующих сервисов.
+  recordBootTrace(logger, `features запущено ${started}/${registry.length}: ${report.join(", ")}`);
 }
