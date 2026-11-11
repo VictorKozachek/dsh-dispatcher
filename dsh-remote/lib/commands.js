@@ -36,8 +36,8 @@ import {
 } from "./doctor.js";
 import { RELAY_TOKEN_REF } from "./transport/relay.js";
 import {
-  MAX_API_BASE,
   MAX_PAIRING_POLL_TIMEOUT_SEC,
+  maxHostOf,
   maxMe,
   maxPollForCode,
 } from "./transport/max.js";
@@ -241,10 +241,13 @@ export async function runDoctorChecks({
       add("fail", "канал", `MAX: healthCheck упал: ${humanError(error, token)}`, "проверьте сеть и токен MAX; webhook требует HTTPS:443 — используйте long polling");
     }
     if (health !== null) {
+      // 048: показываем активный хост — видно, что сработал фолбэк на api.
+      const hostNote = maxHostNote(transport);
       add(
         health?.ok === true ? "ok" : "fail",
         "канал",
-        `MAX: ${health?.detail ?? "?"}; marker ${transport.marker ?? "?"}; polling ${transport.polling === true ? "да" : "нет"}`,
+        `MAX: ${health?.detail ?? "?"}; marker ${transport.marker ?? "?"}; polling ${transport.polling === true ? "да" : "нет"}`
+          + `${hostNote === null ? "" : `; ${hostNote}`}`,
         health?.ok === true ? undefined : "проверьте токен MAX и сеть; webhook требует публичного HTTPS:443 — используйте long polling",
       );
     }
@@ -363,6 +366,23 @@ function humanError(error, token) {
   return token === undefined || token === null || token === "" ? message : message.split(token).join("<token>");
 }
 
+/**
+ * Хост MAX для `status`/`doctor` (048): видно, сработал ли TLS-фолбэк.
+ * `null` — транспорт не MAX (или не сообщает базу, как тестовые заглушки).
+ */
+function maxHostNote(transport) {
+  const endpoint = transport?.endpoint ?? null;
+  if (endpoint === null || typeof endpoint !== "object") return null;
+  const active = maxHostOf(endpoint.active ?? endpoint.primary ?? "");
+  if (active === "") return null;
+  if (endpoint.fallbackUsed === true) {
+    const primary = maxHostOf(endpoint.primary ?? "");
+    return `хост ${active} (фолбэк, ${primary === "" ? "platform-api2.max.ru" : primary} — TLS)`;
+  }
+  if (endpoint.fallback === null) return `хост ${active} (задан maxApiBase/MAX_API_BASE)`;
+  return `хост ${active}`;
+}
+
 /** Шесть цифр pairing-кода. */
 export function pairingCode(random = Math.random) {
   return String(Math.floor(random() * 1_000_000)).padStart(6, "0");
@@ -416,7 +436,11 @@ export function createRemoteCommands({
   random = Math.random,
   fetch: fetchImpl = globalThis.fetch,
   baseUrl = TELEGRAM_API_BASE,
-  maxApiBase = MAX_API_BASE,
+  /**
+   * 048: явная база MAX (`config.maxApiBase`/`MAX_API_BASE`). Не задана —
+   * transport сам берёт api2 и при TLS-ошибке повторяет на platform-api.max.ru.
+   */
+  maxApiBase = undefined,
   /** 039: `GET /updates?timeout=…` для pairing (long polling, не короткий опрос). */
   maxPairingPollTimeoutSec = MAX_PAIRING_POLL_TIMEOUT_SEC,
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -801,9 +825,17 @@ export function createRemoteCommands({
     try {
       me = await maxMe({ token, apiBase: maxApiBase, fetch: fetchImpl });
     } catch (error) {
+      // 048: TLS/сеть — это не «не принял токен»: у ошибки уже есть свой текст
+      // про Russian Trusted CA и два варианта решения.
+      if (error?.code === "MAX_TLS" || error?.code === "MAX_NETWORK") return failure(humanError(error, token));
       return failure(`MAX не принял токен: ${humanError(error, token)}`);
     }
     const botName = typeof me?.name === "string" && me.name !== "" ? me.name : "MAX-бот";
+    // 048: если api2 не прошёл TLS, pairing доопрашиваем по рабочему хосту.
+    const pairingBase = me?.fallbackUsed === true && typeof me.apiBase === "string" ? me.apiBase : maxApiBase;
+    if (me?.fallbackUsed === true) {
+      log(`MAX: ${maxHostOf(me.primaryBase)} недоступен по TLS — работаю через ${maxHostOf(me.apiBase)} (048)`);
+    }
 
     const code = pairingCode(random);
     const deadline = now() + pairingTtlMs;
@@ -821,7 +853,7 @@ export function createRemoteCommands({
         code,
         deadline,
         pollTimeoutSec: maxPairingPollTimeoutSec,
-        apiBase: maxApiBase,
+        apiBase: pairingBase,
         fetch: fetchImpl,
         now,
         sleep,
@@ -1112,6 +1144,8 @@ export function createRemoteCommands({
         lines.push(`бот MAX: «${state.bindings.botUsername ?? "?"}», чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);
         lines.push(`max: long polling ${live?.polling === true ? "работает" : "не запущен"}, marker ${marker ?? "?"}`
           + `${lastError === null ? "" : `, последняя ошибка: ${humanError(lastError)}`}`);
+        const hostNote = maxHostNote(live);
+        if (hostNote !== null) lines.push(`max: ${hostNote}`);
         lines.push("max: webhook недоступен без публичного HTTPS:443 — используется long polling");
       } else {
         lines.push(`бот: @${state.bindings.botUsername ?? "?"} (${state.bindings.transport}), чат ${state.bindings.chatId}, человек ${state.bindings.userId}, привязан ${created}`);

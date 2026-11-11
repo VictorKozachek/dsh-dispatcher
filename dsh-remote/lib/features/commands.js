@@ -25,7 +25,7 @@ import { MAX_TOKEN_REF, TELEGRAM_TOKEN_REF, createRemoteCommands } from "../comm
 import { createCredentialAccess, createStore } from "../store.js";
 import { createTelegramTransport } from "../transport/telegram.js";
 import { RELAY_TOKEN_REF, createRelayTransport } from "../transport/relay.js";
-import { MAX_API_BASE, createMaxTransport } from "../transport/max.js";
+import { createMaxTransport, maxApiBaseFromConfig } from "../transport/max.js";
 import { answererFeature } from "./answerer.js";
 
 /** Имя сервиса транспорта: то же, что ждёт фича answerer в своих `needs`. */
@@ -144,6 +144,8 @@ function createTransportFacade() {
 async function ensureTransport(ctx, store, deps, facade, isDisposed = () => false, config = null) {
   const log = (message) => deps.logger.debug(message);
   const binding = store.read().bindings;
+  /** 048: явная база MAX из конфига — фолбэк тогда не нужен. */
+  const configuredMaxBase = maxApiBaseFromConfig(config);
 
   // 038: привязка на релей — канал создаём здесь же, чтобы `/remote connect relay`
   // переключал публикацию сразу, а не только после перезагрузки профиля.
@@ -240,7 +242,9 @@ async function ensureTransport(ctx, store, deps, facade, isDisposed = () => fals
             deps.logger.debug(`фича commands: marker MAX не сохранён (${error?.message ?? error})`);
           }
         },
-        apiBase: typeof maxSettings.apiBase === "string" && maxSettings.apiBase !== "" ? maxSettings.apiBase : MAX_API_BASE,
+        // 048: явная база (config.maxApiBase главнее config.max.apiBase) отключает
+        // фолбэк; не задана — transport сам уйдёт с api2 на platform-api.max.ru по TLS.
+        ...(configuredMaxBase === null ? {} : { apiBase: configuredMaxBase }),
         ...(typeof maxSettings.fetch === "function" ? { fetch: maxSettings.fetch } : {}),
         ...(Number.isFinite(maxSettings.pollTimeoutSec) ? { pollTimeoutSec: maxSettings.pollTimeoutSec } : {}),
         log: (message) => deps.logger.debug(message),
@@ -400,6 +404,7 @@ export const commandsFeature = {
     // status/on должны видеть хотя бы один живой канал.
     const currentChannel = () => facade.current ?? [...transportRegistry.values()][0] ?? null;
     trace("commands:createRemoteCommands");
+    const configuredMaxBase = maxApiBaseFromConfig(config);
     const remote = createRemoteCommands({
       ctx,
       store,
@@ -408,6 +413,8 @@ export const commandsFeature = {
       currentChannel,
       // 039: long polling для pairing MAX; можно переопределить в config.max.
       ...(Number.isFinite(config?.max?.pollTimeoutSec) ? { maxPairingPollTimeoutSec: config.max.pollTimeoutSec } : {}),
+      // 048: config.maxApiBase — явная база MAX (фолбэк тогда выключен).
+      ...(configuredMaxBase === null ? {} : { maxApiBase: configuredMaxBase }),
     });
     trace("commands:register");
     deps.onDispose(remote.register(), "commands");

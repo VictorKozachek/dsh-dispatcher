@@ -204,6 +204,40 @@ Telegram: вопрос с кнопками, ответ кнопкой или т�
    polling и последнюю ошибку; `/remote doctor` проверяет токен MAX и живость
    канала (`GET /me`).
 
+### TLS к platform-api2: фолбэк на platform-api.max.ru (048)
+
+`platform-api2.max.ru` отдаёт сертификат, выписанный **Russian Trusted Sub CA
+(Минцифры)**, а его корня нет в trust store macOS/Node: первый `GET /me` падает
+с `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, и человек видел «MAX не принял токен:
+fetch failed», хотя дело не в токене.
+
+Плагин повторяет такой запрос на `platform-api.max.ru` — это **тот же** MAX Bot
+API с обычным публичным CA. Фолбэк включается **только** на TLS/сетевые ошибки
+(`fetch failed`, `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `ERR_TLS_*`); 401, 403 и
+429 хост не подменяют — это токен и лимиты, и подмена там только запутала бы.
+Рабочий хост запоминается в транспорте: `/remote doctor` показывает
+`хост platform-api.max.ru (фолбэк, platform-api2.max.ru — TLS)`, `/remote status` —
+ту же строку. В `connect` pairing-опрос идёт уже по рабочему хосту, а факт
+фолбэка пишется в журнал плагина.
+
+Если обе базы недоступны по TLS, ошибка объясняет причину и даёт два варианта:
+(а) оставить фолбэк на `platform-api.max.ru`; (б) доставить корень Минцифры —
+`NODE_EXTRA_CA_CERTS=/путь/к/russian_trusted_root_ca.pem`. Вместо «fetch failed»
+человек видит, что именно не так и что делать.
+
+Хост можно задать явно — тогда фолбэка нет и используется ровно он:
+
+```yaml
+- id: ui-remote
+  name: dsh-remote
+  config:
+    maxApiBase: https://max-proxy.example.com   # или env MAX_API_BASE
+```
+
+Пустая строка — «не задано»: штатный api2 плюс фолбэк. Прежнее место
+`config.max.apiBase` тоже поддерживается, но `maxApiBase` главнее. Явная база
+нужна, например, за корпоративным прокси.
+
 ### Что нужно от человека
 
 Платформа MAX пускает ботов только **юрлицам, ИП и самозанятым — резидентам РФ**

@@ -41,6 +41,164 @@ import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderRows } from "../presen
 /** Базовый адрес MAX Bot API: документация просит именно platform-api2. */
 export const MAX_API_BASE = "https://platform-api2.max.ru";
 
+/**
+ * Запасной адрес **того же** MAX Bot API (048).
+ *
+ * Сертификат `platform-api2.max.ru` выписан Russian Trusted Sub CA (Минцифры), а
+ * его корня нет в trust store macOS/Node — первый же `GET /me` падает с
+ * `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`. У `platform-api.max.ru` обычный публичный
+ * CA и тот же API, поэтому при TLS/сетевой ошибке запрос повторяется туда.
+ * Переопределение хоста (`maxApiBase`/`MAX_API_BASE`) фолбэк отключает.
+ */
+export const MAX_API_FALLBACK_BASE = "https://platform-api.max.ru";
+
+/** Коды Node/OpenSSL, которые означают «сертификат не принят». */
+const MAX_TLS_CODES = new Set([
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_DECRYPT_CERT_SIGNATURE",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "CERT_HAS_EXPIRED",
+  "CERT_NOT_YET_VALID",
+  "CERT_UNTRUSTED",
+]);
+
+/** Коды сетевых сбоев (сюда же попадает undici: `fetch failed`). */
+const MAX_NETWORK_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ECONNABORTED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EPIPE",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+]);
+
+/**
+ * Развернуть ошибку (включая `cause` undici и `AggregateError.errors`) в коды и
+ * тексты. `fetch failed` — это обёртка: настоящая причина лежит в `cause`.
+ */
+function maxErrorFacts(error) {
+  const codes = [];
+  const texts = [];
+  const seen = new Set();
+  const visit = (value) => {
+    if (value === null || typeof value !== "object" || seen.has(value)) return;
+    seen.add(value);
+    if (typeof value.code === "string") codes.push(value.code);
+    if (typeof value.message === "string") texts.push(value.message);
+    if (Array.isArray(value.errors)) for (const item of value.errors) visit(item);
+    visit(value.cause);
+  };
+  visit(error);
+  return { codes, texts };
+}
+
+/** Это TLS-ошибка (сертификат не принят)? */
+export function isMaxTlsError(error) {
+  const { codes, texts } = maxErrorFacts(error);
+  if (codes.some((code) => MAX_TLS_CODES.has(code) || /^ERR_TLS_|^ERR_SSL_/.test(code))) return true;
+  return texts.some((text) => /certificate|issuer|self[- ]signed|TLS|SSL/i.test(text));
+}
+
+/**
+ * Это сетевой сбой (включая TLS)? Фолбэк хоста включается только на них: 401,
+ * 403 и 429 — это токен и лимиты, подмена хоста там только запутает.
+ */
+export function isMaxNetworkError(error) {
+  if (isMaxTlsError(error)) return true;
+  const { codes, texts } = maxErrorFacts(error);
+  if (codes.some((code) => MAX_NETWORK_CODES.has(code) || /^ERR_NETWORK|^UND_ERR_/.test(code))) return true;
+  return texts.some((text) => /fetch failed|socket hang up|network|timed? ?out|ECONN|ENOTFOUND|EAI_AGAIN/i.test(text));
+}
+
+function nonEmptyBase(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+/** Хост с портом для человеческого текста; кривой URL возвращаем как есть. */
+export function maxHostOf(base) {
+  try {
+    return new URL(base).host;
+  } catch {
+    return String(base ?? "");
+  }
+}
+
+/**
+ * Куда обращаться: явное переопределение (`maxApiBase`/`MAX_API_BASE`) или
+ * штатный api2 с запасной базой (тот же API, публичный CA).
+ *
+ * @param {object} options
+ * @param {string} [options.apiBase] — явная база (config.maxApiBase, тесты).
+ * @param {object} [options.env] — окружение (по умолчанию `process.env`).
+ * @returns {{primary: string, fallback: (string|null), overridden: boolean}}
+ */
+export function maxApiEndpoint({ apiBase, env = globalThis.process?.env ?? {} } = {}) {
+  const explicit = nonEmptyBase(apiBase) ?? nonEmptyBase(env?.MAX_API_BASE);
+  if (explicit !== null) return { primary: explicit, fallback: null, overridden: true };
+  return { primary: MAX_API_BASE, fallback: MAX_API_FALLBACK_BASE, overridden: false };
+}
+
+/**
+ * Явная база из конфига профиля (048): `config.maxApiBase` главнее
+ * `config.max.apiBase`, пустая строка — «не задано».
+ */
+export function maxApiBaseFromConfig(config) {
+  const top = nonEmptyBase(config?.maxApiBase);
+  if (top !== null) return top;
+  return nonEmptyBase(config?.max?.apiBase);
+}
+
+/**
+ * Понятная ошибка «MAX недоступен»: без `fetch failed` и без токена.
+ *
+ * Для TLS-причины объясняем про Russian Trusted CA и даём два варианта
+ * (фолбэк на `platform-api.max.ru` или `NODE_EXTRA_CA_CERTS`); для сети —
+ * про прокси/файрвол. Код `MAX_TLS`/`MAX_NETWORK` позволяет команде `connect`
+ * не писать сверху «MAX не принял токен».
+ */
+export function maxUnreachableError({ primary, fallback = null, tried = [] } = {}) {
+  const items = (Array.isArray(tried) ? tried : []).filter((item) => item !== null && item !== undefined);
+  const hosts = items.length > 0
+    ? items.map((item) => maxHostOf(item.base))
+    : [maxHostOf(primary ?? MAX_API_BASE)];
+  const tls = items.some((item) => isMaxTlsError(item.error));
+
+  if (tls) {
+    const fallbackHost = maxHostOf(fallback ?? MAX_API_FALLBACK_BASE);
+    const both = hosts.length > 1 ? ` Пробовали ${hosts.join(" и ")} — TLS не прошёл ни там, ни там.` : "";
+    const fallbackOption = fallback === null
+      ? `(а) убрать переопределение хоста (maxApiBase/MAX_API_BASE) — тогда плагин сам повторит запрос на ${fallbackHost}`
+      : `(а) оставить фолбэк на ${fallbackHost} — плагин повторяет запрос туда автоматически`;
+    const message = `TLS к MAX не проходит: сертификат ${hosts[0]} выписан Russian Trusted Sub CA (Минцифры), `
+      + `и его корня нет в доверенных хранилищах macOS/Node.${both} `
+      + `Варианты: ${fallbackOption}; (б) добавить корень Минцифры в доверенные: `
+      + "NODE_EXTRA_CA_CERTS=/путь/к/russian_trusted_root_ca.pem";
+    const error = new Error(message);
+    error.code = "MAX_TLS";
+    error.tried = items.map((item) => ({ base: item.base, error: item.error }));
+    return error;
+  }
+
+  const message = `MAX недоступен по сети: ${hosts.join(" и ")}. `
+    + "Проверьте интернет, прокси и файрвол; хост можно задать явно через maxApiBase или MAX_API_BASE.";
+  const error = new Error(message);
+  error.code = "MAX_NETWORK";
+  error.tried = items.map((item) => ({ base: item.base, error: item.error }));
+  return error;
+}
+
 /** Возможности MAX: кнопки есть, править можно, текст ≤ 4000, вариантов ≤ 7. */
 export const MAX_CAPS = Object.freeze({
   inlineButtons: true,
@@ -146,7 +304,13 @@ export function createMaxTransport(options = {}) {
     throw new TypeError("max: нужен токен бота");
   }
   const token = options.token;
-  const apiBase = typeof options.apiBase === "string" && options.apiBase !== "" ? options.apiBase : MAX_API_BASE;
+  // 048: штатно api2, а при TLS/сетевой ошибке — platform-api.max.ru (тот же API).
+  // Явный apiBase (config.maxApiBase/MAX_API_BASE) фолбэк отключает.
+  const endpoint = maxApiEndpoint({ apiBase: options.apiBase });
+  let activeBase = endpoint.primary;
+  let fallbackUsed = false;
+  /** Последние ошибки по базам: из них собирается понятный текст (048). */
+  let triedBases = [];
   const doFetch = typeof options.fetch === "function" ? options.fetch : globalThis.fetch;
   const now = typeof options.now === "function" ? options.now : Date.now;
   const sleep = typeof options.sleep === "function"
@@ -183,15 +347,18 @@ export function createMaxTransport(options = {}) {
 
   /** Один HTTP-вызов MAX с авторизацией заголовком и ретраями 429/503/сеть. */
   async function request(method, path, { query, body, signal, attempts = maxAttempts } = {}) {
-    const url = new URL(path, apiBase);
-    for (const [key, value] of Object.entries(query ?? {})) {
-      if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
-    }
+    const urlOf = (base) => {
+      const url = new URL(path, base);
+      for (const [key, value] of Object.entries(query ?? {})) {
+        if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+      }
+      return url;
+    };
     let remaining = attempts;
     for (let attempt = 1; ; attempt += 1) {
       let response;
       try {
-        response = await doFetch(url.toString(), {
+        response = await doFetch(urlOf(activeBase).toString(), {
           method,
           headers: {
             authorization: token,
@@ -201,14 +368,44 @@ export function createMaxTransport(options = {}) {
           ...(signal === undefined ? {} : { signal }),
         });
       } catch (error) {
+        // Отмена — не сбой сети: отдаём как есть, фолбэк и текст про TLS не нужны.
+        if (signal?.aborted) throw error;
+        const recorded = triedBases.find((item) => item.base === activeBase);
+        if (recorded === undefined) triedBases.push({ base: activeBase, error });
+        else recorded.error = error;
+        // 048: TLS/сеть на api2 — сразу пробуем запасной хост, попытку не тратим.
+        if (endpoint.fallback !== null && activeBase !== endpoint.fallback && isMaxNetworkError(error)) {
+          activeBase = endpoint.fallback;
+          fallbackUsed = true;
+          log(`max: ${maxHostOf(endpoint.primary)} недоступен по TLS/сети (${describeError(error, token)}) — `
+            + `повторяю запрос через ${maxHostOf(endpoint.fallback)}`);
+          continue;
+        }
         remaining -= 1;
-        lastError = error;
-        if (remaining <= 0 || signal?.aborted) throw error;
+        if (remaining <= 0) {
+          // 048: понятный текст — про TLS (сертификат Минцифры); обычный сбой сети
+          // отдаём как есть, чтобы не выдавать сетевую проблему за сертификат.
+          if (triedBases.some((item) => isMaxTlsError(item.error))) {
+            const friendly = maxUnreachableError({
+              primary: endpoint.primary,
+              fallback: endpoint.fallback,
+              tried: triedBases,
+            });
+            lastError = friendly;
+            throw friendly;
+          }
+          lastError = error;
+          throw error;
+        }
         await sleep(jitter(500 * 2 ** (attempt - 1)));
         continue;
       }
       const status = response.status;
-      if (status === 200) return response.json();
+      if (status === 200) {
+        // Успех: прежние сетевые ошибки больше не описывают текущее состояние.
+        triedBases = [];
+        return response.json();
+      }
       const text = maskToken(await safeText(response), token);
       const error = new Error(`MAX ${method} ${path}: ${status}${text === "" ? "" : ` ${text}`}`);
       error.status = status;
@@ -451,6 +648,23 @@ export function createMaxTransport(options = {}) {
     get lastError() {
       return lastError;
     },
+    /** Активная база MAX: после TLS-фолбэка здесь `platform-api.max.ru` (048). */
+    get apiBase() {
+      return activeBase;
+    },
+    /**
+     * Куда ходим и почему (048; doctor/status): `active` — рабочая база,
+     * `fallbackUsed` — сработал ли фолбэк, `overridden` — задан ли хост явно.
+     */
+    get endpoint() {
+      return {
+        primary: endpoint.primary,
+        fallback: endpoint.fallback,
+        active: activeBase,
+        fallbackUsed,
+        overridden: endpoint.overridden,
+      };
+    },
     get polling() {
       return running;
     },
@@ -675,28 +889,57 @@ export async function maxApiRequest({
   path,
   query,
   body,
-  apiBase = MAX_API_BASE,
+  apiBase,
   fetch: doFetch = globalThis.fetch,
   signal,
+  /** Внутренний хук (048): какой базой в итоге ответили — им пользуются connect/polling. */
+  onBase,
+  env = globalThis.process?.env ?? {},
 } = {}) {
   if (typeof token !== "string" || token === "") throw new TypeError("max: нужен токен бота");
-  const url = new URL(path, apiBase);
-  for (const [key, value] of Object.entries(query ?? {})) {
-    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  const endpoint = maxApiEndpoint({ apiBase, env });
+  const bases = endpoint.fallback === null ? [endpoint.primary] : [endpoint.primary, endpoint.fallback];
+  const tried = [];
+  let response = null;
+  let usedBase = null;
+  for (let index = 0; index < bases.length; index += 1) {
+    const base = bases[index];
+    const url = new URL(path, base);
+    for (const [key, value] of Object.entries(query ?? {})) {
+      if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+    }
+    try {
+      response = await doFetch(url.toString(), {
+        method,
+        headers: {
+          authorization: token,
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(signal === undefined ? {} : { signal }),
+      });
+      usedBase = base;
+      break;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      tried.push({ base, error });
+      // 048: фолбэк только на TLS/сеть (401/403/429 — это токен и лимиты).
+      const hasNext = index < bases.length - 1;
+      if (hasNext && isMaxNetworkError(error)) continue;
+      if (tried.some((item) => isMaxTlsError(item.error))) {
+        throw maxUnreachableError({ primary: endpoint.primary, fallback: endpoint.fallback, tried });
+      }
+      throw new Error(`MAX ${method} ${path}: сеть недоступна (${describeError(error, token)})`);
+    }
   }
-  let response;
-  try {
-    response = await doFetch(url.toString(), {
-      method,
-      headers: {
-        authorization: token,
-        ...(body === undefined ? {} : { "content-type": "application/json" }),
-      },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-      ...(signal === undefined ? {} : { signal }),
+  if (typeof onBase === "function") {
+    onBase({
+      base: usedBase,
+      primary: endpoint.primary,
+      fallback: endpoint.fallback,
+      fallbackUsed: usedBase !== endpoint.primary,
+      overridden: endpoint.overridden,
     });
-  } catch (error) {
-    throw new Error(`MAX ${method} ${path}: сеть недоступна (${describeError(error, token)})`);
   }
   if (response.status === 200) return response.json();
   let detail = "";
@@ -711,9 +954,23 @@ export async function maxApiRequest({
   throw error;
 }
 
-/** `GET /me`: проверить токен бота MAX до привязки. */
+/**
+ * `GET /me`: проверить токен бота MAX до привязки.
+ *
+ * Возвращает ещё и базу, которая ответила (048): если api2 не прошёл TLS, а
+ * platform-api — прошёл, `connect` доопрашивает pairing уже по рабочему хосту.
+ */
 export async function maxMe({ token, apiBase, fetch: doFetch } = {}) {
-  const me = await maxApiRequest({ token, path: "/me", apiBase, fetch: doFetch });
+  let used = null;
+  const me = await maxApiRequest({
+    token,
+    path: "/me",
+    apiBase,
+    fetch: doFetch,
+    onBase: (info) => {
+      used = info;
+    },
+  });
   return {
     name: typeof me?.name === "string" && me.name !== ""
       ? me.name
@@ -722,6 +979,9 @@ export async function maxMe({ token, apiBase, fetch: doFetch } = {}) {
         : typeof me?.user?.name === "string" && me.user.name !== ""
           ? me.user.name
           : null,
+    apiBase: used?.base ?? null,
+    fallbackUsed: used?.fallbackUsed === true,
+    primaryBase: used?.primary ?? null,
   };
 }
 
@@ -745,6 +1005,9 @@ export async function maxPollForCode({
   log = () => {},
 } = {}) {
   let marker = null;
+  // 048: как только один из хостов ответил, дальше опрашиваем именно его —
+  // иначе каждый long polling начинался бы с падения на TLS у api2.
+  let workingBase = apiBase;
   while (now() < deadline) {
     if (signal?.aborted) throw Object.assign(new Error("подключение отменено"), { name: "AbortError" });
     let response;
@@ -757,9 +1020,12 @@ export async function maxPollForCode({
           limit: 100,
           ...(marker === null ? {} : { marker }),
         },
-        apiBase,
+        apiBase: workingBase,
         fetch: doFetch,
         signal,
+        onBase: (info) => {
+          if (info?.fallbackUsed === true && typeof info.base === "string") workingBase = info.base;
+        },
       });
     } catch (error) {
       if (error?.status === 401) throw error;
