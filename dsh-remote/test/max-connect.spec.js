@@ -478,3 +478,24 @@ test("050: connect MAX: 429 при опросе — пауза и отказ с 
   assert.match(result.text, /retry_after 1 с/);
   assert.equal(stand.store.read().bindings, null);
 });
+
+test("050: connect MAX: 5xx при опросе — «временно недоступен» без привязки", async (t) => {
+  const fetchImpl = async (url) => {
+    const parsed = new URL(url);
+    if (parsed.pathname === "/me") return jsonResponse({ name: "max_bot" });
+    return jsonResponse({ message: "server error" }, 503);
+  };
+  const stand = harness(t, {
+    answers: MAX_ANSWERS,
+    fetchImpl,
+    options: { maxPairingDeadlineMs: 1_000, maxPairingPollTimeoutSec: 0 },
+  });
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "error", result.text);
+  assert.match(result.text, /MAX временно недоступен \(HTTP 503\)/);
+  assert.match(result.text, /повторите \/remote connect/);
+  assert.doesNotMatch(result.text, /fetch failed/);
+  assert.equal(stand.store.read().bindings, null);
+});

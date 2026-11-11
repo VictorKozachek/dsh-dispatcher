@@ -1077,7 +1077,7 @@ export async function maxPollForCode({
       // 401/403 — токен/активация бота: повторять бессмысленно, пусть человек чинит.
       if (status === 401 || status === 403) throw error;
       attempt += 1;
-      counts.lastError = { status, retryAfterMs: error?.retryAfterMs ?? null, message: describeError(error, token) };
+      counts.lastError = { status, code: error?.code ?? null, retryAfterMs: error?.retryAfterMs ?? null, message: describeError(error, token) };
       let pause = waitMs;
       if (status === 429) {
         pause = Math.max(1_000, Number(error?.retryAfterMs ?? 0) || 1_000);

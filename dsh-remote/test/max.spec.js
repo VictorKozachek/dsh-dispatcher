@@ -917,3 +917,26 @@ test("050: 5xx даёт backoff, а не молчаливый цикл", async (
   assert.ok(setup.logs.some((line) => /backoff/.test(line)), "backoff залогирован");
   assert.ok(setup.clock.sleeps.length >= 1);
 });
+
+test("050: таймаут запроса сохраняется в статистике как MAX_TIMEOUT", async () => {
+  const clock = fakeClock();
+  const stats = { polls: 0, updates: 0, types: new Set(), codeSeen: 0, host: null };
+  const hanging = async () => {
+    const error = new Error("timeout");
+    error.name = "TimeoutError";
+    throw error;
+  };
+  const result = await maxPollForCode({
+    token: TOKEN,
+    code: CODE,
+    deadline: clock.clock + 1_000,
+    pollTimeoutSec: 0,
+    apiBase: "https://platform-api2.max.ru",
+    fetch: hanging,
+    now: clock.now,
+    sleep: clock.sleep,
+    stats,
+  });
+  assert.equal(result, null);
+  assert.equal(stats.lastError?.code, "MAX_TIMEOUT");
+});

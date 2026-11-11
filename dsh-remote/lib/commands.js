@@ -854,7 +854,7 @@ export function createRemoteCommands({
     const pollDeadline = now() + Math.max(1_000, Math.floor(maxPairingDeadlineMs));
     await askStep(invocation, {
       id: "remote-connect-max-send-code",
-      question: `Откройте бота «${botName}» в MAX и отправьте ему код ${code} в течение 10 минут `
+      question: `Откройте бота «${botName}» в MAX и отправьте ему код ${code} в течение 2 минут `
         + "(бот MAX заводится только на юрлицо/ИП/самозанятого РФ). Отправили? Нажмите «Отправил».",
       options: ["Отправил"],
     });
@@ -886,14 +886,15 @@ export function createRemoteCommands({
       if (status === 429) {
         return failure(`MAX ограничил частоту запросов (429${error?.retryAfterMs ? `, retry_after ${Math.round(error.retryAfterMs / 1000)} с` : ""}) — повторите /remote connect позже`);
       }
-      if (error?.code === "MAX_TIMEOUT") {
-        return failure(`MAX не ответил за ${Math.round(maxPairingDeadlineMs / 1000)} с — проверьте сеть и повторите /remote connect`);
-      }
       return failure(`не удалось получить код из MAX: ${humanError(error, token)}`);
     }
     if (match === null) {
       if (stats.lastError?.status === 429) {
         return failure(`MAX ограничил частоту запросов (429${stats.lastError.retryAfterMs ? `, retry_after ${Math.round(stats.lastError.retryAfterMs / 1000)} с` : ""}) — повторите /remote connect позже`);
+      }
+      if (stats.lastError?.code === "MAX_TIMEOUT" || Number(stats.lastError?.status) >= 500) {
+        const reason = stats.lastError?.code === "MAX_TIMEOUT" ? "таймаут запроса" : `HTTP ${stats.lastError?.status}`;
+        return failure(`MAX временно недоступен (${reason}) — проверьте сеть и повторите /remote connect`);
       }
       const types = stats.types.size === 0 ? "—" : [...stats.types].join(", ");
       const seconds = Math.round(Math.max(1_000, maxPairingDeadlineMs) / 1000);

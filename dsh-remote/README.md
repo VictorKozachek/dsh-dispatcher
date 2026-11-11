@@ -206,7 +206,8 @@ Telegram: вопрос с кнопками, ответ кнопкой или т�
 1. Выбрать «MAX», вставить токен бота (секрет `DSH_REMOTE_MAX_TOKEN`). Плагин
    проверяет его `GET /me`; неверный токен — текстовая ошибка, без привязки.
 2. Отправить боту показанный 6-значный код; плагин ждёт его в `GET /updates`
-   (long polling, `timeout=5`; `config.max.pollTimeoutSec` переопределяет),
+   (long polling, `timeout=5`; `config.max.pollTimeoutSec` переопределяет,
+   `config.max.pairingDeadlineMs` — общий дедлайн pairing, по умолчанию 120 с),
    берёт `user_id`/`chat_id` из сообщения и сохраняет привязку
    (allowlist по `user_id`), `marker` — в состоянии.
 3. Канал стартует сразу, без перезапуска профиля; `marker` переживает рестарт
