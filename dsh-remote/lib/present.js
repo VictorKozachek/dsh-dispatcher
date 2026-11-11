@@ -25,6 +25,7 @@ import path from "node:path";
 
 import { DEFAULT_CAPS } from "./transport/base.js";
 import { normalizeQuickReplies } from "./quick-replies.js";
+import { DEFAULT_LANG, normalizeLang, t } from "./i18n.js";
 
 /** Кнопка свободного ответа: переключает вопрос в режим ожидания текста. */
 export const FREE_TEXT_LABEL = "Другой ответ…";
@@ -68,10 +69,10 @@ export function formatTime(ms) {
  *
  * Без дедлайна остаётся только время: «до …» не врём.
  */
-export function renderClock(now = Date.now(), expiresAt = null) {
+export function renderClock(now = Date.now(), expiresAt = null, lang = DEFAULT_LANG) {
   const started = formatTime(now);
   if (!Number.isFinite(expiresAt)) return started;
-  return `${started} · до ${formatTime(expiresAt)}`;
+  return `${started} · ${t("present.until", { time: formatTime(expiresAt) }, lang)}`;
 }
 
 /** Усечь до `limit` символов, не разрезая суррогатную пару. */
@@ -240,6 +241,7 @@ export function resolveContext({ sessionId, ctx, log = noop } = {}) {
  * усекается до {@link WORKSPACE_LIMIT} символов.
  */
 export function renderHeader(context = {}) {
+  const lang = normalizeLang(context.lang) ?? DEFAULT_LANG;
   const now = Number.isFinite(context.now) ? context.now : Date.now();
   const expiresAt = Number.isFinite(context.expiresAt) ? context.expiresAt : null;
   const segments = [];
@@ -249,14 +251,16 @@ export function renderHeader(context = {}) {
     : null;
   if (workspace !== null) segments.push(workspace);
   const taskId = context.taskId === null || context.taskId === undefined ? "" : String(context.taskId);
-  if (taskId !== "") segments.push(`task ${taskId}`);
+  if (taskId !== "") segments.push(t("present.task", { id: taskId }, lang));
   const role = typeof context.role === "string" && context.role !== "" ? truncate(context.role, WORKSPACE_LIMIT) : null;
   if (role !== null) segments.push(role);
   // Номер вопроса в пачке: в мессенджере вопросы идут отдельными сообщениями.
   const index = Number.isFinite(context.index) ? context.index : null;
   const total = Number.isFinite(context.total) ? context.total : null;
-  if (index !== null && total !== null && total > 1) segments.push(`вопрос ${index}/${total}`);
-  segments.push(renderClock(now, expiresAt));
+  if (index !== null && total !== null && total > 1) {
+    segments.push(t("present.questionOf", { index, total }, lang));
+  }
+  segments.push(renderClock(now, expiresAt, lang));
 
   return `▸ ${segments.join(" · ")}`;
 }
@@ -268,6 +272,7 @@ export function renderHeader(context = {}) {
  * маркером «…обрезано» (лучше честный хвост, чем молча потерянный текст).
  */
 export function renderBody(question = {}, caps = {}) {
+  const lang = normalizeLang(question.lang ?? caps.lang) ?? DEFAULT_LANG;
   const maxText = Number.isFinite(caps.maxText) ? caps.maxText : DEFAULT_CAPS.maxText;
   const now = Number.isFinite(question.createdAt) ? question.createdAt : Date.now();
   const cwd = typeof question.workspace === "string" && question.workspace !== "" ? question.workspace : null;
@@ -280,6 +285,7 @@ export function renderBody(question = {}, caps = {}) {
     total: question.total ?? null,
     now,
     expiresAt: question.expiresAt ?? null,
+    lang,
   });
 
   const parts = [header, ""];
@@ -289,19 +295,19 @@ export function renderBody(question = {}, caps = {}) {
   const rawBody = String(question.body ?? "");
   // Пустое тело без заголовка/подробностей — не молчание: честная заглушка,
   // иначе сообщение выглядело бы пустым.
-  parts.push(rawBody.trim() !== "" || title !== "" || detail !== "" ? rawBody : "(пустой вопрос)");
+  parts.push(rawBody.trim() !== "" || title !== "" || detail !== "" ? rawBody : t("present.emptyQuestion", {}, lang));
   if (detail !== "") parts.push("", detail);
-  if (question.multiSelect === true) parts.push("", MULTISELECT_HINT);
+  if (question.multiSelect === true) parts.push("", t("present.multiselectHint", {}, lang));
   // Вопрос без вариантов: в мессенджере нет «поля ввода», поэтому прямо говорим,
   // как ответить, и транспорт дополнительно включает force_reply (клавиатура
   // сразу открывается с подсказкой).
   const hasOptions = Array.isArray(question.options) && question.options.length > 0;
   if (!hasOptions && question.allowFreeText !== false) {
-    const quick = normalizeQuickReplies(question.quickReplies);
+    const quick = normalizeQuickReplies(question.quickReplies, lang);
     const quickShown = caps.inlineButtons !== false && quick.length > 0;
-    parts.push("", quickShown ? QUICK_REPLY_HINT : FREE_TEXT_HINT);
+    parts.push("", t(quickShown ? "present.quickReplyHint" : "present.freeTextHint", {}, lang));
   }
-  return truncate(parts.join("\n"), maxText, TRUNCATION_MARKER);
+  return truncate(parts.join("\n"), maxText, t("present.truncationMarker", {}, lang));
 }
 
 /**
@@ -316,6 +322,7 @@ export function renderBody(question = {}, caps = {}) {
  * свободного текста.
  */
 export function renderRows(question = {}, caps = {}) {
+  const lang = normalizeLang(question.lang ?? caps.lang) ?? DEFAULT_LANG;
   const maxOptions = Math.max(
     0,
     Math.floor(Number.isFinite(caps.maxOptions) ? caps.maxOptions : DEFAULT_CAPS.maxOptions),
@@ -329,7 +336,7 @@ export function renderRows(question = {}, caps = {}) {
   // набор (конфиг `quickReplies: []`) выключает кнопки: остаётся текст.
   if (options.length === 0) {
     if (question.allowFreeText === false || caps.inlineButtons === false) return [];
-    const quick = normalizeQuickReplies(question.quickReplies);
+    const quick = normalizeQuickReplies(question.quickReplies, lang);
     if (quick.length === 0) return [];
     return quick.slice(0, maxOptions).map((item) => [{
       label: truncate(item.label, labelLimit),
@@ -365,10 +372,10 @@ export function renderRows(question = {}, caps = {}) {
   const shown = options.slice(0, Math.max(0, optionSlots));
   const rows = shown.map((option) => [button(option)]);
   if (showMore && shown.length < options.length) {
-    rows.push([{ label: MORE_LABEL, kind: "more", optionId: MORE_OPTION }]);
+    rows.push([{ label: t("present.moreLabel", {}, lang), kind: "more", optionId: MORE_OPTION }]);
   }
   if (freeSlots === 1) {
-    rows.push([{ label: FREE_TEXT_LABEL, kind: "free", optionId: FREE_TEXT_OPTION }]);
+    rows.push([{ label: t("present.freeTextLabel", {}, lang), kind: "free", optionId: FREE_TEXT_OPTION }]);
   }
   return rows.slice(0, maxOptions);
 }

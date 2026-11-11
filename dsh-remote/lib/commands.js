@@ -44,6 +44,7 @@ import {
 import { createAudit } from "./audit.js";
 import { DEFAULT_KEEP, vacuum } from "./rotate.js";
 import { formatStats } from "./metrics.js";
+import { DEFAULT_LANG, LANGS, normalizeLang, resolveLanguage, t } from "./i18n.js";
 import { randomUUID } from "node:crypto";
 
 /**
@@ -117,27 +118,33 @@ export const PAIRING_TTL_MS = 10 * 60 * 1000;
 const PAIRING_POLL_TIMEOUT_SEC = 5;
 const PAIRING_POLL_INTERVAL_MS = 1000;
 
-const HELP_TEXT = [
-  "Команды /remote:",
-  "  /remote connect    — привязать бота (пошагово, локальными вопросами)",
-  "  /remote on|off     — включить/выключить для этого проекта",
-  "    --all            — для всех проектов, --session — только для этой сессии",
-  "    --hybrid         — гибрид: вопрос уходит в GUI, если в мессенджере молчат N секунд",
-  "    --no-hybrid      — выключить гибридный режим",
-  "  /remote status     — привязка, режим, источник токена",
-  "  /remote audit [N]  — последние N решений по подтверждениям (по умолчанию 20)",
-  "  /remote test       — отправить тестовый вопрос в мессенджер",
-  "  /remote who        — сессия, воркспейс и эффективный режим",
-  "  /remote doctor [--json] — проверка привязки, канала и состояния (ok/warn/fail; JSON для скриптов)",
-  "  /remote stats [--json] — метрики: вопросы, подтверждения, доставки, латентность, очереди",
-  "  /remote vacuum [--dry-run] — очистить старые ротированные журналы (хранить 5)",
-  "  /remote channel <проект> <chatId> [threadId] — канал проекта (топик форума)",
-  "    --force          — если бот действительно в другом чате (чужой чат иначе отвергается)",
-  "    --transport=<id> — канал для конкретного канала (telegram, max); по умолчанию — транспорт привязки",
-  "  /remote channel list — какие каналы у каких проектов",
-  "  /remote channel remove <проект> — вернуть проект в общий чат",
-  "  /remote disconnect — отвязать бота и выключить режим",
-].join("\n");
+/** Справка на выбранном языке (RU/EN); имена команд остаются латиницей. */
+function helpText(lang = DEFAULT_LANG) {
+  const code = normalizeLang(lang) ?? DEFAULT_LANG;
+  return [
+    t("commands.helpTitle", {}, code),
+    t("commands.helpConnect", {}, code),
+    t("commands.helpOnOff", {}, code),
+    t("commands.helpAll", {}, code),
+    t("commands.helpHybrid", {}, code),
+    t("commands.helpNoHybrid", {}, code),
+    t("commands.helpStatusLong", {}, code),
+    t("commands.helpAudit", {}, code),
+    t("commands.helpTest", {}, code),
+    t("commands.helpWho", {}, code),
+    t("commands.helpDoctor", {}, code),
+    t("commands.helpStats", {}, code),
+    t("commands.helpVacuum", {}, code),
+    t("commands.helpLang", {}, code),
+    t("commands.helpChannel", {}, code),
+    t("commands.helpForce", {}, code),
+    t("commands.helpTransport", {}, code),
+    t("commands.helpChannelList", {}, code),
+    t("commands.helpChannelRemove", {}, code),
+    t("commands.helpDisconnect", {}, code),
+    t("commands.helpFooter", {}, code),
+  ].join("\n");
+}
 
 /**
  * Версия плагина из `package.json` (для `doctor`).
@@ -1114,13 +1121,42 @@ export function createRemoteCommands({
   }
 
   /** `/remote status`. */
+  /** 046: язык команд: явная настройка состояния → локаль DSH → ru. */
+  function currentLang() {
+    try {
+      return resolveLanguage({ explicit: store.read().lang });
+    } catch {
+      return DEFAULT_LANG;
+    }
+  }
+
+  /**
+   * `/remote lang [ru|en]` — язык пользовательских сообщений без перезапуска.
+   * Без аргумента показывает текущий; неизвестный — ошибка с подсказкой.
+   */
+  async function langCommand(args) {
+    const lang = currentLang();
+    const value = Array.isArray(args) ? args[0] : undefined;
+    if (value === undefined || value === "") {
+      return success(t("commands.lang.current", { lang }, lang));
+    }
+    const normalized = normalizeLang(value);
+    if (normalized === null) {
+      return failure(t("commands.lang.unknown", { value }, lang));
+    }
+    store.setLang(normalized);
+    return success(t("commands.lang.set", { lang: normalized }, normalized));
+  }
+
   async function status(invocation) {
     const state = store.read();
+    const lang = currentLang();
     const { sessionId, cwd } = sessionInfo(invocation);
     const lines = [];
 
+    lines.push(t("commands.status.language", { lang }, lang));
     if (state.bindings === null && liveTransport() === null) {
-      lines.push("бот не привязан: /remote connect");
+      lines.push(t("commands.status.notBound", {}, lang));
     } else if (state.bindings === null) {
       // Канал живёт из config профиля (004): привязки через /remote connect нет.
       lines.push("бот не привязан через /remote connect; канал поднят из config профиля");
@@ -1162,12 +1198,13 @@ export function createRemoteCommands({
       : TELEGRAM_TOKEN_REF;
     const described = await credentials.describe(activeSecretRef);
     if (described.source === null) {
-      lines.push(`секрет: ${activeSecretRef} — не найден`);
+      lines.push(t("commands.status.secret", { ref: activeSecretRef }, lang));
     } else {
       lines.push(`секрет: ${activeSecretRef} — источник ${described.source}${described.writable ? " (запись разрешена)" : " (только чтение)"}`);
     }
 
-    lines.push(`гибрид: ${state.hybrid.enabled ? `вкл, ждём ${Math.round(state.hybrid.waitMs / 1000)} с` : "выкл"}`);
+    const hybridState = state.hybrid.enabled ? `вкл, ждём ${Math.round(state.hybrid.waitMs / 1000)} с` : "выкл";
+    lines.push(t("commands.status.hybrid", { state: hybridState }, lang));
     const hybridStats = ctx?.get?.("remoteAnswerer")?.stats ?? null;
     if (hybridStats !== null && (hybridStats.hybridHanded > 0 || hybridStats.hybridPhoneAnswers > 0)) {
       lines.push(`гибрид-метрика: в GUI ${hybridStats.hybridHanded}, ответов из телефона после GUI ${hybridStats.hybridPhoneAnswers}`);
@@ -1183,7 +1220,7 @@ export function createRemoteCommands({
       if (policy !== null && typeof policy?.describe === "function") {
         for (const line of policy.describe()) lines.push(line);
       } else {
-        lines.push("approvals: политика не загружена — удалённые подтверждения только в GUI");
+        lines.push(t("commands.status.approvals", {}, lang));
       }
     } catch (error) {
       lines.push(`approvals: политика не прочитана (${humanError(error)})`);
@@ -1578,6 +1615,8 @@ export function createRemoteCommands({
           return await setMode(invocation, false, flags);
         case "status":
           return await status(invocation);
+        case "lang":
+          return await langCommand(rest);
         case "audit":
           return auditCommand(rest);
         case "test":
@@ -1596,9 +1635,9 @@ export function createRemoteCommands({
           return await disconnect(invocation);
         case "help":
         case "?":
-          return success(HELP_TEXT);
+          return success(helpText(currentLang()));
         default:
-          return success(`неизвестная подкоманда «${subcommand}»\n\n${HELP_TEXT}`);
+          return success(`${t("commands.unknownSubcommand", { name: subcommand }, currentLang())}\n\n${helpText(currentLang())}`);
       }
     } catch (error) {
       // Сюда попадают отказы userQuestions (человек закрыл вопрос) и прочее:

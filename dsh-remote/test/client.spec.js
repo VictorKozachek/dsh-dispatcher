@@ -324,6 +324,13 @@ test("client: форматирование статуса, дедлайна и �
   const client = loadClientInternals();
   const { statusLines, deadlineText, clockText } = client.__internals;
 
+  const ru = {
+    expired: "истёк",
+    allProjects: "все проекты",
+    session: "сессия",
+    minutes: "{n} мин",
+  };
+  const t = (key) => ru[key] ?? key;
   const lines = statusLines({
     status: {
       channel: true,
@@ -331,15 +338,21 @@ test("client: форматирование статуса, дедлайна и �
       binding: { transport: "telegram", botUsername: "test_bot" },
       enabled: { global: false, workspaces: ["dsh-dispatcher"], sessions: ["session-123456"] },
     },
-  });
+  }, t);
   assert.deepEqual(lines.map((line) => line.key), ["channel", "binding", "enabled"]);
   assert.equal(lines[1].value, "test_bot", "в статусе только имя бота");
   assert.match(lines[2].value, /dsh-dispatcher/);
   assert.match(lines[2].value, /сессия session-/);
 
-  assert.equal(deadlineText(1_000 + 5 * 60_000, 1_000), "5 мин");
-  assert.equal(deadlineText(1_000, 2_000), "истёк");
-  assert.equal(deadlineText(null, 0), "—");
+  const en = { expired: "expired", allProjects: "all projects", session: "session", minutes: "{n} min" };
+  const tEn = (key) => en[key] ?? key;
+  const enLines = statusLines({ status: { enabled: { global: true } } }, tEn);
+  assert.match(enLines.at(-1).value, /all projects/);
+
+  assert.equal(deadlineText(1_000 + 5 * 60_000, 1_000, t), "5 мин");
+  assert.equal(deadlineText(1_000, 2_000, t), "истёк");
+  assert.equal(deadlineText(1_000 + 5 * 60_000, 1_000, tEn), "5 min");
+  assert.equal(deadlineText(null, 0, t), "—");
   assert.match(clockText(1_000), /^\d{2}:\d{2}$/);
 });
 

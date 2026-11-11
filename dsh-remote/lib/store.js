@@ -23,6 +23,8 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { DEFAULT_LANG, normalizeLang } from "./i18n.js";
+
 /**
  * Текущая версия схемы `state.json` (задача 032). Растёт только вперёд, ровно
  * на одну ступень за миграцию; каждая ступень — в {@link STATE_MIGRATIONS}.
@@ -346,6 +348,8 @@ export function defaultState() {
     enabled: { global: false, workspaces: {}, sessions: {} },
     /** Гибридный режим: мессенджер → GUI через `waitMs` (задача 013). */
     hybrid: { enabled: false, waitMs: DEFAULT_HYBRID_WAIT_MS },
+    /** 046: язык пользовательских сообщений (`/remote lang`). */
+    lang: DEFAULT_LANG,
     recent: [],
     pending: [],
     /** 014: дедуп уведомлений доски: что уже отправлено и сколько было todo. */
@@ -829,6 +833,15 @@ export function createStore({
     write,
     update,
     setEnabled,
+    /** 046: сменить язык сообщений; неизвестный — ошибка. */
+    setLang(lang) {
+      const normalized = normalizeLang(lang);
+      if (normalized === null) throw new TypeError(`setLang: неизвестный язык ${lang}`);
+      return update((state) => {
+        state.lang = normalized;
+        return state;
+      });
+    },
     setChannel,
     removeChannel,
     setHybrid,
@@ -876,6 +889,7 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT, pendi
       workspaces: booleans(enabled.workspaces),
       sessions: booleans(enabled.sessions),
     },
+    lang: normalizeLang(value.lang) ?? DEFAULT_LANG,
     hybrid: {
       enabled: value.hybrid?.enabled === true,
       waitMs: Number.isFinite(value.hybrid?.waitMs) && value.hybrid.waitMs > 0

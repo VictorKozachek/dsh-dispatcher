@@ -65,7 +65,10 @@ window.__ModuleLoader__.load({
       spendNone: "no token spend recorded",
       today: "today",
       week: "week",
-      total: "total"
+      total: "total",
+      allProjects: "all projects",
+      session: "session",
+      minutes: "{n} min"
     };
 
     const ru = {
@@ -97,7 +100,10 @@ window.__ModuleLoader__.load({
       spendNone: "расход пока не записан",
       today: "сегодня",
       week: "неделя",
-      total: "всего"
+      total: "всего",
+      allProjects: "все проекты",
+      session: "сессия",
+      minutes: "{n} мин"
     };
 
     /** Время в формате `ЧЧ:ММ`; нечисловое значение — прочерк. */
@@ -114,16 +120,16 @@ window.__ModuleLoader__.load({
      * @param deadlineAt - метка времени или null.
      * @param now - текущее время.
      */
-    function deadlineText(deadlineAt, now) {
+    function deadlineText(deadlineAt, now, t) {
       if (!Number.isFinite(deadlineAt)) return "—";
       const left = deadlineAt - now;
-      if (left <= 0) return ru.expired;
+      if (left <= 0) return t("expired");
       const minutes = Math.ceil(left / 60000);
-      return minutes + " мин";
+      return String(t("minutes")).replace("{n}", String(minutes));
     }
 
     /** Строки статуса для панели: без секретов и полных путей (их нет в снимке). */
-    function statusLines(snapshot) {
+    function statusLines(snapshot, t) {
       const status = snapshot && snapshot.status ? snapshot.status : {};
       const lines = [];
       lines.push({
@@ -142,9 +148,9 @@ window.__ModuleLoader__.load({
       }
       const enabled = status.enabled || {};
       const scopes = [];
-      if (enabled.global === true) scopes.push("все проекты");
+      if (enabled.global === true) scopes.push(t("allProjects"));
       for (const workspace of enabled.workspaces || []) scopes.push(workspace);
-      for (const session of enabled.sessions || []) scopes.push("сессия " + String(session).slice(0, 8));
+      for (const session of enabled.sessions || []) scopes.push(t("session") + " " + String(session).slice(0, 8));
       lines.push({ key: "enabled", label: "enabled", value: scopes.length > 0 ? scopes.join(", ") : "enabledNone" });
       return lines;
     }
@@ -285,7 +291,7 @@ window.__ModuleLoader__.load({
         h("div", { key: "status", style: { display: "flex", flexDirection: "column", gap: 2 } },
           state.loading
             ? h(Row, { label: "", value: t("loading") })
-            : statusLines(snapshot).map((line) => h(Row, { key: line.key, label: t(line.label), value: line.value === "" ? "" : (line.label === "binding" || line.label === "enabled" ? line.value : t(line.value)) }))
+            : statusLines(snapshot, t).map((line) => h(Row, { key: line.key, label: t(line.label), value: line.value === "" ? "" : (line.label === "binding" || line.label === "enabled" ? line.value : t(line.value)) }))
         )
       );
 
@@ -319,7 +325,7 @@ window.__ModuleLoader__.load({
                 h(Button, { label: t("dismiss"), disabled: busy !== "", onClick: () => void run("dismiss", question.shortId) })
               ),
               h("div", { style: { color: "#475569" } }, title === "" ? "—" : title),
-              h("div", { style: { color: "#64748b" } }, t("deadline") + ": " + deadlineText(question.deadlineAt, now) + " (" + clockText(question.deadlineAt) + ")")
+              h("div", { style: { color: "#64748b" } }, t("deadline") + ": " + deadlineText(question.deadlineAt, now, t) + " (" + clockText(question.deadlineAt) + ")")
             )
           );
         }
