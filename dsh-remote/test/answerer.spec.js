@@ -243,15 +243,15 @@ test("аборт request.signal: сообщение закрыто, вопрос
   assert.match(logs.join("\n"), /режим|ответ/);
 });
 
-test("аборт во время sendQuestion: не ждём отправку, отклоняемся, закрываем отправленное", async () => {
+test("аборт во время sendQuestion: не ждём отправку, отклоняемся, закрываем опубликованное", async () => {
   const closed = [];
   const sent = [];
   const transport = {
     sendQuestion(question) {
       sent.push(question);
-      if (question.questionId === "q2") {
+      if (question.questionId === "q1") {
         return new Promise(() => {
-          /* отправка «зависла»: именно этот случай ломал обработчик */
+          /* отправка первого «зависла»: именно этот случай ломал обработчик */
         });
       }
       return Promise.resolve();
@@ -275,29 +275,36 @@ test("аборт во время sendQuestion: не ждём отправку, �
     signal: controller.signal,
   }, () => assert.fail("next() не должен вызываться"));
   await tick();
-  assert.equal(sent.length, 2, "вторая отправка висит");
+  assert.equal(sent.length, 1, "037: второй вопрос не публикуется до ответа на первый");
 
   controller.abort();
 
   await assert.rejects(pending, (error) => error.name === "AbortError");
-  assert.equal(closed.length, 2, "закрыты вопросы, по которым отправка уже началась");
-  assert.deepEqual(closed.map((item) => item.question.questionId), ["q1", "q2"]);
+  assert.equal(closed.length, 1, "закрыт уже опубликованный вопрос");
+  assert.deepEqual(closed.map((item) => item.question.questionId), ["q1"]);
   assert.equal(sent[0].status, QUESTION_STATUS.cancelled);
-  assert.equal(sent[1].status, QUESTION_STATUS.cancelled);
 });
 
-test("два вопроса в одном запросе не путаются", async () => {
+test("два вопроса в одном запросе задаются последовательно и не путаются", async () => {
   const { ctx, transport, answerer } = setup();
   answerer.attach(ctx);
 
   const questions = [item({ id: "q1" }), item({ id: "q2", options: [{ label: "Раз" }, { label: "Два" }] })];
   const pending = runWaterfall(ctx, EVENT, request({ questions }), () => assert.fail("next()"));
   await tick();
-  assert.equal(transport.sent.length, 2);
+  assert.equal(transport.sent.length, 1, "сначала только вопрос 1");
+  assert.equal(transport.sent[0].index, 1, "шапка: вопрос 1/2");
+  assert.equal(transport.sent[0].total, 2);
 
-  const [first, second] = transport.sent;
-  transport.answer({ shortId: second.shortId, optionId: "o2" });
-  transport.answer({ shortId: first.shortId, optionId: "o1" });
+  // Отвечаем на первый — только теперь появляется второй с корректным номером.
+  transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+  await tick();
+  assert.equal(transport.sent.length, 2, "после ответа отправлен вопрос 2");
+  assert.equal(transport.sent[1].index, 2, "шапка: вопрос 2/2");
+  assert.equal(transport.sent[1].total, 2);
+  assert.equal(transport.sent[1].questionId, "q2");
+
+  transport.answer({ shortId: transport.sent[1].shortId, optionId: "o2" });
 
   const result = await pending;
   assert.deepEqual(result.answers, [
@@ -606,3 +613,53 @@ function rowsFor(question) {
   // Локальный аналог renderRows для проверки: вопрос с вариантами даёт option-кнопки.
   return (question.options ?? []).map((option) => [{ kind: "option", optionId: option.id, label: option.label }]);
 }
+
+// --- 037: пачка вопросов публикуется последовательно ------------------------
+
+test("037: ответ на ещё не опубликованный вопрос игнорируется, пачка завершается", async () => {
+  const { ctx, transport, answerer } = setup();
+  answerer.attach(ctx);
+
+  const questions = [item({ id: "q1" }), item({ id: "q2", options: [{ label: "Раз" }, { label: "Два" }] })];
+  const pending = runWaterfall(ctx, EVENT, request({ questions }), () => assert.fail("next()"));
+  await tick();
+  assert.equal(transport.sent.length, 1);
+
+  // «Ответ» на второй вопрос до его публикации: shortId неизвестен — игнор.
+  transport.answer({ shortId: "deadbeef", optionId: "o2" });
+  await tick();
+  assert.equal(transport.sent.length, 1, "второй вопрос всё ещё не опубликован");
+  assert.equal(transport.sent[0].status, QUESTION_STATUS.open, "первый не тронут чужим ответом");
+
+  transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+  await tick();
+  assert.equal(transport.sent.length, 2);
+
+  transport.answer({ shortId: transport.sent[1].shortId, optionId: "o2" });
+  const result = await pending;
+  assert.deepEqual(result.answers, [
+    { id: "q1", selected: ["Да"] },
+    { id: "q2", selected: ["Два"] },
+  ]);
+});
+
+test("037: аборт после ответа на первый снимает опубликованный второй", async () => {
+  const { ctx, transport, answerer } = setup();
+  answerer.attach(ctx);
+  const controller = new AbortController();
+  const pending = runWaterfall(ctx, EVENT, request({
+    questions: [item({ id: "q1" }), item({ id: "q2" })],
+    signal: controller.signal,
+  }), () => assert.fail("next()"));
+
+  await tick();
+  transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+  await tick();
+  assert.equal(transport.sent.length, 2, "второй опубликован после первого ответа");
+
+  controller.abort();
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+  const closedIds = transport.closed.map((entry) => entry.question.questionId);
+  assert.ok(closedIds.includes("q2"), "опубликованный второй закрыт");
+  assert.equal(transport.sent[1].status, QUESTION_STATUS.cancelled);
+});
