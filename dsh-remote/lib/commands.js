@@ -1520,6 +1520,11 @@ export function createRemoteCommands({
    * `--json` — стабильная машиночитаемая структура с кодом возврата.
    */
   async function doctor(invocation, flags) {
+    // 049: `--json` — машинный вывод, он не должен зависеть от языка:
+    // detail/action строим на каноническом DEFAULT_LANG. Человеческий вывод —
+    // на текущем языке.
+    const json = flags?.has?.("json") === true;
+    commandLang = json ? DEFAULT_LANG : currentLang();
     const legacyChecks = await runDoctorChecks({
 
       store,
@@ -1551,13 +1556,14 @@ export function createRemoteCommands({
       store,
       reliability: ctx?.get?.("remoteReliability") ?? null,
       supportedSchemaVersion: STATE_VERSION,
-      lang: currentLang(),
+      lang: commandLang,
     });
     const report = buildReport(checks);
-    if (flags?.has?.("json") === true) {
+    if (json) {
       return { ...success(serializeReport(report)), exitCode: report.exitCode };
     }
-    return { ...success(formatHealthReport(report, currentLang())), exitCode: report.exitCode };
+    commandLang = currentLang();
+    return { ...success(formatHealthReport(report, commandLang)), exitCode: report.exitCode };
   }
 
   async function disconnect(invocation) {

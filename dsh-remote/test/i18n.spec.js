@@ -230,3 +230,22 @@ test("049: help и doctor на EN не содержат русских фраг�
   assert.doesNotMatch(doctor.text, /[А-Яа-яЁё]/, doctor.text);
   assert.doesNotMatch(doctor.text, /undefined/);
 });
+
+test("049: doctor --json одинаков на RU и EN (машинный вывод не локализуется)", async (t) => {
+  const { remote, invoke } = harness(t);
+
+  await remote.handler(invoke("lang en"));
+  const en = await remote.handler(invoke("doctor --json"));
+  await remote.handler(invoke("lang ru"));
+  const ru = await remote.handler(invoke("doctor --json"));
+
+  assert.equal(en.kind, "success", en.text);
+  assert.equal(ru.kind, "success", ru.text);
+  const enReport = JSON.parse(en.text);
+  const ruReport = JSON.parse(ru.text);
+  assert.deepEqual(enReport.checks, ruReport.checks, "id/status/detail/action не зависят от языка");
+  assert.equal(enReport.exitCode, ruReport.exitCode);
+  for (const check of enReport.checks) {
+    assert.deepEqual(Object.keys(check).filter((key) => /[^a-z]/.test(key)), [], "ключи — латиницей");
+  }
+});
