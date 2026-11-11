@@ -31,6 +31,9 @@ export const STATE_SERVICE = "remoteStore";
 function createBindingTransport({ facade, registry, store, log = () => {} }) {
   const subscribers = new Set();
   const subscriptions = new Map();
+  /** shortId → канал, который реально доставил вопрос (для close/edit после switch). */
+  const deliveredVia = new Map();
+  let warnedMissingChannel = false;
   const bindingId = () => {
     try {
       const binding = store?.read?.().bindings ?? null;
@@ -44,8 +47,34 @@ function createBindingTransport({ facade, registry, store, log = () => {} }) {
     if (id !== null) {
       const bound = registry?.get?.(id) ?? null;
       if (bound !== null) return bound;
+      // Fail-closed: привязка есть, канала нет — не подставляем чужой фасад
+      // (это может быть старый/отключённый канал). Если ensure положил нужный
+      // канал только в фасад (current.id совпадает) — берём его.
+      if (facade?.current?.id === id) return facade;
+      if (!warnedMissingChannel) {
+        warnedMissingChannel = true;
+        log(`answerer: привязка ${id}, но канал не поднят — вопрос уйдёт в GUI (fail-closed)`);
+      }
+      return null;
     }
     return facade ?? null;
+  };
+
+  /** Канал, который доставил вопрос: deliveries/answeredVia, иначе активный. */
+  const channelForQuestion = (question) => {
+    const ids = [];
+    if (typeof question?.answeredVia === "string") ids.push(question.answeredVia);
+    for (const delivery of Array.isArray(question?.deliveries) ? question.deliveries : []) {
+      if (typeof delivery?.transport === "string") ids.push(delivery.transport);
+    }
+    for (const id of ids) {
+      const channel = registry?.get?.(id) ?? null;
+      if (channel !== null) return channel;
+      if (facade?.current?.id === id) return facade.current;
+    }
+    const key = question?.shortId;
+    if (typeof key === "string" && deliveredVia.has(key)) return deliveredVia.get(key);
+    return active();
   };
   const sync = () => {
     const candidates = new Set([facade]);
@@ -60,7 +89,12 @@ function createBindingTransport({ facade, registry, store, log = () => {} }) {
       let off = null;
       try {
         off = channel.onAnswer((event) => {
-          for (const handler of [...subscribers]) handler(event);
+          // 038: сохранить реальный канал-источник (ответчик подписан на прокси,
+          // и без этого answeredVia после переключения стал бы «текущим»).
+          const payload = event !== null && typeof event === "object"
+            ? { ...event, __sourceTransport: channel }
+            : event;
+          for (const handler of [...subscribers]) handler(payload);
         });
       } catch (error) {
         log(`answerer: подписка на канал ${channel.id ?? "?"} не удалась (${error?.message ?? error})`);
@@ -89,13 +123,30 @@ function createBindingTransport({ facade, registry, store, log = () => {} }) {
       if (channel === null || typeof channel.sendQuestion !== "function") {
         throw new Error("канал не поднят: /remote connect");
       }
-      return channel.sendQuestion(question, options);
+      const remember = () => {
+        if (typeof question?.shortId === "string") deliveredVia.set(question.shortId, channel);
+      };
+      const sent = channel.sendQuestion(question, options);
+      if (sent !== null && typeof sent?.then === "function") {
+        return sent.then((result) => {
+          remember();
+          return result;
+        });
+      }
+      remember();
+      return sent;
     },
     closeQuestion(question, summary) {
-      return active()?.closeQuestion?.(question, summary);
+      const channel = channelForQuestion(question);
+      if (channel === null) return undefined;
+      const result = channel.closeQuestion?.(question, summary);
+      if (typeof question?.shortId === "string") deliveredVia.delete(question.shortId);
+      return result;
     },
     editQuestion(question, text) {
-      return active()?.editQuestion?.(question, text);
+      // Правка идёт в канал, который доставил вопрос, даже если привязка уже
+      // переключилась (TTL/напоминание старого вопроса).
+      return channelForQuestion(question)?.editQuestion?.(question, text);
     },
     healthCheck() {
       return active()?.healthCheck?.() ?? { ok: false, detail: "канал не поднят" };
@@ -195,7 +246,11 @@ export const answererFeature = {
     deps.onDispose(answerer.attach(ctx), "closers");
     // Метрика гибрида доступна командам (`/remote status`) как сервис.
     try {
-      ctx.provide?.("remoteAnswerer", { stats: answerer.stats });
+      ctx.provide?.("remoteAnswerer", {
+        stats: answerer.stats,
+        // 038: до остановки прежнего канала снять его открытые вопросы.
+        cancelChannel: (transportId, reason) => answerer.cancelChannel(transportId, reason),
+      });
     } catch (error) {
       deps.logger.debug(`answerer: сервис статистики не зарегистрирован (${error?.message ?? error})`);
     }

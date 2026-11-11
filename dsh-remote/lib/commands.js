@@ -586,6 +586,17 @@ export function createRemoteCommands({
     const previous = store.read().bindings;
     if (previous === null) return { previous: null, switchNote: null, secretNote: null };
     const previousTransport = typeof previous.transport === "string" ? previous.transport : "telegram";
+    // 038: сначала снимаем открытые вопросы прежнего канала (пока он жив и может
+    // закрыть сообщения), затем останавливаем его. Иначе вопрос остался бы с
+    // кнопками, а ответ закрывал бы уже новый канал.
+    try {
+      const cancellation = await ctx?.get?.("remoteAnswerer")?.cancelChannel?.(previousTransport, "канал отключён");
+      if (Number.isFinite(cancellation) && cancellation > 0) {
+        log(`переключение канала: снято открытых вопросов — ${cancellation}`);
+      }
+    } catch (error) {
+      log(`переключение канала: открытые вопросы не сняты (${humanError(error)})`);
+    }
     await stopTransportChannels(previousTransport);
 
     let secretNote = null;

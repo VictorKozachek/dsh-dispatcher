@@ -650,7 +650,22 @@ export function createAnswerer({
             reliability?.noteDeliveries?.(question);
             continue;
           }
-          const outcome = await Promise.race([sendOne(question, request?.signal), aborted]);
+          const sent = await Promise.race([sendOne(question, request?.signal), aborted]);
+          const outcome = sent;
+          // 038: запомнить, какой канал реально доставил вопрос — после смены
+          // привязки закрывать/править его нужно в этом канале.
+          if (typeof question.addDelivery === "function"
+            && !(Array.isArray(question.deliveries) && question.deliveries.length > 0)) {
+            try {
+              question.addDelivery({
+                transport: primary?.id ?? null,
+                messageId: sent?.messageId ?? null,
+                chatId: question.chatId ?? null,
+              });
+            } catch (error) {
+              log(`вопрос ${question.shortId}: доставка не записана (${error?.message ?? error})`);
+            }
+          }
           if (outcome === "give-up") {
             try {
               metrics?.inc?.("deliveries.failed");
@@ -749,7 +764,13 @@ export function createAnswerer({
     let offAnswers = [];
     let offRequest = null;
     try {
-      offAnswers = subscribable.map((channel) => channel.onAnswer((event) => onTransportAnswer(event, channel)));
+      offAnswers = subscribable.map((channel) => channel.onAnswer((event) => onTransportAnswer(
+        event,
+        // 038: прокси динамического канала передаёт реальный источник ответа.
+        event !== null && typeof event === "object" && event.__sourceTransport !== undefined
+          ? event.__sourceTransport
+          : channel,
+      )));
     } catch (error) {
       log(`ответчик не подписан: транспорт не отдал onAnswer (${error?.message ?? error})`);
       for (const off of offAnswers) {
@@ -819,5 +840,34 @@ export function createAnswerer({
     return stats;
   }
 
-  return { attach, handler, dispose, stats };
+  /**
+   * 038: снять открытые вопросы, доставленные в канал, который отключаем (до
+   * transport.stop). Закрываем сообщения в том же канале, ожидания отклоняем.
+   */
+  async function cancelChannel(transportId, reason = "канал отключён") {
+    let cancelled = 0;
+    for (const [shortId, entry] of [...pending.entries()]) {
+      const question = entry.question;
+      const deliveries = Array.isArray(question?.deliveries) ? question.deliveries : [];
+      const via = question?.answeredVia;
+      if (via !== transportId && !deliveries.some((delivery) => delivery?.transport === transportId)) continue;
+      pending.delete(shortId);
+      rememberClosed(question);
+      reliability?.unwatch?.(shortId);
+      if (!question.cancel(reason, now())) continue;
+      try {
+        const closing = useBroker && (question.deliveries?.length ?? 0) > 0
+          ? broker.closeAll(question, { winner: null, summary: reason })
+          : primary?.closeQuestion?.(question, reason);
+        if (closing !== null && typeof closing?.then === "function") closing.catch(() => {});
+      } catch (error) {
+        log(`вопрос ${shortId}: закрыть сообщение при отключении канала не удалось (${error?.message ?? error})`);
+      }
+      entry.reject(abortError(reason));
+      cancelled += 1;
+    }
+    return cancelled;
+  }
+
+  return { attach, handler, dispose, stats, cancelChannel };
 }

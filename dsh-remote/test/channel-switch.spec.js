@@ -119,6 +119,7 @@ function harness(t, { bindings = null, credentials = fakeCredentials(), answers 
 
   const order = [];
   const registry = new Map(channels.map((channel) => [channel.id, channel]));
+  const cancelledChannels = [];
   const facade = {
     __isTransportFacade: true,
     current: channels[0] ?? null,
@@ -149,6 +150,15 @@ function harness(t, { bindings = null, credentials = fakeCredentials(), answers 
         if (name === "userQuestions") return { ask };
         if (name === "remoteTransport") return facade;
         if (name === "remoteTransports") return registry;
+        if (name === "remoteAnswerer") {
+          return {
+            stats: {},
+            cancelChannel: (transportId, reason) => {
+              cancelledChannels.push({ transportId, reason });
+              return 0;
+            },
+          };
+        }
         return null;
       },
       userQuestions: { ask },
@@ -166,7 +176,7 @@ function harness(t, { bindings = null, credentials = fakeCredentials(), answers 
       return { async start() { return true; } };
     },
   });
-  return { store, remote, order, facade, registry, credentials };
+  return { store, remote, order, facade, registry, credentials, cancelledChannels };
 }
 
 /** Ответы для connect relay. */
@@ -237,6 +247,8 @@ test("connect: Telegram → релей отключает прежний кан�
   assert.equal(state.bindings.previousTransport, "telegram", "имя прежнего канала сохранено");
   assert.equal(credentials.values.has(TELEGRAM_TOKEN_REF), false, "токен Telegram удалён");
   assert.deepEqual(stand.registry.size, 0, "канал прежнего транспорта снят с реестра");
+  assert.deepEqual(stand.cancelledChannels, [{ transportId: "telegram", reason: "канал отключён" }],
+    "открытые вопросы прежнего канала сняты до его остановки");
 });
 
 test("connect: релей → Telegram переключает обратно и чистит токен релея", async (t) => {
@@ -351,6 +363,9 @@ test("имена и ссылки транспортов: MAX — свой сек
 function answererStand({ config = {}, binding = null, facadeCurrent = null } = {}) {
   const telegram = createFakeTransport({ now: () => 0 });
   const relay = createFakeTransport({ now: () => 0 });
+  // У fake id фиксирован «fake»; для роутинга по deliveries нужны реальные id.
+  telegram.id = "telegram";
+  relay.id = "relay";
   const facade = {
     __isTransportFacade: true,
     current: facadeCurrent === "relay" ? relay : facadeCurrent === "telegram" ? telegram : null,
@@ -388,8 +403,14 @@ function answererStand({ config = {}, binding = null, facadeCurrent = null } = {
     get: (name) => services.get(name) ?? null,
     onDispose: () => {},
   };
+  const provided = new Map();
   const ctx = {
-    get: (name) => services.get(name) ?? null,
+    get: (name) => services.get(name) ?? provided.get(name) ?? null,
+    provide: (name, value) => {
+      provided.set(name, value);
+      services.set(name, value);
+      return value;
+    },
     on: (event, handler) => {
       hooks.set(event, { handler });
       return () => {};
@@ -408,6 +429,7 @@ function answererStand({ config = {}, binding = null, facadeCurrent = null } = {
       currentBinding = transportId;
       facade.current = transportId === "relay" ? relay : telegram;
     },
+    answererService: provided.get("remoteAnswerer") ?? null,
   };
 }
 
@@ -465,23 +487,60 @@ test("ответчик: веер включается только явным co
   await pending.catch(() => {});
 });
 
-test("live-переключение: после connect вопрос идёт в новый активный канал", async () => {
+test("live-переключение: после connect вопрос идёт в новый канал, старый закрывается там же", async () => {
   const stand = answererStand({ binding: "telegram", facadeCurrent: "telegram" });
 
+  // q1 доставлен в telegram и остался открытым.
   const first = await publish(stand.handler);
   assert.equal(stand.telegram.messages.length, 1, "стартовый канал — telegram");
-  stand.telegram.answer(stand.telegram.messages[0].shortId, "o1");
-  assert.equal((await first.pending).answers.length, 1, "ответ из стартового канала доставлен");
 
-  // `/remote connect relay`: retireActiveChannel меняет привязку, ensure поднимает relay
-  // и кладёт его в фасад; ответчик уже применён и не должен остаться на telegram.
+  // `/remote connect relay`: привязка меняется, ensure поднимает relay.
   stand.switchTo("relay");
-  const second = await publish(stand.handler);
+  // Ответ на q1 пришёл в telegram уже после переключения: закрывать нужно telegram,
+  // а не новый relay (сообщения q1 в relay нет).
+  stand.telegram.answer(stand.telegram.messages[0].shortId, "o1");
+  assert.equal((await first.pending).answers.length, 1, "ответ на q1 доставлен");
+  await new Promise((resolve) => setImmediate(resolve)); // закрытие сообщения — в фоне
+  assert.equal(stand.telegram.calls.close, 1, "q1 закрыт в своём канале telegram");
+  assert.equal(stand.relay.calls.close, 0, "relay не трогает чужой вопрос");
 
+  const second = await publish(stand.handler);
   assert.equal(stand.telegram.messages.length, 1, "в отключённый telegram новых вопросов нет");
   assert.equal(stand.relay.messages.length, 1, "вопрос ушёл в новый активный relay");
   stand.relay.answer(stand.relay.messages[0].shortId, "o1");
   assert.equal((await second.pending).answers.length, 1, "ответ из relay доставлен ровно один раз");
+  assert.equal(stand.relay.calls.close, 1, "вопрос из relay закрыт в relay");
+});
+
+test("привязка есть, канала нет: fail-closed, а не старый фасад", async () => {
+  const stand = answererStand({ binding: "relay", facadeCurrent: "telegram" });
+  stand.registry.delete("relay"); // как будто ensure не поднял relay (нет секрета)
+
+  const pending = stand.handler(questionRequest, async () => "gui");
+  pending.catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(stand.telegram.messages.length, 0, "старый фасад не должен получать вопрос");
+  assert.equal(stand.relay.messages.length, 0);
+  assert.equal(await pending, "gui", "вопрос уходит в GUI (fail-closed)");
+});
+
+test("cancelChannel снимает открытые вопросы отключаемого канала", async () => {
+  const stand = answererStand({ binding: "telegram", facadeCurrent: "telegram" });
+  const first = await publish(stand.handler);
+  assert.equal(stand.telegram.messages.length, 1);
+
+  const cancelled = await stand.answererService.cancelChannel("telegram", "канал отключён");
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(cancelled, 1, "вопрос канала снят");
+  assert.equal(stand.telegram.calls.close, 1, "сообщение закрыто в отключаемом канале");
+  assert.equal(stand.relay.calls.close, 0, "новый канал не тронут");
+  await assert.rejects(first.pending, (error) => {
+    assert.equal(error.name, "AbortError", "ожидание отклонено абонентом");
+    assert.equal(error.cause, "канал отключён", "причина — отключение канала");
+    return true;
+  });
 });
 
 test("live-переключение и обратно: повторный connect снова меняет канал", async () => {
