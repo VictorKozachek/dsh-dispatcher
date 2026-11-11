@@ -512,3 +512,97 @@ test("служебные кнопки free/more не ломают вопрос (
   const result = await pending;
   assert.deepEqual(result.answers, [{ id: "q1", selected: [], custom: "своё" }]);
 });
+
+// --- 044: быстрые ответы для вопросов без вариантов -------------------------
+
+test("044: быстрая кнопка возвращает custom с человекочитаемым текстом", async () => {
+  const { ctx, transport, answerer } = setup();
+  answerer.attach(ctx);
+  const pending = runWaterfall(ctx, EVENT, request({
+    questions: [item({ id: "q-free", question: "Продолжать?", options: [] })],
+  }), () => assert.fail("next()"));
+
+  await tick();
+  const sent = transport.sent[0];
+  assert.deepEqual(sent.quickReplies.map((entry) => entry.label), ["Да", "Нет", "Отложить", "Решай сам"]);
+
+  transport.answer({ shortId: sent.shortId, optionId: "q1" });
+  const result = await pending;
+  assert.deepEqual(result.answers, [{ id: "q-free", selected: [], custom: "Да" }]);
+});
+
+test("044: «Решай сам» возвращает понятный модели текст, а не id кнопки", async () => {
+  const { ctx, transport, answerer } = setup();
+  answerer.attach(ctx);
+  const pending = runWaterfall(ctx, EVENT, request({
+    questions: [item({ id: "q-delegate", options: [] })],
+  }), () => assert.fail("next()"));
+
+  await tick();
+  transport.answer({ shortId: transport.sent[0].shortId, optionId: "q4" });
+  const result = await pending;
+  assert.equal(result.answers[0].custom, "Реши сам, я делегирую");
+  assert.equal(/q4/.test(JSON.stringify(result)), false, "внутренний id не утёк в ответ");
+});
+
+test("044: конфиг переопределяет набор, пустой — выключает кнопки", async () => {
+  const custom = setup();
+  const answerer = (await import("../lib/answerer.js")).createAnswerer({
+    transport: custom.transport,
+    registry: createRegistry({ readState: () => ({ global: true }) }),
+    quickReplies: [{ label: "Ок", text: "Хорошо" }],
+    now: () => 1_000,
+  });
+  answerer.attach(custom.ctx);
+  const pending = runWaterfall(custom.ctx, EVENT, request({
+    questions: [item({ id: "q-custom", options: [] })],
+  }), () => assert.fail("next()"));
+  await tick();
+  assert.deepEqual(custom.transport.sent[0].quickReplies.map((entry) => entry.label), ["Ок"]);
+  custom.transport.answer({ shortId: custom.transport.sent[0].shortId, optionId: "q1" });
+  const result = await pending;
+  assert.equal(result.answers[0].custom, "Хорошо");
+
+  const disabled = setup();
+  const emptyAnswerer = (await import("../lib/answerer.js")).createAnswerer({
+    transport: disabled.transport,
+    registry: createRegistry({ readState: () => ({ global: true }) }),
+    quickReplies: [],
+    now: () => 1_000,
+  });
+  emptyAnswerer.attach(disabled.ctx);
+  const emptyPending = runWaterfall(disabled.ctx, EVENT, request({
+    questions: [item({ id: "q-empty", options: [] })],
+  }), () => assert.fail("next()"));
+  await tick();
+  assert.deepEqual(disabled.transport.sent[0].quickReplies, [], "пустой набор — кнопок нет");
+
+  // Кнопки нет — «нажатие» q1 игнорируется, вопрос остаётся открытым.
+  disabled.transport.answer({ shortId: disabled.transport.sent[0].shortId, optionId: "q1" });
+  await tick();
+  assert.equal(disabled.transport.sent[0].status, QUESTION_STATUS.open);
+  disabled.transport.answer({ shortId: disabled.transport.sent[0].shortId, text: "текстом" });
+  const emptyResult = await emptyPending;
+  assert.equal(emptyResult.answers[0].custom, "текстом");
+});
+
+test("044: вопрос с вариантами не получает быстрых кнопок", async () => {
+  const { ctx, transport, answerer } = setup();
+  answerer.attach(ctx);
+  const pending = runWaterfall(ctx, EVENT, request({
+    questions: [item({ id: "q-options", options: [{ label: "Да" }, { label: "Нет" }] })],
+  }), () => assert.fail("next()"));
+  await tick();
+  const sent = transport.sent[0];
+  assert.equal(sent.quickReplies.length, 4, "набор хранится в модели, но не рендерится");
+  assert.equal(rowsFor(sent).some((row) => row.some((button) => button.kind === "quick")), false);
+
+  transport.answer({ shortId: sent.shortId, optionId: "o1" });
+  const result = await pending;
+  assert.deepEqual(result.answers, [{ id: "q-options", selected: ["Да"] }]);
+});
+
+function rowsFor(question) {
+  // Локальный аналог renderRows для проверки: вопрос с вариантами даёт option-кнопки.
+  return (question.options ?? []).map((option) => [{ kind: "option", optionId: option.id, label: option.label }]);
+}

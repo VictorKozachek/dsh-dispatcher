@@ -94,6 +94,14 @@ function choiceFor(question, event) {
   if (event.optionIds.length === 1 && event.optionIds[0] === FREE_TEXT_OPTION) return { awaitingText: true };
   if (event.optionIds.length === 1 && event.optionIds[0] === MORE_OPTION) return { showMore: true };
 
+  // 044: быстрая кнопка — это не вариант вопроса, а готовый свободный ответ.
+  // В сессию уходит человекочитаемый текст, а не наш внутренний id `qN`.
+  const quick = Array.isArray(question.quickReplies) ? question.quickReplies : [];
+  if (quick.length > 0 && event.optionIds.length === 1) {
+    const match = quick.find((item) => item.id === event.optionIds[0]);
+    if (match !== undefined) return { choice: { selected: [], custom: match.text } };
+  }
+
   const labels = new Map(question.options.map((option) => [option.id, option.label]));
   const selected = [];
   for (const id of event.optionIds) {
@@ -146,6 +154,8 @@ export function createAnswerer({
   hybrid = null,
   /** 031: метрики (только числа). */
   metrics = null,
+  /** 044: быстрые ответы для вопросов без вариантов. */
+  quickReplies = undefined,
   /** 013: доставка позднего ответа; по умолчанию `sessionController.prompt`. */
   steer = null,
   /** 013: таймеры инжектируются, тесты не ждут реальные 20 секунд. */
@@ -497,6 +507,7 @@ export function createAnswerer({
           workspace,
           role: questionContext.role,
           taskId: questionContext.taskId,
+          quickReplies,
           chatId: questionChannel.chatId,
           threadId: questionChannel.threadId,
           now: now(),

@@ -24,12 +24,16 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { DEFAULT_CAPS } from "./transport/base.js";
+import { normalizeQuickReplies } from "./quick-replies.js";
 
 /** Кнопка свободного ответа: переключает вопрос в режим ожидания текста. */
 export const FREE_TEXT_LABEL = "Другой ответ…";
 
 /** Подсказка под вопросом без вариантов: как ответить из мессенджера. */
 export const FREE_TEXT_HINT = "↩︎ Ответьте текстом на это сообщение.";
+
+/** 044: подсказка, когда есть и быстрые кнопки, и возможность написать текст. */
+export const QUICK_REPLY_HINT = "↩︎ Или ответьте текстом на это сообщение.";
 
 /** Кнопка «вариантов больше, чем влезает» — раскрывает остальные. */
 export const MORE_LABEL = "Показать ещё";
@@ -292,7 +296,11 @@ export function renderBody(question = {}, caps = {}) {
   // как ответить, и транспорт дополнительно включает force_reply (клавиатура
   // сразу открывается с подсказкой).
   const hasOptions = Array.isArray(question.options) && question.options.length > 0;
-  if (!hasOptions && question.allowFreeText !== false) parts.push("", FREE_TEXT_HINT);
+  if (!hasOptions && question.allowFreeText !== false) {
+    const quick = normalizeQuickReplies(question.quickReplies);
+    const quickShown = caps.inlineButtons !== false && quick.length > 0;
+    parts.push("", quickShown ? QUICK_REPLY_HINT : FREE_TEXT_HINT);
+  }
   return truncate(parts.join("\n"), maxText, TRUNCATION_MARKER);
 }
 
@@ -316,6 +324,19 @@ export function renderRows(question = {}, caps = {}) {
 
   const options = Array.isArray(question.options) ? question.options : [];
   const labelLimit = Number.isFinite(caps.maxText) ? Math.min(64, caps.maxText) : 64;
+
+  // 044: вопрос без вариантов — ряд быстрых ответов вместо поля ввода. Пустой
+  // набор (конфиг `quickReplies: []`) выключает кнопки: остаётся текст.
+  if (options.length === 0) {
+    if (question.allowFreeText === false || caps.inlineButtons === false) return [];
+    const quick = normalizeQuickReplies(question.quickReplies);
+    if (quick.length === 0) return [];
+    return quick.slice(0, maxOptions).map((item) => [{
+      label: truncate(item.label, labelLimit),
+      kind: "quick",
+      optionId: item.id,
+    }]);
+  }
   const button = (option) => ({
     label: truncate(option?.label ?? "", labelLimit),
     kind: "option",

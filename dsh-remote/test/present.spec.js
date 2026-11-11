@@ -257,8 +257,32 @@ test("renderRows: без свободного ответа и без вариа�
   const noFree = renderRows({ options: [{ id: "o1", label: "Да" }], allowFreeText: false }, { maxOptions: 8 });
   assert.deepEqual(noFree.map((row) => row[0].kind), ["option"]);
 
+  // 044: вопрос без вариантов — быстрые ответы, а не кнопка «Другой ответ…».
   const empty = renderRows({ options: [], allowFreeText: true }, { maxOptions: 8 });
-  assert.deepEqual(empty, [[{ label: FREE_TEXT_LABEL, kind: "free", optionId: FREE_TEXT_OPTION }]]);
+  assert.deepEqual(empty.map((row) => row[0].label), ["Да", "Нет", "Отложить", "Решай сам"]);
+  assert.deepEqual(empty.map((row) => row[0].kind), ["quick", "quick", "quick", "quick"]);
+  assert.deepEqual(empty.map((row) => row[0].optionId), ["q1", "q2", "q3", "q4"]);
+
+  const noFreeText = renderRows({ options: [], allowFreeText: false }, { maxOptions: 8 });
+  assert.deepEqual(noFreeText, []);
+});
+
+test("renderRows: быстрые ответы настраиваются и выключаются", () => {
+  const custom = renderRows({
+    options: [],
+    allowFreeText: true,
+    quickReplies: [{ id: "q1", label: "Ок", text: "Хорошо" }],
+  }, { maxOptions: 8 });
+  assert.deepEqual(custom, [[{ label: "Ок", kind: "quick", optionId: "q1" }]]);
+
+  const disabled = renderRows({ options: [], allowFreeText: true, quickReplies: [] }, { maxOptions: 8 });
+  assert.deepEqual(disabled, [], "пустой набор — только текстовый ввод");
+
+  const noButtons = renderRows({ options: [], allowFreeText: true }, { maxOptions: 8, inlineButtons: false });
+  assert.deepEqual(noButtons, []);
+
+  const limited = renderRows({ options: [], allowFreeText: true }, { maxOptions: 2 });
+  assert.deepEqual(limited.map((row) => row[0].label), ["Да", "Нет"], "лимит рядов соблюдается");
 });
 
 test("renderRows: один вариант при maxOptions 2 — вариант и «Другой ответ…»", () => {
@@ -364,4 +388,13 @@ test("findOwnedTask на реальной доске 005–008 и в рабоч�
 
   // Reviewer/verifier не владельцы карточки — задачи не присваиваем.
   assert.equal(findOwnedTask(root, "session-reviewer"), null);
+});
+
+test("044: подсказка при быстрых кнопках говорит про альтернативный текст", async () => {
+  const { QUICK_REPLY_HINT, FREE_TEXT_HINT } = await import("../lib/present.js");
+  const withQuick = (await import("../lib/present.js")).renderBody({ body: "Продолжать?", options: [] }, {});
+  assert.match(withQuick, new RegExp(QUICK_REPLY_HINT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+  const disabled = (await import("../lib/present.js")).renderBody({ body: "Продолжать?", options: [], quickReplies: [] }, {});
+  assert.match(disabled, new RegExp(FREE_TEXT_HINT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });

@@ -508,8 +508,7 @@ export function createTelegramTransport(options = {}) {
 
       // Кнопки — тоже из представления: варианты по одной в ряд, «Показать ещё»
       // при переполнении, «Другой ответ…» последним.
-      const hasOptions = Array.isArray(question?.options) && question.options.length > 0;
-      const buttons = caps.inlineButtons && hasOptions
+      const buttons = caps.inlineButtons
         ? renderRows(question, caps)
           .map((row) => row
             .map((button) => {
