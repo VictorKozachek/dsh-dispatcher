@@ -36,7 +36,7 @@ import {
   splitText,
   throttle,
 } from "./base.js";
-import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderRows } from "../present.js";
+import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderHtml, renderRows } from "../present.js";
 
 /** Базовый адрес MAX Bot API: документация просит именно platform-api2. */
 export const MAX_API_BASE = "https://platform-api2.max.ru";
@@ -733,7 +733,7 @@ export function createMaxTransport(options = {}) {
       const targetChat = sendOptions?.chatId ?? chatId;
       const query = targetChat !== null ? { chat_id: targetChat } : { user_id: userId };
 
-      const text = clipEscaped(escapeHtml(renderBody(question, caps)), caps.maxText);
+      const text = clipEscaped(renderHtml(renderBody(question, caps)), caps.maxText);
       const keyboard = buildKeyboard(question);
       const attachments = keyboard.payload.buttons.length === 0 ? undefined : [keyboard];
 

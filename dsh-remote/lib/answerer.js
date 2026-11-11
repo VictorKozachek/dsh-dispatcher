@@ -475,10 +475,15 @@ export function createAnswerer({
     const workspace = workspaceOf(sessionId);
     // Маркировка (006): роль и задача, которую ведёт эта сессия. Ошибки чтения
     // контекста не должны мешать вопросу — тогда просто без задачи.
-    let questionContext = { role: null, taskId: null };
+    let questionContext = { role: null, taskId: null, branch: null, worktree: null };
     try {
       const resolved = resolveContext({ sessionId, ctx: context, log });
-      questionContext = { role: resolved.role ?? null, taskId: resolved.taskId ?? null };
+      questionContext = {
+        role: resolved.role ?? null,
+        taskId: resolved.taskId ?? null,
+        branch: resolved.branch ?? null,
+        worktree: resolved.worktree ?? null,
+      };
     } catch (error) {
       log(`вопрос: контекст сессии не прочитан (${error?.message ?? error})`);
     }
@@ -521,6 +526,8 @@ export function createAnswerer({
         workspace,
         role: questionContext.role,
         taskId: questionContext.taskId,
+        branch: questionContext.branch,
+        worktree: questionContext.worktree,
         quickReplies,
         lang: questionLang,
         chatId: primaryChannel.chatId,
@@ -528,8 +535,7 @@ export function createAnswerer({
         now: now(),
         log,
       });
-      for (const created of createdList) {
-        known.set(created.shortId, created);
+      for (const created of createdList) {        known.set(created.shortId, created);
         if (known.size > 200) known.delete(known.keys().next().value);
         questions.push(created);
         try {
