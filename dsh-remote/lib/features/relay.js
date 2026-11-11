@@ -132,10 +132,20 @@ export const relayFeature = {
     }
 
     const multiChannel = Array.isArray(config?.transports) && config.transports.length > 1;
+    // 038: если активная привязка — другой транспорт, relay не становится фасадом.
+    const boundTransport = (() => {
+      try {
+        const binding = deps.get("remoteStore")?.read?.().bindings ?? null;
+        return typeof binding?.transport === "string" && binding.transport !== "" ? binding.transport : null;
+      } catch {
+        return null;
+      }
+    })();
+    const isActiveTransport = boundTransport === null || boundTransport === "relay";
     try {
       const facade = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
-      if (multiChannel) {
-        deps.logger.info("фича relay: мультиканальный режим — транспорт только в реестре");
+      if (multiChannel || !isActiveTransport) {
+        deps.logger.info(`фича relay: канал только в реестре (привязка: ${boundTransport ?? "нет"})`);
       } else if (facade !== null && facade.__isTransportFacade === true) {
         facade.set(transport);
       } else {

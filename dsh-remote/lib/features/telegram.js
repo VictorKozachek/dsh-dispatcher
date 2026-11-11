@@ -103,11 +103,22 @@ export const telegramFeature = {
     // previous — второй канал перестал бы принимать ответы. Поэтому в
     // мультиканальном режиме каналы живут сами и регистрируются только в реестре.
     const multiChannel = Array.isArray(config?.transports) && config.transports.length > 1;
+    // 038: если активная привязка — другой транспорт, этот канал не должен
+    // становиться фасадом (иначе он перетирает активный канал при старте).
+    const boundTransport = (() => {
+      try {
+        const binding = deps.get("remoteStore")?.read?.().bindings ?? null;
+        return typeof binding?.transport === "string" && binding.transport !== "" ? binding.transport : null;
+      } catch {
+        return null;
+      }
+    })();
+    const isActiveTransport = boundTransport === null || boundTransport === "telegram";
     try {
       const facade = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
-      if (multiChannel) {
+      if (multiChannel || !isActiveTransport) {
         ctx?.get?.("remoteTransports")?.set?.("telegram", transport);
-        deps.logger.info("фича telegram: мультиканальный режим — транспорт только в реестре");
+        deps.logger.info(`фича telegram: канал только в реестре (привязка: ${boundTransport ?? "нет"})`);
       } else if (facade !== null && facade.__isTransportFacade === true) {
         // Фича commands (005) уже держит фасад: кладём транспорт внутрь, чтобы
         // connect/disconnect могли его заменить и остановить.

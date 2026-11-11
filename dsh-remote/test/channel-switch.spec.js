@@ -336,13 +336,37 @@ test("имена и ссылки транспортов: MAX — свой сек
 // Ответчик: один канал по умолчанию, веер — только явным конфигом
 // ---------------------------------------------------------------------------
 
-function answererStand(config) {
+function answererStand({ config = {}, binding = null, facadeCurrent = null } = {}) {
   const telegram = createFakeTransport({ now: () => 0 });
-  const max = createFakeTransport({ now: () => 0 });
+  const relay = createFakeTransport({ now: () => 0 });
+  const facade = {
+    __isTransportFacade: true,
+    current: facadeCurrent === "relay" ? relay : facadeCurrent === "telegram" ? telegram : null,
+    async stop() {
+      this.current = null;
+    },
+    sendQuestion(question, options) {
+      if (this.current === null) throw new Error("канал не поднят");
+      return this.current.sendQuestion(question, options);
+    },
+    closeQuestion(question, summary) {
+      return this.current?.closeQuestion?.(question, summary);
+    },
+    onAnswer(handler) {
+      return this.current?.onAnswer?.(handler) ?? (() => {});
+    },
+    healthCheck: () => ({ ok: true }),
+  };
   const services = new Map([
-    ["remoteTransport", telegram],
-    ["remoteTransports", new Map([["telegram", telegram], ["max", max]])],
-    ["remoteStore", { read: () => ({ enabled: { global: true }, hybrid: { enabled: false } }) }],
+    ["remoteTransport", facade],
+    ["remoteTransports", new Map([["telegram", telegram], ["relay", relay]])],
+    ["remoteStore", {
+      read: () => ({
+        enabled: { global: true },
+        hybrid: { enabled: false },
+        bindings: binding === null ? null : { transport: binding },
+      }),
+    }],
   ]);
   const hooks = new Map();
   const deps = {
@@ -359,7 +383,7 @@ function answererStand(config) {
     effect: (execute) => execute(),
   };
   answererFeature.apply(ctx, config, deps);
-  return { telegram, max, handler: hooks.get("user-questions/request")?.handler };
+  return { telegram, relay, facade, handler: hooks.get("user-questions/request")?.handler };
 }
 
 const questionRequest = {
@@ -367,27 +391,51 @@ const questionRequest = {
   questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }, { label: "Нет" }] }],
 };
 
-test("ответчик: без config.transports вопрос уходит ровно в один канал (активный)", async () => {
-  const { telegram, max, handler } = answererStand({});
+/** Задать вопрос и дождаться отправки. */
+async function publish(handler) {
   const pending = handler(questionRequest, async () => "gui");
   pending.catch(() => {});
   await new Promise((resolve) => setImmediate(resolve));
+  // Не `return pending`: async-функция «усыновит» промис, и await publish()
+  // будет ждать ответа человека, а не отправки вопроса.
+  return { pending };
+}
 
-  assert.equal(telegram.messages.length, 1, "активный канал получил вопрос");
-  assert.equal(max.messages.length, 0, "второй поднятый транспорт вопрос не получает");
-  telegram.answer(telegram.messages[0].shortId, "o1");
-  const result = await pending;
-  assert.equal(result.answers.length, 1, "ответ пришёл из активного канала");
+test("ответчик: привязка telegram — публикует в telegram, даже если фасад указывает на relay", async () => {
+  // Репро блокера: relay смонтирован позже и перетёр фасад, но активна привязка telegram.
+  const stand = answererStand({ binding: "telegram", facadeCurrent: "relay" });
+  const { pending } = await publish(stand.handler);
+
+  assert.equal(stand.telegram.messages.length, 1, "вопрос ушёл в активный канал telegram");
+  assert.equal(stand.relay.messages.length, 0, "relay вопрос не получает");
+  stand.telegram.answer(stand.telegram.messages[0].shortId, "o1");
+  assert.equal((await pending).answers.length, 1, "ответ из активного канала доставлен");
+});
+
+test("ответчик: привязка relay — публикует в relay, даже если фасад указывает на telegram", async () => {
+  const stand = answererStand({ binding: "relay", facadeCurrent: "telegram" });
+  const { pending } = await publish(stand.handler);
+
+  assert.equal(stand.relay.messages.length, 1, "вопрос ушёл в активный relay");
+  assert.equal(stand.telegram.messages.length, 0);
+  stand.relay.answer(stand.relay.messages[0].shortId, "o1");
+  assert.equal((await pending).answers.length, 1);
+});
+
+test("ответчик: без привязки работает канал из фасада (config-путь)", async () => {
+  const stand = answererStand({ binding: null, facadeCurrent: "relay" });
+  await publish(stand.handler);
+
+  assert.equal(stand.relay.messages.length, 1, "config-канал из фасада получил вопрос");
+  assert.equal(stand.telegram.messages.length, 0);
 });
 
 test("ответчик: веер включается только явным config.transports с двумя каналами", async () => {
-  const { telegram, max, handler } = answererStand({ transports: ["telegram", "max"] });
-  const pending = handler(questionRequest, async () => "gui");
-  pending.catch(() => {});
-  await new Promise((resolve) => setImmediate(resolve));
+  const stand = answererStand({ binding: "telegram", facadeCurrent: "relay", config: { transports: ["telegram", "relay"] } });
+  const { pending } = await publish(stand.handler);
 
-  assert.equal(telegram.messages.length, 1, "первый канал явного веера получил вопрос");
-  assert.equal(max.messages.length, 1, "второй канал явного веера тоже");
-  telegram.answer(telegram.messages[0].shortId, "o1");
+  assert.equal(stand.telegram.messages.length, 1, "первый канал явного веера получил вопрос");
+  assert.equal(stand.relay.messages.length, 1, "второй канал явного веера тоже");
+  stand.telegram.answer(stand.telegram.messages[0].shortId, "o1");
   await pending.catch(() => {});
 });

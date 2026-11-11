@@ -58,11 +58,33 @@ export const answererFeature = {
       if (transports.length <= 1) transports = null;
     }
 
+    // 038: в обычном режиме публикуем в АКТИВНЫЙ канал из `state.bindings`, а не
+    // в «последний поднятый» фасад: иначе relay-конфиг, смонтированный позже
+    // telegram, перетирал бы фасад и вопросы уходили бы не туда.
+    const bindingTransportId = (() => {
+      try {
+        const binding = store?.read?.().bindings ?? null;
+        return typeof binding?.transport === "string" && binding.transport !== "" ? binding.transport : null;
+      } catch {
+        return null;
+      }
+    })();
+    const boundTransport = bindingTransportId !== null && transportRegistry !== null
+      ? transportRegistry.get(bindingTransportId) ?? null
+      : null;
+    const serviceTransport = deps.get(TRANSPORT_SERVICE);
+    const activeTransport = boundTransport ?? serviceTransport;
+    if (boundTransport !== null) {
+      deps.logger.debug(`answerer: активный канал из привязки — ${bindingTransportId}`);
+    } else if (bindingTransportId !== null) {
+      deps.logger.warn(`answerer: привязка ${bindingTransportId}, но канал не найден в реестре — работаю с фасадом`);
+    }
+
     // 012: у каждого канала — своя доставка reliability (повторы/backoff/give-up).
     const deliverFor = deps.get("remoteReliabilityDeliver");
     // Гибрид (013): ждём ответ в мессенджере `hybrid.waitMs`, потом отдаём в GUI.
     const answerer = createAnswerer({
-      transport: deps.get(TRANSPORT_SERVICE),
+      transport: activeTransport,
       deliverFor,
       // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
       channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
