@@ -142,9 +142,17 @@ export const relayFeature = {
       }
     })();
     const isActiveTransport = boundTransport === null || boundTransport === "relay";
+
+    if (!isActiveTransport && !multiChannel) {
+      // 038: активна привязка на другой транспорт — конфиг-канал не поднимаем,
+      // иначе после reload снова работали бы два поллера. Явный мультиканальный
+      // конфиг (`transports: [..2+]`) — исключение: это осознанный веер.
+      deps.logger.info(`фича relay: привязка ${boundTransport} — конфиг-канал не поднимаю`);
+      return;
+    }
     try {
       const facade = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
-      if (multiChannel || !isActiveTransport) {
+      if (multiChannel) {
         deps.logger.info(`фича relay: канал только в реестре (привязка: ${boundTransport ?? "нет"})`);
       } else if (facade !== null && facade.__isTransportFacade === true) {
         facade.set(transport);

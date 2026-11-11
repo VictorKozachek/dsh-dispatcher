@@ -681,13 +681,30 @@ export function createRemoteCommands({
         ? `токен не сохранён: источник ${RELAY_TOKEN_REF} только для чтения`
         : `токен взят из окружения (${RELAY_TOKEN_REF}) и не сохранён`;
 
+    // 038: поднимаем канал сразу, чтобы после переключения вопрос шёл в релей,
+    // а не в прежний (уже остановленный) транспорт.
+    let channelNote = "канал поднимется при следующей загрузке профиля (или после /remote on)";
+    if (typeof ensureTransport === "function") {
+      try {
+        const started = await ensureTransport();
+        if (started === null) {
+          channelNote = "привязка сохранена, но канал не поднят: проверьте /remote status";
+        } else {
+          channelNote = "канал поднят: вопросы уходят в релей";
+        }
+      } catch (error) {
+        log(`ensureTransport после привязки релея: ${humanError(error, token)}`);
+        channelNote = "канал не поднялся — проверьте /remote status";
+      }
+    }
+
     return success([
       ...(retired.switchNote === null ? [] : [retired.switchNote]),
       ...(retired.secretNote === null ? [] : [retired.secretNote]),
       `релей привязан: ${url} (${health.detail})`,
       tokenNote,
       scope.note,
-      "канал поднимется при следующей загрузке профиля (или после /remote on)",
+      channelNote,
     ].join("\n"));
   }
 

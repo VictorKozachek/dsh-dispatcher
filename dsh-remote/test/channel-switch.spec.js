@@ -369,14 +369,16 @@ function answererStand({ config = {}, binding = null, facadeCurrent = null } = {
     },
     healthCheck: () => ({ ok: true }),
   };
+  let currentBinding = binding;
+  const registry = new Map([["telegram", telegram], ["relay", relay]]);
   const services = new Map([
     ["remoteTransport", facade],
-    ["remoteTransports", new Map([["telegram", telegram], ["relay", relay]])],
+    ["remoteTransports", registry],
     ["remoteStore", {
       read: () => ({
         enabled: { global: true },
         hybrid: { enabled: false },
-        bindings: binding === null ? null : { transport: binding },
+        bindings: currentBinding === null ? null : { transport: currentBinding },
       }),
     }],
   ]);
@@ -395,7 +397,18 @@ function answererStand({ config = {}, binding = null, facadeCurrent = null } = {
     effect: (execute) => execute(),
   };
   answererFeature.apply(ctx, config, deps);
-  return { telegram, relay, facade, handler: hooks.get("user-questions/request")?.handler };
+  return {
+    telegram,
+    relay,
+    facade,
+    registry,
+    handler: hooks.get("user-questions/request")?.handler,
+    /** Как `/remote connect`: меняем привязку и фасад (ensure поднял новый канал). */
+    switchTo(transportId) {
+      currentBinding = transportId;
+      facade.current = transportId === "relay" ? relay : telegram;
+    },
+  };
 }
 
 const questionRequest = {
@@ -450,4 +463,81 @@ test("ответчик: веер включается только явным co
   assert.equal(stand.relay.messages.length, 1, "второй канал явного веера тоже");
   stand.telegram.answer(stand.telegram.messages[0].shortId, "o1");
   await pending.catch(() => {});
+});
+
+test("live-переключение: после connect вопрос идёт в новый активный канал", async () => {
+  const stand = answererStand({ binding: "telegram", facadeCurrent: "telegram" });
+
+  const first = await publish(stand.handler);
+  assert.equal(stand.telegram.messages.length, 1, "стартовый канал — telegram");
+  stand.telegram.answer(stand.telegram.messages[0].shortId, "o1");
+  assert.equal((await first.pending).answers.length, 1, "ответ из стартового канала доставлен");
+
+  // `/remote connect relay`: retireActiveChannel меняет привязку, ensure поднимает relay
+  // и кладёт его в фасад; ответчик уже применён и не должен остаться на telegram.
+  stand.switchTo("relay");
+  const second = await publish(stand.handler);
+
+  assert.equal(stand.telegram.messages.length, 1, "в отключённый telegram новых вопросов нет");
+  assert.equal(stand.relay.messages.length, 1, "вопрос ушёл в новый активный relay");
+  stand.relay.answer(stand.relay.messages[0].shortId, "o1");
+  assert.equal((await second.pending).answers.length, 1, "ответ из relay доставлен ровно один раз");
+});
+
+test("live-переключение и обратно: повторный connect снова меняет канал", async () => {
+  const stand = answererStand({ binding: "telegram", facadeCurrent: "telegram" });
+  await publish(stand.handler);
+
+  stand.switchTo("relay");
+  const relayQuestion = await publish(stand.handler);
+  assert.equal(stand.relay.messages.length, 1);
+  stand.relay.answer(stand.relay.messages[0].shortId, "o1");
+  await relayQuestion.pending;
+
+  stand.switchTo("telegram");
+  await publish(stand.handler);
+  assert.equal(stand.telegram.messages.length, 2, "после обратного connect канал снова telegram");
+  assert.equal(stand.relay.messages.length, 1, "в relay новых вопросов нет");
+});
+
+test("неактивный config-канал не поднимается и не становится фасадом", async () => {
+  const { telegramFeature } = await import("../lib/features/telegram.js");
+  const facade = {
+    __isTransportFacade: true,
+    current: null,
+    set(transport) {
+      this.current = transport;
+    },
+    async stop() {
+      this.current = null;
+    },
+  };
+  const registry = new Map();
+  const credentials = {
+    resolve: async () => ({ value: TOKEN, source: "file" }),
+    describe: async () => ({ present: true, configured: true, source: "file", writable: true }),
+    set: async () => true,
+    unset: async () => true,
+  };
+  const services = new Map([
+    ["remoteStore", { read: () => ({ bindings: { transport: "relay", url: "https://relay.example" } }) }],
+    ["remoteTransport", facade],
+    ["remoteTransports", registry],
+    ["credentials", credentials],
+  ]);
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => services.get(name) ?? null,
+    onDispose: () => {},
+  };
+  const ctx = {
+    get: (name) => services.get(name) ?? null,
+    provide: (name, value) => services.set(name, value),
+    on: () => () => {},
+  };
+
+  await telegramFeature.apply(ctx, { telegram: { tokenRef: TELEGRAM_TOKEN_REF } }, deps);
+
+  assert.equal(facade.current, null, "config-канал не стал активным");
+  assert.equal(registry.has("telegram"), false, "неактивный канал не зарегистрирован");
 });

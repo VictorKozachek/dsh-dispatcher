@@ -114,9 +114,17 @@ export const telegramFeature = {
       }
     })();
     const isActiveTransport = boundTransport === null || boundTransport === "telegram";
+
+    if (!isActiveTransport && !multiChannel) {
+      // 038: активна привязка на другой транспорт — конфиг-канал не поднимаем,
+      // иначе после reload снова работали бы два поллера. Явный мультиканальный
+      // конфиг (`transports: [..2+]`) — исключение: это осознанный веер.
+      deps.logger.info(`фича telegram: привязка ${boundTransport} — конфиг-канал не поднимаю`);
+      return;
+    }
     try {
       const facade = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
-      if (multiChannel || !isActiveTransport) {
+      if (multiChannel) {
         ctx?.get?.("remoteTransports")?.set?.("telegram", transport);
         deps.logger.info(`фича telegram: канал только в реестре (привязка: ${boundTransport ?? "нет"})`);
       } else if (facade !== null && facade.__isTransportFacade === true) {

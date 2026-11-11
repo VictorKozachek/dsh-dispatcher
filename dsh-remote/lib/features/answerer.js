@@ -19,6 +19,97 @@ export const TRANSPORT_SERVICE = "remoteTransport";
 /** Имя сервиса состояния: его объявляет фича commands (005). */
 export const STATE_SERVICE = "remoteStore";
 
+/**
+ * Динамический транспорт ответчика (038): активный канал выбирается НА КАЖДОЙ
+ * отправке из `state.bindings.transport` + реестра, а не кэшируется в apply.
+ * Иначе после `/remote connect` ответчик оставался бы на прежнем канале.
+ *
+ * Подписки на ответы собираются со всех известных каналов (фасад + реестр):
+ * фасад сам переподписывает подписчиков при `set()`, а каналы, появившиеся позже
+ * (relay после live-connect), подхватываются в `sync()` перед отправкой.
+ */
+function createBindingTransport({ facade, registry, store, log = () => {} }) {
+  const subscribers = new Set();
+  const subscriptions = new Map();
+  const bindingId = () => {
+    try {
+      const binding = store?.read?.().bindings ?? null;
+      return typeof binding?.transport === "string" && binding.transport !== "" ? binding.transport : null;
+    } catch {
+      return null;
+    }
+  };
+  const active = () => {
+    const id = bindingId();
+    if (id !== null) {
+      const bound = registry?.get?.(id) ?? null;
+      if (bound !== null) return bound;
+    }
+    return facade ?? null;
+  };
+  const sync = () => {
+    const candidates = new Set([facade]);
+    try {
+      for (const channel of registry?.values?.() ?? []) candidates.add(channel);
+    } catch {
+      /* реестр недоступен */
+    }
+    for (const channel of candidates) {
+      if (channel === null || channel === undefined || subscriptions.has(channel)) continue;
+      if (typeof channel.onAnswer !== "function") continue;
+      let off = null;
+      try {
+        off = channel.onAnswer((event) => {
+          for (const handler of [...subscribers]) handler(event);
+        });
+      } catch (error) {
+        log(`answerer: подписка на канал ${channel.id ?? "?"} не удалась (${error?.message ?? error})`);
+      }
+      subscriptions.set(channel, off);
+    }
+  };
+
+  return {
+    get id() {
+      return active()?.id ?? "binding";
+    },
+    get caps() {
+      return active()?.caps ?? facade?.caps ?? {};
+    },
+    async start() {
+      sync();
+      return active()?.start?.() ?? false;
+    },
+    async stop() {
+      return active()?.stop?.();
+    },
+    sendQuestion(question, options) {
+      sync();
+      const channel = active();
+      if (channel === null || typeof channel.sendQuestion !== "function") {
+        throw new Error("канал не поднят: /remote connect");
+      }
+      return channel.sendQuestion(question, options);
+    },
+    closeQuestion(question, summary) {
+      return active()?.closeQuestion?.(question, summary);
+    },
+    editQuestion(question, text) {
+      return active()?.editQuestion?.(question, text);
+    },
+    healthCheck() {
+      return active()?.healthCheck?.() ?? { ok: false, detail: "канал не поднят" };
+    },
+    onAnswer(handler) {
+      subscribers.add(handler);
+      sync();
+      return () => {
+        subscribers.delete(handler);
+      };
+    },
+  };
+}
+
 export const answererFeature = {
   name: "answerer",
   needs: [TRANSPORT_SERVICE],
@@ -69,15 +160,19 @@ export const answererFeature = {
         return null;
       }
     })();
-    const boundTransport = bindingTransportId !== null && transportRegistry !== null
-      ? transportRegistry.get(bindingTransportId) ?? null
-      : null;
     const serviceTransport = deps.get(TRANSPORT_SERVICE);
-    const activeTransport = boundTransport ?? serviceTransport;
-    if (boundTransport !== null) {
-      deps.logger.debug(`answerer: активный канал из привязки — ${bindingTransportId}`);
-    } else if (bindingTransportId !== null) {
-      deps.logger.warn(`answerer: привязка ${bindingTransportId}, но канал не найден в реестре — работаю с фасадом`);
+    // В обычном режиме — динамический транспорт по привязке: `/remote connect`
+    // может сменить канал уже после apply, и ответчик обязан это увидеть.
+    const activeTransport = transports === null
+      ? createBindingTransport({
+        facade: serviceTransport,
+        registry: transportRegistry,
+        store,
+        log: (message) => deps.logger.debug(message),
+      })
+      : serviceTransport;
+    if (bindingTransportId !== null) {
+      deps.logger.debug(`answerer: активный канал из привязки — ${bindingTransportId} (динамически)`);
     }
 
     // 012: у каждого канала — своя доставка reliability (повторы/backoff/give-up).
