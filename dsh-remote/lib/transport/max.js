@@ -1071,10 +1071,19 @@ export async function maxPollForCode({
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   signal,
   log = () => {},
+  /** 051: рабочий журнал (log.jsonl). */
+  journal = null,
   /** 050: сюда складывается диагностика для текста ошибки (`polls/updates/types/host`). */
   stats = null,
   timeoutMs = 15_000,
 } = {}) {
+  const journalEvent = (event, fields) => {
+    try {
+      journal?.record?.(event, fields);
+    } catch {
+      /* журнал не должен ронять pairing */
+    }
+  };
   let marker = null;
   // 048: как только один из хостов ответил, дальше опрашиваем именно его —
   // иначе каждый long polling начинался бы с падения на TLS у api2.
@@ -1117,6 +1126,10 @@ export async function maxPollForCode({
       // 401/403 — токен/активация бота: повторять бессмысленно, пусть человек чинит.
       if (status === 401 || status === 403) throw error;
       attempt += 1;
+      journalEvent("pairing.error", {
+        transport: "max",
+        detail: { status, code: error?.code ?? "", retryAfterMs: error?.retryAfterMs ?? null },
+      });
       counts.lastError = { status, code: error?.code ?? null, retryAfterMs: error?.retryAfterMs ?? null, message: describeError(error, token) };
       let pause = waitMs;
       if (status === 429) {
@@ -1144,7 +1157,17 @@ export async function maxPollForCode({
     const found = findPairingUpdate(updates, code);
     if (found.codeSeen) counts.codeSeen += 1;
     log(`max pairing: poll host=${counts.host ?? workingBase ?? "?"} updates=${updates.length} types=${types} code=${found.codeSeen ? "yes" : "no"}`);
-    if (found.match !== null) return { ...found.match, marker, stats: counts };
+    journalEvent("pairing.poll", {
+      transport: "max",
+      detail: { host: counts.host ?? workingBase ?? null, updates: updates.length, types: [...counts.types], code: found.codeSeen },
+    });
+    if (found.match !== null) {
+      journalEvent("pairing.code", {
+        transport: "max",
+        detail: { host: counts.host ?? workingBase ?? null, updates: updates.length, chatId: found.match.chatId, userId: found.match.userId },
+      });
+      return { ...found.match, marker, stats: counts };
+    }
     // Long polling уже ждал ответ `pollTimeoutSec`; короткий опрос (0) — пауза 1 с.
     await sleep(pollTimeoutSec > 0 ? 200 : 1000);
   }

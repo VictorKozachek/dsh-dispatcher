@@ -131,7 +131,7 @@ test("каркас: имя плагина, пустой inject и фичи с к
   // подписываются после транспорта, panel (009) — рядом с ними.
   assert.deepEqual(
     features.map((feature) => feature.name),
-    ["metrics", "commands", "max", "telegram", "reliability", "answerer", "approvals", "relay", "notify", "panel"],
+    ["journal", "metrics", "commands", "max", "telegram", "reliability", "answerer", "approvals", "relay", "notify", "panel"],
   );
 });
 
