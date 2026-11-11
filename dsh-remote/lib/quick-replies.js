@@ -10,12 +10,18 @@
  */
 
 /** Четыре решения по умолчанию. */
-export const DEFAULT_QUICK_REPLIES = Object.freeze([
-  Object.freeze({ label: "Да", text: "Да" }),
-  Object.freeze({ label: "Нет", text: "Нет" }),
-  Object.freeze({ label: "Отложить", text: "Отложить, вернёмся позже" }),
-  Object.freeze({ label: "Решай сам", text: "Реши сам, я делегирую" }),
-]);
+import { DEFAULT_LANG, normalizeLang, t } from "./i18n.js";
+
+/** Четыре решения по умолчанию (подписи — из словаря языка). */
+export function defaultQuickReplies(lang = DEFAULT_LANG) {
+  const code = normalizeLang(lang) ?? DEFAULT_LANG;
+  return [
+    { id: "q1", label: t("present.quickYes", {}, code), text: t("present.quickYes", {}, code) },
+    { id: "q2", label: t("present.quickNo", {}, code), text: t("present.quickNo", {}, code) },
+    { id: "q3", label: t("present.quickLater", {}, code), text: t("present.quickLaterText", {}, code) },
+    { id: "q4", label: t("present.quickDelegate", {}, code), text: t("present.quickDelegateText", {}, code) },
+  ];
+}
 
 /** Предел числа кнопок: больше всё равно не влезет в один экран. */
 const MAX_QUICK_REPLIES = 8;
@@ -30,13 +36,9 @@ const trim = (value) => (typeof value === "string" ? value.trim() : "");
  * - не-массив/битые записи — безопасный дефолт (не теряем возможность ответить);
  * - id стабильны (`q1…`) и не пересекаются с вариантами (`o1…`).
  */
-export function normalizeQuickReplies(value) {
-  if (value === undefined || value === null) {
-    return DEFAULT_QUICK_REPLIES.map((item, index) => ({ id: `q${index + 1}`, label: item.label, text: item.text }));
-  }
-  if (!Array.isArray(value)) {
-    return DEFAULT_QUICK_REPLIES.map((item, index) => ({ id: `q${index + 1}`, label: item.label, text: item.text }));
-  }
+export function normalizeQuickReplies(value, lang = DEFAULT_LANG) {
+  if (value === undefined || value === null) return defaultQuickReplies(lang);
+  if (!Array.isArray(value)) return defaultQuickReplies(lang);
   if (value.length === 0) return [];
 
   const normalized = [];
@@ -49,8 +51,6 @@ export function normalizeQuickReplies(value) {
   }
   // Набор задан, но все записи битые: не оставляем человека без кнопок и без
   // подсказки — откатываемся к дефолту.
-  if (normalized.length === 0) {
-    return DEFAULT_QUICK_REPLIES.map((item, index) => ({ id: `q${index + 1}`, label: item.label, text: item.text }));
-  }
+  if (normalized.length === 0) return defaultQuickReplies(lang);
   return normalized;
 }

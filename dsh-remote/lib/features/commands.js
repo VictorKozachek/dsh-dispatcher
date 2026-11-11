@@ -411,6 +411,7 @@ export const commandsFeature = {
       log,
       ensureTransport: ensure,
       currentChannel,
+      lang: config?.lang ?? null,
       // 039: long polling для pairing MAX; можно переопределить в config.max.
       ...(Number.isFinite(config?.max?.pollTimeoutSec) ? { maxPairingPollTimeoutSec: config.max.pollTimeoutSec } : {}),
       // 048: config.maxApiBase — явная база MAX (фолбэк тогда выключен).

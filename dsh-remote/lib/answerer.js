@@ -156,6 +156,8 @@ export function createAnswerer({
   metrics = null,
   /** 044: быстрые ответы для вопросов без вариантов. */
   quickReplies = undefined,
+  /** 046: язык сообщений (строка или функция, чтобы читать состояние на каждый вопрос). */
+  lang = null,
   /** 013: доставка позднего ответа; по умолчанию `sessionController.prompt`. */
   steer = null,
   /** 013: таймеры инжектируются, тесты не ждут реальные 20 секунд. */
@@ -499,6 +501,7 @@ export function createAnswerer({
 
     const questions = [];
     try {
+      const questionLang = typeof lang === "function" ? lang() : lang;
       for (const item of items) {
         const primaryChannel = channelFor(primary?.id ?? null);
         const questionChannel = { chatId: primaryChannel.chatId, threadId: primaryChannel.threadId };
@@ -508,6 +511,7 @@ export function createAnswerer({
           role: questionContext.role,
           taskId: questionContext.taskId,
           quickReplies,
+          lang: questionLang,
           chatId: questionChannel.chatId,
           threadId: questionChannel.threadId,
           now: now(),

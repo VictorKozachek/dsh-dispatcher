@@ -11,6 +11,7 @@
 
 import { createAnswerer } from "../answerer.js";
 import { resolveChannel } from "../store.js";
+import { resolveLanguage } from "../i18n.js";
 import { createRegistry } from "../domain/registry.js";
 
 /** Имя сервиса транспорта: его объявит задача 003 (`dsh-remote/lib/transport`). */
@@ -238,6 +239,7 @@ export const answererFeature = {
       hybrid: () => (store?.read?.().hybrid ?? { enabled: false }),
       registry,
       quickReplies: config?.quickReplies,
+      lang: () => resolveLanguage({ explicit: store?.read?.().lang ?? config?.lang ?? null }),
       reliability,
       metrics: deps.get("remoteMetrics") ?? null,
       deliver: reliability === null ? null : (argument) => reliability.deliver(argument),

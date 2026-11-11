@@ -12,12 +12,8 @@ import os from "node:os";
 import path from "node:path";
 
 import {
-  FREE_TEXT_LABEL,
   FREE_TEXT_OPTION,
   MORE_OPTION,
-  MORE_LABEL,
-  MULTISELECT_HINT,
-  TRUNCATION_MARKER,
   WORKSPACE_LIMIT,
   findOwnedTask,
   formatTime,
@@ -29,6 +25,7 @@ import {
   resolveContext,
   truncate,
 } from "../lib/present.js";
+import { t } from "../lib/i18n.js";
 
 const SESSION_ID = "session-aaa";
 const CWD = "/Users/victor/projects/dsh-dispatcher";
@@ -203,7 +200,7 @@ test("renderBody: подсказка multiSelect", () => {
   const body = renderBody({ body: "Что берём?", multiSelect: true, createdAt: 0 }, { maxText: 4096 });
 
   assert.match(body, /Что берём\?/);
-  assert.match(body, new RegExp(MULTISELECT_HINT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(body, new RegExp(t("present.multiselectHint").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("renderBody: усечение под caps.maxText с честным маркером", () => {
@@ -211,7 +208,7 @@ test("renderBody: усечение под caps.maxText с честным мар�
   const body = renderBody({ body: long, createdAt: 0 }, { maxText: 80 });
 
   assert.ok(body.length <= 80, `длина ${body.length} больше предела`);
-  assert.match(body, new RegExp(TRUNCATION_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(body, new RegExp(t("present.truncationMarker").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("renderBody: эмодзи на границе усечения не ломается", () => {
@@ -234,9 +231,9 @@ test("renderRows: вариант — одна кнопка в ряд, «Друг
     allowFreeText: true,
   }, { maxOptions: 8 });
 
-  assert.deepEqual(rows.map((row) => row.map((button) => button.label)), [["Да"], ["Нет"], [FREE_TEXT_LABEL]]);
+  assert.deepEqual(rows.map((row) => row.map((button) => button.label)), [["Да"], ["Нет"], [t("present.freeTextLabel")]]);
   assert.deepEqual(rows[0][0], { label: "Да", kind: "option", optionId: "o1" });
-  assert.deepEqual(rows.at(-1)[0], { label: FREE_TEXT_LABEL, kind: "free", optionId: FREE_TEXT_OPTION });
+  assert.deepEqual(rows.at(-1)[0], { label: t("present.freeTextLabel"), kind: "free", optionId: FREE_TEXT_OPTION });
   assert.equal(rows.at(-1)[0].kind, "free");
 });
 
@@ -249,8 +246,8 @@ test("renderRows: 12 вариантов при maxOptions 8 — «Показат
   assert.deepEqual(rows.map((row) => row[0].kind), [
     "option", "option", "option", "option", "option", "option", "more", "free",
   ]);
-  assert.equal(rows[6][0].label, MORE_LABEL);
-  assert.equal(rows.at(-1)[0].label, FREE_TEXT_LABEL);
+  assert.equal(rows[6][0].label, t("present.moreLabel"));
+  assert.equal(rows.at(-1)[0].label, t("present.freeTextLabel"));
 });
 
 test("renderRows: без свободного ответа и без вариантов", () => {
@@ -391,10 +388,10 @@ test("findOwnedTask на реальной доске 005–008 и в рабоч�
 });
 
 test("044: подсказка при быстрых кнопках говорит про альтернативный текст", async () => {
-  const { QUICK_REPLY_HINT, FREE_TEXT_HINT } = await import("../lib/present.js");
+  const { t: tr } = await import("../lib/i18n.js");
   const withQuick = (await import("../lib/present.js")).renderBody({ body: "Продолжать?", options: [] }, {});
-  assert.match(withQuick, new RegExp(QUICK_REPLY_HINT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(withQuick, new RegExp(tr("present.quickReplyHint").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
   const disabled = (await import("../lib/present.js")).renderBody({ body: "Продолжать?", options: [], quickReplies: [] }, {});
-  assert.match(disabled, new RegExp(FREE_TEXT_HINT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(disabled, new RegExp(tr("present.freeTextHint").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
