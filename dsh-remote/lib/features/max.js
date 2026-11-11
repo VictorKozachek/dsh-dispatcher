@@ -16,7 +16,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { createCredentialAccess } from "../store.js";
-import { createMaxTransport, describeError } from "../transport/max.js";
+import { createMaxTransport, describeError, maxApiBaseFromConfig } from "../transport/max.js";
 
 /** Имя сервиса транспорта в контексте плагина. */
 /** 015: чаты проектов из состояния — их тоже принимаем (allowlist). */
@@ -130,6 +130,8 @@ export const maxFeature = {
         allowedUserIds: Array.isArray(settings.allowedUserIds) ? settings.allowedUserIds : [],
         allowedChatIds: () => projectChatIds(deps),
         pollTimeoutSec: settings.pollTimeoutSec,
+        // 048: явная база MAX из конфига отключает TLS-фолбэк.
+        ...(maxApiBaseFromConfig(config) === null ? {} : { apiBase: maxApiBaseFromConfig(config) }),
         marker: savedMarker ?? settings.marker,
         persistMarker: (marker) => writeMarker(markerPath, marker, log),
         log: (message) => deps.logger.debug(message),
