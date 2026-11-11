@@ -251,6 +251,221 @@ export function describeStatus({ state = null, channelPresent = false, settings 
   };
 }
 
+/** Колонки доски, которые панель показывает в сводке (045). */
+export const BOARD_STATUSES = Object.freeze(["in-progress", "in-review", "testing", "ready", "blocked"]);
+
+/** Через сколько минут карточка считается залипшей у роли (045). */
+export const DEFAULT_STALE_MINUTES = 30;
+
+/** Статусы, в которых карточка «висит у роли» и может залипнуть. */
+const STALE_STATUSES = new Set(["in-progress", "in-review", "testing", "ready"]);
+
+/** Разобрать YAML-подобный фронт-маттер карточки (только простые `key: value`). */
+export function parseCardFrontMatter(text) {
+  const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(String(text ?? ""));
+  if (match === null) return {};
+  const result = {};
+  for (const line of match[1].split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    const entry = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(trimmed);
+    if (entry === null) continue;
+    let value = entry[2].trim();
+    if (value.length >= 2
+      && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+      value = value.slice(1, -1);
+    }
+    result[entry[1]] = value;
+  }
+  return result;
+}
+
+/** Метка времени из ISO/числа; null, если не разобрать. */
+function timeOf(value) {
+  if (Number.isFinite(value)) return value;
+  if (typeof value !== "string" || value.trim() === "") return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Числовое поле токенов; мусор — 0. */
+function numberOrZero(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  if (typeof value !== "string" || value.trim() === "") return 0;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * Прочитать карточки одного воркспейса: `.kanban/tasks/*.md`.
+ *
+ * Только чтение: панель ничего не двигает и не пишет (045). Нет каталога или
+ * файлы битые — это не ошибка, а `missing`/пропуск.
+ */
+export function readBoardCards(workspaceRoot, { logger = () => {} } = {}) {
+  const root = typeof workspaceRoot === "string" && workspaceRoot !== "" ? workspaceRoot : null;
+  if (root === null) return { missing: true, cards: [] };
+  const dir = path.join(root, ".kanban", "tasks");
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((name) => name.endsWith(".md") && !name.startsWith("."));
+  } catch (error) {
+    if (error?.code !== "ENOENT") logger(`панель: доска ${basenameOf(root)} не прочитана (${error?.message ?? error})`);
+    return { missing: true, cards: [] };
+  }
+  const cards = [];
+  for (const name of names) {
+    let text;
+    try {
+      text = fs.readFileSync(path.join(dir, name), "utf8");
+    } catch (error) {
+      logger(`панель: карточка ${name} не прочитана (${error?.message ?? error})`);
+      continue;
+    }
+    const front = parseCardFrontMatter(text);
+    const id = typeof front.id === "string" && front.id !== "" ? front.id : name.replace(/\.md$/, "");
+    const status = typeof front.status === "string" ? front.status : "";
+    const tokens = numberOrZero(front.tokens);
+    const tokensByRole = {};
+    for (const [key, value] of Object.entries(front)) {
+      if (!key.startsWith("tokens_")) continue;
+      const amount = numberOrZero(value);
+      if (amount > 0) tokensByRole[key.slice("tokens_".length)] = amount;
+    }
+    cards.push({
+      id,
+      title: typeof front.title === "string" ? sanitizeText(front.title) : "",
+      status,
+      role: typeof front.role === "string" ? front.role : "",
+      owner: typeof front.owner === "string" ? front.owner : "",
+      updated: timeOf(front.updated),
+      since: timeOf(front.since),
+      tokens,
+      tokensByRole,
+    });
+  }
+  return { missing: false, cards };
+}
+
+/**
+ * Сводка по одному воркспейсу: счётчики по колонкам, залипшие карточки и
+ * расход токенов. Пути наружу не отдаются — только basename воркспейса.
+ */
+export function boardSummary(workspaceRoot, { now = () => Date.now(), staleMinutes = DEFAULT_STALE_MINUTES, logger = () => {} } = {}) {
+  const { missing, cards } = readBoardCards(workspaceRoot, { logger });
+  const counts = Object.fromEntries(BOARD_STATUSES.map((status) => [status, 0]));
+  const stale = [];
+  const tasks = [];
+  let total = 0;
+  let today = 0;
+  let week = 0;
+  const current = now();
+  const todayStart = new Date(current);
+  todayStart.setHours(0, 0, 0, 0);
+  const weekStart = current - 7 * 24 * 60 * 60 * 1000;
+  for (const card of cards) {
+    if (Object.hasOwn(counts, card.status)) counts[card.status] += 1;
+    const tokens = card.tokens > 0
+      ? card.tokens
+      : Object.values(card.tokensByRole).reduce((sum, value) => sum + value, 0);
+    total += tokens;
+    if (card.updated !== null) {
+      if (card.updated >= todayStart.getTime()) today += tokens;
+      if (card.updated >= weekStart) week += tokens;
+    }
+    if (tokens > 0) {
+      tasks.push({
+        id: card.id,
+        title: card.title,
+        status: card.status,
+        role: card.role,
+        updated: card.updated,
+        tokens,
+        tokensByRole: card.tokensByRole,
+      });
+    }
+    if (!STALE_STATUSES.has(card.status)) continue;
+    const startedAt = card.since ?? card.updated;
+    if (startedAt === null) continue;
+    const ageMinutes = Math.floor(Math.max(0, current - startedAt) / 60000);
+    if (ageMinutes < staleMinutes) continue;
+    stale.push({
+      id: card.id,
+      title: card.title,
+      status: card.status,
+      role: card.role,
+      since: startedAt,
+      ageMinutes,
+    });
+  }
+  stale.sort((left, right) => right.ageMinutes - left.ageMinutes);
+  tasks.sort((left, right) => right.tokens - left.tokens);
+  return {
+    name: basenameOf(workspaceRoot),
+    missing,
+    counts,
+    stale,
+    spend: {
+      tasks,
+      total,
+      today,
+      week,
+    },
+  };
+}
+
+/**
+ * Доска и расход по нескольким воркспейсам. Сумма токенов — по фронт-маттеру
+ * карточек (`tokens`, `tokens_<роль>`); «сегодня»/«неделя» — по `updated`
+ * карточки, без новых файлов и без обращения к метрикам.
+ */
+export function collectBoard({ workspaces = [], now = () => Date.now(), staleMinutes = DEFAULT_STALE_MINUTES, logger = () => {} } = {}) {
+  const roots = [...new Set((Array.isArray(workspaces) ? workspaces : [])
+    .filter((root) => typeof root === "string" && root.trim() !== ""))];
+  const summaries = roots.map((root) => boardSummary(root, { now, staleMinutes, logger }));
+  const spend = { tasks: [], total: 0, today: 0, week: 0 };
+  for (const summary of summaries) {
+    for (const task of summary.spend.tasks) {
+      spend.tasks.push({ ...task, workspace: summary.name });
+    }
+    spend.total += summary.spend.total;
+    spend.today += summary.spend.today;
+    spend.week += summary.spend.week;
+  }
+  spend.tasks.sort((left, right) => right.tokens - left.tokens);
+  return {
+    board: {
+      staleMinutes,
+      available: summaries.some((summary) => !summary.missing),
+      workspaces: summaries.map((summary) => ({
+        name: summary.name,
+        missing: summary.missing,
+        counts: summary.counts,
+        stale: summary.stale,
+      })),
+    },
+    spend,
+  };
+}
+
+/** Воркспейсы для доски: явные, из настроек, из состояния; при желании — cwd. */
+function boardRoots({ workspaces, settings, state, includeCwd }) {
+  if (Array.isArray(workspaces)) {
+    return workspaces.filter((root) => typeof root === "string" && root.trim() !== "");
+  }
+  for (const candidate of [settings?.boards, settings?.workspaces]) {
+    if (Array.isArray(candidate)) {
+      const roots = candidate.filter((root) => typeof root === "string" && root.trim() !== "");
+      if (roots.length > 0) return roots;
+    }
+  }
+  const enabled = state?.enabled !== null && typeof state?.enabled === "object" ? state.enabled : null;
+  const map = enabled?.workspaces !== null && typeof enabled?.workspaces === "object" ? enabled.workspaces : null;
+  const fromState = map === null ? [] : Object.keys(map).filter((root) => root.trim() !== "");
+  if (fromState.length > 0) return fromState;
+  return includeCwd === true ? [process.cwd()] : [];
+}
+
 /**
  * Снимок для панели: всё, что нужно одному обновлению.
  *
@@ -266,11 +481,21 @@ export function panelSnapshot({
   settings = {},
   logger = () => {},
   limit = JOURNAL_TAIL,
+  workspaces = undefined,
+  staleMinutes = DEFAULT_STALE_MINUTES,
+  includeCwd = false,
+  metrics = null,
 } = {}) {
   const { state, unreadable } = readState(stateFile, logger);
   const normalized = normalizeState(state);
   const questions = sortQuestionsByDeadline(normalized.questions, ttlMs);
   const journal = readJournalTail(logFile, { limit, logger });
+  const boardData = collectBoard({
+    workspaces: boardRoots({ workspaces, settings, state, includeCwd }),
+    now,
+    staleMinutes,
+    logger,
+  });
 
   return {
     ok: true,
@@ -283,6 +508,13 @@ export function panelSnapshot({
     journal: {
       lines: journal.lines,
       unreadable: journal.unreadable,
+    },
+    board: boardData.board,
+    spend: {
+      ...boardData.spend,
+      // 031: числовые метрики рантайма (вопросы/доставки/латентность). Токенов
+      // в них нет — расход по задачам считается по фронт-маттеру карточек.
+      ...(metrics !== null && typeof metrics === "object" ? { metrics } : {}),
     },
   };
 }
