@@ -499,3 +499,28 @@ test("050: connect MAX: 5xx при опросе — «временно недо�
   assert.doesNotMatch(result.text, /fetch failed/);
   assert.equal(stand.store.read().bindings, null);
 });
+
+test("049: connect MAX на EN: вопросы и результат без кириллицы", async (t) => {
+  const api = maxFetch({ updates: pairingUpdates });
+  const stand = harness(t, {
+    answers: {
+      "remote-connect-transport": { selected: ["MAX"] },
+      "remote-connect-max-token": { custom: TOKEN },
+      "remote-connect-max-send-code": { selected: ["Sent"] },
+      "remote-connect-scope": { selected: ["This project only"] },
+    },
+    fetchImpl: api.fetch,
+  });
+  stand.store.setLang("en");
+
+  const result = await stand.remote.handler(invoke("connect"));
+
+  assert.equal(result.kind, "success", result.text);
+  assert.doesNotMatch(result.text, /[А-Яа-яЁё]/, result.text);
+  assert.match(result.text, /MAX bot .* bound/);
+  assert.equal(stand.store.read().bindings.transport, "max");
+  assert.equal(stand.store.read().bindings.chatId, CHAT_ID);
+  for (const question of stand.asked) {
+    assert.doesNotMatch(question.question ?? "", /[А-Яа-яЁё]/, `вопрос: ${question.question}`);
+  }
+});

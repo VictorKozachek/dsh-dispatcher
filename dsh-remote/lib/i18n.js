@@ -16,8 +16,18 @@ export const LANGS = Object.freeze(["ru", "en"]);
 /** Язык по умолчанию. */
 export const DEFAULT_LANG = "ru";
 
-/** Словари. Ключи обязаны совпадать (проверяется тестом). */
-export const dictionaries = Object.freeze({
+import { COMMAND_MESSAGES_EN, COMMAND_MESSAGES_RU } from "./i18n-commands.js";
+import {
+  DOCTOR_MESSAGES_EN,
+  DOCTOR_MESSAGES_RU,
+  METRICS_MESSAGES_EN,
+  METRICS_MESSAGES_RU,
+  POLICY_MESSAGES_EN,
+  POLICY_MESSAGES_RU,
+} from "./i18n-modules.js";
+
+/** Базовые словари (сообщения, панель, help/status). */
+const dictionariesBase = Object.freeze({
   ru: Object.freeze({
     "present.freeTextLabel": "Другой ответ…",
     "present.freeTextHint": "↩︎ Ответьте текстом на это сообщение.",
@@ -131,6 +141,24 @@ export const dictionaries = Object.freeze({
     "commands.status.mode": "mode: {scope}",
     "commands.status.effective": "effective: {state}",
     "commands.status.approvals": "approvals: policy not loaded — remote approvals only in GUI",
+  }),
+});
+
+/** Словари. Ключи обязаны совпадать (проверяется тестом). */
+export const dictionaries = Object.freeze({
+  ru: Object.freeze({
+    ...dictionariesBase.ru,
+    ...COMMAND_MESSAGES_RU,
+    ...DOCTOR_MESSAGES_RU,
+    ...METRICS_MESSAGES_RU,
+    ...POLICY_MESSAGES_RU,
+  }),
+  en: Object.freeze({
+    ...dictionariesBase.en,
+    ...COMMAND_MESSAGES_EN,
+    ...DOCTOR_MESSAGES_EN,
+    ...METRICS_MESSAGES_EN,
+    ...POLICY_MESSAGES_EN,
   }),
 });
 
