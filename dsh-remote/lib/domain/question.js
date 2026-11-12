@@ -104,6 +104,9 @@ export class RemoteQuestion {
     this.workspace = context.workspace ?? null;
     this.role = context.role ?? null;
     this.taskId = context.taskId ?? null;
+    /** 047: короткая ссылка на ветку/рабочее дерево задачи (для подсказки). */
+    this.branch = typeof context.branch === "string" && context.branch !== "" ? context.branch : null;
+    this.worktree = typeof context.worktree === "string" && context.worktree !== "" ? context.worktree : null;
     /** 015: канал проекта (`chatId` + опциональный `threadId` топика). */
     this.chatId = context.chatId ?? null;
     this.threadId = context.threadId ?? null;
@@ -266,6 +269,8 @@ export class RemoteQuestion {
       workspace: this.workspace,
       role: this.role,
       taskId: this.taskId,
+      branch: this.branch,
+      worktree: this.worktree,
       title: this.title,
       body: this.body,
       options: this.options,

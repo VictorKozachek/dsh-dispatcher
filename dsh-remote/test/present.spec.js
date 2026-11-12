@@ -10,20 +10,30 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   FREE_TEXT_OPTION,
+  HEADER_LIMIT,
   MORE_OPTION,
+  TASK_LINK_PREFIX,
   WORKSPACE_LIMIT,
   findOwnedTask,
+  findOwnedTaskCard,
   formatTime,
   frontMatterField,
   renderBody,
   renderClock,
   renderHeader,
+  renderHtml,
   renderRows,
   resolveContext,
+  taskLinkHint,
   truncate,
+  truncateLines,
+  truncateWord,
+  workspaceLabel,
+  worktreeHint,
 } from "../lib/present.js";
 import { t } from "../lib/i18n.js";
 
@@ -96,7 +106,9 @@ test("resolveContext: нет каталога .kanban — тихо, без taskI
 
 test("resolveContext: чужой/пропавший/бросающий sessions.get не роняет", () => {
   const missing = resolveContext({ sessionId: SESSION_ID, ctx: fakeCtx({ get: () => undefined }) });
-  assert.deepEqual(missing, { sessionId: SESSION_ID, workspace: null, cwd: null, role: null, taskId: null });
+  assert.deepEqual(missing, {
+    sessionId: SESSION_ID, workspace: null, cwd: null, role: null, taskId: null, branch: null, worktree: null,
+  });
 
   const throwing = resolveContext({
     sessionId: SESSION_ID,
@@ -112,7 +124,9 @@ test("resolveContext: чужой/пропавший/бросающий sessions.
   assert.equal(noService.workspace, null);
 
   const noSession = resolveContext({ sessionId: null, ctx: fakeCtx({ get: () => session(CWD) }) });
-  assert.deepEqual(noSession, { sessionId: null, workspace: null, cwd: null, role: null, taskId: null });
+  assert.deepEqual(noSession, {
+    sessionId: null, workspace: null, cwd: null, role: null, taskId: null, branch: null, worktree: null,
+  });
 });
 
 test("resolveContext и findOwnedTask только читают карточки", (t) => {
@@ -193,6 +207,8 @@ test("renderBody: шапка, пустая строка, тело вопроса
     "▸ dsh-dispatcher · task 007 · worker · 17:41 · до 18:11",
     "",
     "Удалить ветку task/007 после слияния?",
+    "",
+    t("present.buttonHint"),
   ].join("\n"));
 });
 
@@ -394,4 +410,374 @@ test("044: подсказка при быстрых кнопках говори�
 
   const disabled = (await import("../lib/present.js")).renderBody({ body: "Продолжать?", options: [], quickReplies: [] }, {});
   assert.match(disabled, new RegExp(tr("present.freeTextHint").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+/* ------------------- 047: формат сообщений и подсказок ------------------- */
+
+const FIXED_NOW = new Date(2026, 10, 3, 17, 41).getTime();
+const FIXED_DEADLINE = new Date(2026, 10, 3, 18, 11).getTime();
+const SNAPSHOT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "snapshots", "present");
+const PROJECT = "/Users/victor/projects/dsh-dispatcher";
+const WORKTREE = `${PROJECT}/worktrees/047`;
+
+/** 30 строк «ответа агента» — длинный текст, который не влезает в сообщение. */
+function longAnswer(lines = 30) {
+  return Array.from({ length: lines }, (_, index) => `строка ${index + 1}: ${"подробность ".repeat(3).trimEnd()}`).join("\n");
+}
+
+/** Ответ с кодом и диффом: то, что обязано быть моноширинным. */
+function codeAnswer() {
+  return [
+    "Проверь патч:",
+    "",
+    "```js",
+    "if (a < b && c > d) {",
+    '  return "x & y";',
+    "}",
+    "```",
+    "",
+    "--- a/dsh-remote/lib/x.js",
+    "+++ b/dsh-remote/lib/x.js",
+    "@@ -1,2 +1,2 @@",
+    "-const old = 1;",
+    "+const next = 2;",
+  ].join("\n");
+}
+
+/** Типичные сообщения; их текст лежит снапшотами рядом с тестами. */
+function snapshotMessages() {
+  const caps = { maxText: 4096, maxOptions: 8 };
+  return {
+    "short-question.txt": renderBody({
+      workspace: PROJECT,
+      role: "worker",
+      taskId: "007",
+      body: "Удалить ветку task/007 после слияния?",
+      options: [{ id: "o1", label: "Да" }, { id: "o2", label: "Нет" }],
+      createdAt: FIXED_NOW,
+      expiresAt: FIXED_DEADLINE,
+      lang: "ru",
+    }, caps),
+    "long-question.txt": renderBody({
+      workspace: PROJECT,
+      role: "worker",
+      taskId: "047",
+      body: longAnswer(),
+      allowFreeText: true,
+      createdAt: FIXED_NOW,
+      lang: "ru",
+    }, { maxText: 320 }),
+    "code-question.txt": renderBody({
+      workspace: PROJECT,
+      role: "worker",
+      body: codeAnswer(),
+      allowFreeText: true,
+      createdAt: FIXED_NOW,
+      lang: "ru",
+    }, caps),
+    "task-question.txt": renderBody({
+      workspace: WORKTREE,
+      role: "worker",
+      taskId: "047",
+      branch: "feature/047",
+      worktree: WORKTREE,
+      body: "Пуш в develop?",
+      options: [{ id: "o1", label: "Да" }, { id: "o2", label: "Нет" }],
+      createdAt: FIXED_NOW,
+      lang: "ru",
+    }, caps),
+    "no-task-question.txt": renderBody({
+      workspace: PROJECT,
+      role: "verifier",
+      body: "Задача в порядке?",
+      options: [{ id: "o1", label: "Да" }, { id: "o2", label: "Нет" }],
+      createdAt: FIXED_NOW,
+      lang: "ru",
+    }, caps),
+    "code-html.txt": renderHtml(codeAnswer()),
+  };
+}
+
+test("047: снапшоты типичных сообщений (короткий, длинный, код, с задачей, без)", () => {
+  const messages = snapshotMessages();
+
+  for (const [name, actual] of Object.entries(messages)) {
+    const file = path.join(SNAPSHOT_DIR, name);
+    if (process.env.UPDATE_SNAPSHOTS === "1") {
+      fs.mkdirSync(SNAPSHOT_DIR, { recursive: true });
+      fs.writeFileSync(file, `${actual}\n`);
+      continue;
+    }
+    assert.ok(fs.existsSync(file), `нет снапшота ${name} (обновить: UPDATE_SNAPSHOTS=1 node --test dsh-remote/test/present.spec.js)`);
+    assert.equal(actual, fs.readFileSync(file, "utf8").replace(/\n$/, ""), `снапшот ${name} разошёлся с рендером`);
+  }
+  assert.equal(Object.keys(messages).length, 6, "набор типичных случаев не должен молча сокращаться");
+});
+
+test("047: длинный ответ режется по границе строки с честным маркером", () => {
+  const body = renderBody({
+    workspace: PROJECT,
+    role: "worker",
+    body: longAnswer(30),
+    allowFreeText: false,
+    createdAt: FIXED_NOW,
+    lang: "ru",
+  }, { maxText: 320 });
+
+  assert.ok(body.length <= 320, `длина ${body.length} больше предела`);
+  const tail = body.split("\n").at(-1);
+  const match = /^…ещё (\d+) строк(?:а|и|ок)?$/.exec(tail);
+  assert.ok(match !== null, `последняя строка не хвост «…ещё N строк»: ${JSON.stringify(tail)}`);
+  const shown = body.split("\n").filter((line) => /^строка \d+:/.test(line)).length;
+  assert.equal(shown + Number(match[1]), 30, "показанные и скрытые строки дают исходное число строк");
+  assert.match(body, /▸ dsh-dispatcher · worker · 17:41/, "шапка остаётся целой");
+});
+
+test("047: одна слишком длинная строка режется прежним маркером, а не «ещё 1 строка»", () => {
+  const out = truncateLines("а".repeat(300), 80, { lang: "ru" });
+
+  assert.ok(out.length <= 80, `длина ${out.length} больше предела`);
+  assert.ok(out.endsWith(t("present.truncationMarker")), `нет маркера обрезки: ${out.slice(-20)}`);
+});
+
+test("047: хвост усечения говорит на языке сообщения", () => {
+  const lines = Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join("\n");
+  const ru = truncateLines(lines, 44, { lang: "ru" });
+  const en = truncateLines(lines, 44, { lang: "en" });
+
+  assert.match(ru, /…ещё \d+ стр(?:ока|оки|ок)$/);
+  assert.match(en, /…\d+ more lines?$/);
+  assert.ok(ru.length <= 44 && en.length <= 44, "лимит соблюдается");
+  assert.equal(truncateLines("a\nb", 10, { lang: "ru" }), "a\nb", "короткий текст не трогаем");
+});
+
+test("047: шапка — короткий идентификатор ветки без дубля номера задачи", () => {
+  assert.equal(
+    renderHeader({ workspace: "dsh-dispatcher", taskId: "047", branch: "feature/047", role: "worker", now: FIXED_NOW }),
+    "▸ dsh-dispatcher · task 047 · worker · 17:41",
+    "feature/047 дублировал бы номер задачи",
+  );
+  assert.equal(
+    renderHeader({ workspace: "dsh-dispatcher", taskId: "047", branch: "refs/heads/bug/047-timeout", role: "worker", now: FIXED_NOW }),
+    "▸ dsh-dispatcher · task 047 · 047-timeout · worker · 17:41",
+    "refs/heads снят, значимая часть ветки осталась",
+  );
+});
+
+test("047: длинное имя проекта усекается по границе слова, шапка — одна строка", () => {
+  const long = "dsh-dispatcher-очень-длинное-имя-проекта-2026";
+  const header = renderHeader({
+    workspace: long,
+    taskId: "047",
+    branch: "feature/047",
+    role: "worker",
+    now: FIXED_NOW,
+    expiresAt: FIXED_DEADLINE,
+  });
+  const workspace = header.replace("▸ ", "").split(" · ")[0];
+
+  assert.ok(header.length <= HEADER_LIMIT, `шапка ${header.length} > ${HEADER_LIMIT}`);
+  assert.ok(workspace.endsWith("…"), "длинное имя усечено");
+  const stem = workspace.slice(0, -1);
+  assert.ok(long.startsWith(stem), "усечение — префикс исходного имени");
+  assert.match(long.charAt(stem.length), /[\s._/-]/, `имя оборвано посреди слова: ${workspace}`);
+});
+
+test("047: ссылка на задачу — номер в шапке, дерево одной строкой в подсказке", () => {
+  const body = renderBody({
+    workspace: WORKTREE,
+    role: "worker",
+    taskId: "047",
+    branch: "feature/047",
+    worktree: WORKTREE,
+    body: "Пуш в develop?",
+    options: [{ id: "o1", label: "Да" }],
+    createdAt: FIXED_NOW,
+    lang: "ru",
+  }, { maxText: 4096 });
+
+  assert.equal(body.split("\n")[0], "▸ dsh-dispatcher · task 047 · worker · 17:41", "в шапке — проект и номер карточки");
+  assert.match(body, new RegExp(`^${TASK_LINK_PREFIX} feature/047 · worktrees/047$`, "m"));
+  assert.doesNotMatch(body, /\/Users\//, "абсолютный путь в сообщение не уходит");
+  assert.ok(body.indexOf(TASK_LINK_PREFIX) > body.indexOf("Пуш в develop?"), "ссылка ниже тела, а не в нём");
+});
+
+test("047: подсказка ровно одна — кнопка при вариантах, текст без кнопок", () => {
+  const button = t("present.buttonHint");
+  const text = t("present.freeTextHint");
+  const options = [{ id: "o1", label: "Да" }];
+
+  const withOptions = renderBody({ body: "?", options, createdAt: 0 }, { maxText: 4096 });
+  assert.ok(withOptions.includes(button), "варианты — просим нажать кнопку");
+  assert.ok(!withOptions.includes(text), "«ответьте текстом» одновременно не показываем");
+
+  const withoutButtons = renderBody({ body: "?", options, createdAt: 0 }, { maxText: 4096, inlineButtons: false });
+  assert.ok(withoutButtons.includes(text), "кнопок нет — только текст");
+  assert.ok(!withoutButtons.includes(button), "не просим нажать несуществующую кнопку");
+
+  const freeText = renderBody({ body: "?", quickReplies: [], createdAt: 0 }, { maxText: 4096 });
+  assert.ok(freeText.includes(text));
+  assert.ok(!freeText.includes(button));
+});
+
+test("047: caps.maxText соблюдается на любом теле — обрезка не рвёт лимит", () => {
+  for (const maxText of [40, 80, 120, 300]) {
+    const out = renderBody({
+      workspace: "/p/dsh-dispatcher",
+      role: "worker",
+      body: longAnswer(50),
+      allowFreeText: true,
+      createdAt: FIXED_NOW,
+      lang: "ru",
+    }, { maxText });
+    assert.ok(out.length <= maxText, `maxText=${maxText}: получили ${out.length}`);
+  }
+});
+
+test("047: renderHtml экранирует текст, а код и дифф держит в <pre>", () => {
+  assert.equal(renderHtml("a < b & c > d"), "a &lt; b &amp; c &gt; d");
+  assert.equal(renderHtml("`x < y`"), "<code>x &lt; y</code>");
+
+  const html = renderHtml(codeAnswer());
+  assert.equal((html.match(/<pre>/g) ?? []).length, 2, "код и дифф — два моноширинных блока");
+  assert.equal((html.match(/<\/pre>/g) ?? []).length, 2, "все блоки закрыты");
+  assert.match(html, /<pre>if \(a &lt; b &amp;&amp; c &gt; d\) \{/);
+  assert.match(html, /<pre>--- a\/dsh-remote\/lib\/x\.js/);
+  assert.doesNotMatch(html, /<script|onerror=/i, "чужой html не проходит как разметка");
+});
+
+test("047: worktreeHint/workspaceLabel — короткий путь дерева, проект без номера задачи", () => {
+  assert.equal(truncateWord("короткое", 20), "короткое");
+  assert.ok(truncateWord("dsh-dispatcher-очень-длинное-имя", 20).endsWith("…"), "длинное усекается");
+  assert.equal(worktreeHint(WORKTREE), "worktrees/047");
+  assert.equal(worktreeHint(`${WORKTREE}/`), "worktrees/047");
+  assert.equal(worktreeHint(null), null);
+  assert.equal(workspaceLabel(WORKTREE), "dsh-dispatcher", "в шапке имя проекта, а не номер задачи");
+  assert.equal(workspaceLabel(PROJECT), "dsh-dispatcher");
+  assert.equal(workspaceLabel(""), null);
+});
+
+test("047: taskLinkHint — ветка и дерево одной строкой, без задачи — null", () => {
+  assert.equal(taskLinkHint({}), null);
+  assert.equal(taskLinkHint({ branch: "feature/047" }), `${TASK_LINK_PREFIX} feature/047`);
+  assert.equal(
+    taskLinkHint({ branch: "refs/heads/feature/047", worktree: "/p/x/worktrees/047" }),
+    `${TASK_LINK_PREFIX} feature/047 · worktrees/047`,
+  );
+});
+
+test("047: findOwnedTaskCard отдаёт ветку и дерево карточки", (t) => {
+  const dir = tempWorkspace(t, {
+    cards: {
+      "006.md": [
+        "---",
+        'id: "006"',
+        'title: "Задача 006"',
+        "status: in-progress",
+        `owner: ${SESSION_ID}`,
+        "role: worker",
+        'branch: "feature/006"',
+        'worktree: "/Users/victor/projects/dsh-dispatcher/worktrees/006"',
+        "---",
+        "",
+      ].join("\n"),
+    },
+  });
+
+  assert.deepEqual(findOwnedTaskCard(dir, SESSION_ID), {
+    id: "006",
+    branch: "feature/006",
+    worktree: "/Users/victor/projects/dsh-dispatcher/worktrees/006",
+  });
+  assert.equal(findOwnedTaskCard(dir, "session-other"), null);
+  assert.equal(findOwnedTask(dir, SESSION_ID), "006", "findOwnedTask остаётся прежним API");
+});
+
+/** Снапшоты текста: правки формата видны в диффе (047). */
+const snapshotsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "snapshots", "present");
+
+function readSnapshot(name) {
+  // Файл снапшота заканчивается переводом строки; сообщение — нет.
+  return fs.readFileSync(path.join(snapshotsDir, name), "utf8").replace(/\n$/, "");
+}
+
+test("снапшоты: короткий, длинный, с кодом, с задачей, без задачи", () => {
+  const createdAt = new Date(2026, 10, 3, 17, 41).getTime();
+  const expiresAt = new Date(2026, 10, 3, 18, 11).getTime();
+  const workspace = "/Users/victor/projects/dsh-dispatcher";
+  const caps = { maxText: 4096, maxOptions: 8 };
+
+  const shortQuestion = {
+    workspace, role: "worker", taskId: "007", createdAt, expiresAt,
+    body: "Удалить ветку task/007 после слияния?",
+    options: [{ id: "o1", label: "Да" }],
+  };
+  assert.equal(renderBody(shortQuestion, caps), readSnapshot("short-question.txt"));
+
+  const longBody = Array.from({ length: 30 }, (_, index) => `строка ${index + 1}: подробность подробность подробность`).join("\n");
+  const longQuestion = { workspace, role: "worker", taskId: "047", createdAt, body: longBody };
+  assert.equal(renderBody(longQuestion, { ...caps, maxText: 320 }), readSnapshot("long-question.txt"));
+
+  const codeQuestion = {
+    workspace, role: "worker", createdAt,
+    body: [
+      "Проверь патч:",
+      "",
+      "```js",
+      "if (a < b && c > d) {",
+      '  return "x & y";',
+      "}",
+      "```",
+      "",
+      "--- a/dsh-remote/lib/x.js",
+      "+++ b/dsh-remote/lib/x.js",
+      "@@ -1,2 +1,2 @@",
+      "-const old = 1;",
+      "+const next = 2;",
+    ].join("\n"),
+  };
+  assert.equal(renderBody(codeQuestion, caps), readSnapshot("code-question.txt"));
+
+  const taskQuestion = {
+    workspace, role: "worker", taskId: "047",
+    branch: "feature/047",
+    worktree: "/Users/victor/projects/dsh-dispatcher/worktrees/047",
+    createdAt,
+    body: "Пуш в develop?",
+    options: [{ id: "o1", label: "Да" }],
+  };
+  assert.equal(renderBody(taskQuestion, caps), readSnapshot("task-question.txt"));
+
+  const noTaskQuestion = {
+    workspace, role: "verifier", createdAt,
+    body: "Задача в порядке?",
+    options: [{ id: "o1", label: "Да" }],
+  };
+  assert.equal(renderBody(noTaskQuestion, caps), readSnapshot("no-task-question.txt"));
+});
+
+test("снапшот: код и диффы в <pre>, HTML экранирован", () => {
+  const body = [
+    "Проверь патч:",
+    "",
+    "```js",
+    "if (a < b && c > d) {",
+    '  return "x & y";',
+    "}",
+    "```",
+    "",
+    "--- a/dsh-remote/lib/x.js",
+    "+++ b/dsh-remote/lib/x.js",
+    "@@ -1,2 +1,2 @@",
+    "-const old = 1;",
+    "+const next = 2;",
+  ].join("\n");
+
+  assert.equal(renderHtml(body), readSnapshot("code-html.txt"));
+});
+
+test("HTML: спецсимволы экранируются, одиночные <pre> не ломаются", () => {
+  const html = renderHtml("a < b & c > d `code <x>`");
+  assert.equal(html, "a &lt; b &amp; c &gt; d <code>code &lt;x&gt;</code>");
+  assert.equal(html.includes("<script>"), false);
 });

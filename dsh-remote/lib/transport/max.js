@@ -36,7 +36,7 @@ import {
   splitText,
   throttle,
 } from "./base.js";
-import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderRows } from "../present.js";
+import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderHtml, renderRows } from "../present.js";
 
 /** Базовый адрес MAX Bot API: документация просит именно platform-api2. */
 export const MAX_API_BASE = "https://platform-api2.max.ru";
@@ -263,6 +263,44 @@ function clipEscaped(text, limit) {
   const amp = cut.lastIndexOf("&");
   if (amp >= 0 && !/^&(amp|lt|gt);$/.test(cut.slice(amp))) cut = cut.slice(0, amp);
   return `${cut}…`;
+}
+
+/**
+ * 047: HTML обязан влезть в `caps.maxText`, не разрывая `<pre>/<code>`.
+ *
+ * Сначала ужимаем **plain-текст** (renderBody сам держит место под подсказку),
+ * затем рендерим HTML. Если теги/экранирование всё же вывели за лимит — режем
+ * готовый HTML по границе тега и закрываем открытые `<pre>/<code>`, а не как
+ * раньше «по сырым символам» с незакрытым `<pre>`.
+ */
+function clipHtml(text, limit) {
+  if (text.length <= limit) return text;
+  let cut = text.slice(0, Math.max(0, limit - 8));
+  const lastOpen = cut.lastIndexOf("<");
+  const lastClose = cut.lastIndexOf(">");
+  if (lastOpen > lastClose) cut = cut.slice(0, lastOpen);
+  const preOpen = (cut.match(/<pre>/g) ?? []).length - (cut.match(/<\/pre>/g) ?? []).length;
+  const codeOpen = (cut.match(/<code>/g) ?? []).length - (cut.match(/<\/code>/g) ?? []).length;
+  let suffix = "…";
+  for (let index = 0; index < Math.max(0, codeOpen); index += 1) suffix += "</code>";
+  for (let index = 0; index < Math.max(0, preOpen); index += 1) suffix += "</pre>";
+  return `${cut.slice(0, Math.max(0, limit - suffix.length))}${suffix}`;
+}
+
+/** 047: plain → HTML с бюджетом на теги, без обрыва подсказки. */
+function renderMaxHtml(question, caps) {
+  const max = Number.isFinite(caps?.maxText) ? caps.maxText : MAX_CAPS.maxText;
+  let budget = max;
+  let html = "";
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const plain = renderBody(question, { ...caps, maxText: budget });
+    html = renderHtml(plain);
+    if (html.length <= max) return html;
+    budget = Math.max(40, budget - (html.length - max) - 8);
+  }
+  const plain = renderBody(question, { ...caps, maxText: Math.max(40, max - 64) });
+  html = renderHtml(plain);
+  return html.length <= max ? html : clipHtml(html, max);
 }
 
 /** Вырезать токен из произвольного текста (сервер может его отразить). */
@@ -733,7 +771,7 @@ export function createMaxTransport(options = {}) {
       const targetChat = sendOptions?.chatId ?? chatId;
       const query = targetChat !== null ? { chat_id: targetChat } : { user_id: userId };
 
-      const text = clipEscaped(escapeHtml(renderBody(question, caps)), caps.maxText);
+      const text = renderMaxHtml(question, caps);
       const keyboard = buildKeyboard(question);
       const attachments = keyboard.payload.buttons.length === 0 ? undefined : [keyboard];
 

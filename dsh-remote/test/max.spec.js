@@ -134,10 +134,27 @@ test("sendQuestion: текст усечён под 4000 и экранирова�
 
   const call = calls.find((item) => item.key === "POST /messages");
   assert.ok(call.body.text.length <= 4000, `длина ${call.body.text.length}`);
-  assert.match(call.body.text, /…$/, "текст обрезан маркером");
+  assert.match(call.body.text, /…/, "текст обрезан маркером");
   assert.match(call.body.text, /&amp;/);
   assert.equal(call.body.text.includes("a & b < c"), false, "спецсимволы экранированы");
   assert.equal(/&[a-z]*$/.test(call.body.text), false, "сущность не разорвана");
+});
+
+test("sendQuestion: длинный code fence не рвёт <pre> и caps.maxText", async (t) => {
+  const { transport, calls } = setup(t);
+  const body = `\`\`\`js\n${"A".repeat(3990)}\n\`\`\``;
+
+  await transport.sendQuestion(question({ body, options: [], allowFreeText: true }));
+
+  const call = calls.find((item) => item.key === "POST /messages");
+  const text = call.body.text;
+  assert.ok(text.length <= 4000, `длина ${text.length}`);
+  assert.equal((text.match(/<pre>/g) ?? []).length, (text.match(/<\/pre>/g) ?? []).length, "<pre> закрыт");
+  assert.equal((text.match(/<code>/g) ?? []).length, (text.match(/<\/code>/g) ?? []).length, "<code> закрыт");
+  assert.match(text, /…/, "маркер усечения на месте");
+  assert.match(text, /Ответьте текстом/i, "подсказка не обрезана");
+  assert.ok(text.lastIndexOf("</pre>") < text.lastIndexOf("ответьте текстом"), "подсказка вне <pre>");
+  assert.equal(text.includes("A".repeat(3990)), false, "тело усечено");
 });
 
 test("нажатие кнопки: message_callback -> /answers и один ответ подписчику", async (t) => {
