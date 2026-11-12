@@ -190,21 +190,6 @@ async function ensureTransport(ctx, store, deps, facade, isDisposed = () => fals
     return relayTransport;
   }
 
-  if (binding === null || binding.transport !== "telegram") {
-    // Канал из config.telegram (004) мы не создавали — его не гасим: без привязки
-    // в состоянии он и есть рабочий канал.
-    const adopted = facade.current;
-    const boundId = typeof binding?.transport === "string" ? binding.transport : null;
-    if (boundId !== null) {
-      // 038: привязка на другой транспорт (relay/max) — config-канал не активен.
-      if (adopted !== null && adopted.id === boundId) return adopted;
-      return null;
-    }
-    if (adopted !== null && adopted.__bindingKey === undefined) return adopted;
-    if (adopted !== null) await facade.stop();
-    return null;
-  }
-
   // 039: привязка на MAX — канал создаём здесь же, чтобы `/remote connect MAX`
   // начинал публиковать сразу, без перезагрузки профиля.
   if (binding !== null && binding.transport === "max") {
@@ -217,6 +202,9 @@ async function ensureTransport(ctx, store, deps, facade, isDisposed = () => fals
       return null;
     }
     if (token === null) {
+      // Секрет пропал/ротировался: старый MAX-поллер с прежним токеном не должен
+      // продолжать работать (052) — как в telegram-ветке.
+      await facade.stop();
       deps.logger.warn(`фича commands: привязка на MAX, а секрета ${tokenRef} нет — канал не поднят`);
       return null;
     }
@@ -254,6 +242,7 @@ async function ensureTransport(ctx, store, deps, facade, isDisposed = () => fals
       return null;
     }
     maxTransport.__bindingKey = key;
+    maxTransport.__token = token;
     facade.set(maxTransport);
     try {
       await maxTransport.start();
@@ -262,6 +251,23 @@ async function ensureTransport(ctx, store, deps, facade, isDisposed = () => fals
     }
     deps.logger.info("фича commands: канал MAX поднят из сохранённой привязки");
     return maxTransport;
+  }
+
+  // 052: MAX обрабатывается отдельной веткой ниже; в «не telegram» его не
+  // отправляем, иначе ветка max недостижима и канал не поднимается.
+  if (binding === null || (binding.transport !== "telegram" && binding.transport !== "max")) {
+    // Канал из config.telegram (004) мы не создавали — его не гасим: без привязки
+    // в состоянии он и есть рабочий канал.
+    const adopted = facade.current;
+    const boundId = typeof binding?.transport === "string" ? binding.transport : null;
+    if (boundId !== null) {
+      // 038: привязка на другой транспорт (relay/max) — config-канал не активен.
+      if (adopted !== null && adopted.id === boundId) return adopted;
+      return null;
+    }
+    if (adopted !== null && adopted.__bindingKey === undefined) return adopted;
+    if (adopted !== null) await facade.stop();
+    return null;
   }
 
   const credentials = createCredentialAccess(ctx, { log });

@@ -1555,3 +1555,159 @@ test("050: connect MAX: отмена вопроса прекращает опр�
   assert.match(result.text, /отменена/);
   assert.equal(stand.store.read().bindings, null);
 });
+
+// --- 052: ensureTransport поднимает канал MAX ------------------------------
+
+/** MAX API для фичи: /updates висит до abort, /messages отвечает. */
+function maxFeatureFetch() {
+  const calls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const parsed = new URL(url);
+    const method = init.method ?? "GET";
+    calls.push({ key: `${method} ${parsed.pathname}`, url: parsed, init });
+    if (parsed.pathname === "/updates") {
+      return new Promise((_, reject) => {
+        init.signal?.addEventListener?.("abort", () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    }
+    if (parsed.pathname === "/messages") {
+      return { ok: true, status: 200, async json() { return { message: { body: { mid: "mid.1" } } }; } };
+    }
+    return { ok: true, status: 200, async json() { return { name: "max_bot" }; } };
+  };
+  return { calls, fetch: fetchImpl };
+}
+
+async function maxFeatureStand(t, { withToken = true, chatId = 549732759 } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-feature-max-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "state.json");
+  const store = createStore({ file });
+  store.setBinding({ transport: "max", chatId, userId: 13853411, botUsername: "max_bot" });
+
+  const previousState = process.env.DSH_REMOTE_STATE;
+  process.env.DSH_REMOTE_STATE = file;
+  t.after(() => {
+    if (previousState === undefined) delete process.env.DSH_REMOTE_STATE;
+    else process.env.DSH_REMOTE_STATE = previousState;
+  });
+
+  // Токен изменяемый: тесты смены привязки/токена меняют его между вызовами.
+  const secret = { token: withToken ? "max-feature-token" : null };
+  const credentials = { resolve: async () => (secret.token === null ? null : { value: secret.token, source: "file" }) };
+  const provided = new Map();
+  const ctx = {
+    provide: (name, service) => provided.set(name, service),
+    get: (name) => (name === "credentials" ? credentials : provided.get(name) ?? null),
+    commands: { register: () => () => {} },
+    userQuestions: { ask: async () => ({ answers: [] }) },
+    on: () => () => {},
+    effect: (execute) => {
+      const disposable = execute();
+      return () => disposable?.();
+    },
+  };
+  const logs = [];
+  const deps = {
+    logger: {
+      debug: (message) => logs.push(`debug: ${message}`),
+      info: (message) => logs.push(`info: ${message}`),
+      warn: (message) => logs.push(`warn: ${message}`),
+      error: (message) => logs.push(`error: ${message}`),
+    },
+    get: (name) => (name === "credentials" ? credentials : null),
+    onDispose: () => {},
+  };
+  return { ctx, deps, logs, provided, store, dir, file, secret };
+}
+
+test("052: привязка MAX поднимает канал в фасаде и доставляет вопрос", async (t) => {
+  const api = maxFeatureFetch();
+  const stand = await maxFeatureStand(t);
+  const { commandsFeature } = await import("../lib/features/commands.js");
+
+  await commandsFeature.apply(stand.ctx, { max: { fetch: api.fetch, apiBase: "https://platform-api.max.ru" } }, stand.deps);
+
+  const facade = stand.provided.get("remoteTransport");
+  assert.ok(facade, "фасад зарегистрирован");
+  assert.equal(facade.current?.id, "max", "канал MAX поднят");
+  assert.equal(facade.current.polling, true, "поллинг MAX стартовал");
+  assert.equal(facade.current.__token, "max-feature-token", "__token проставлен");
+  assert.match(facade.current.__bindingKey, /^max\|549732759\|13853411\|/, "ключ привязки для пересоздания");
+
+  await facade.sendQuestion({
+    shortId: "abcd1234",
+    id: "q-1",
+    question: "Продолжать?",
+    options: [{ id: "o1", label: "Да" }],
+    allowFreeText: true,
+  });
+  const messageCall = api.calls.find((call) => call.key === "POST /messages");
+  assert.ok(messageCall, "вопрос ушёл в POST /messages");
+  assert.equal(messageCall.url.searchParams.get("chat_id"), "549732759");
+  await facade.stop();
+  t.after(async () => { await facade.stop(); });
+});
+
+test("052: смена привязки и токена пересоздаёт MAX-транспорт", async (t) => {
+  const api = maxFeatureFetch();
+  const stand = await maxFeatureStand(t);
+  const { commandsFeature } = await import("../lib/features/commands.js");
+
+  const feature = await commandsFeature.apply(stand.ctx, { max: { fetch: api.fetch, apiBase: "https://platform-api.max.ru" } }, stand.deps);
+  const facade = stand.provided.get("remoteTransport");
+  t.after(async () => { await facade.stop(); });
+  const first = facade.current;
+  assert.ok(first !== null, "канал поднят");
+  assert.equal(first.polling, true, "первый поллер стартовал");
+
+  // Новая привязка и новый токен — старый поллер не должен остаться.
+  createStore({ file: stand.file }).setBinding({ transport: "max", chatId: 549732760, userId: 13853411, botUsername: "max_bot" });
+  stand.secret.token = "max-feature-token-2";
+
+  const second = await feature.ensureTransport();
+
+  assert.notEqual(second, first, "транспорт пересоздан");
+  assert.equal(first.polling, false, "старый поллинг остановлен");
+  assert.equal(facade.current, second, "в фасаде новый транспорт");
+  assert.match(second.__bindingKey, /^max\|549732760\|13853411\|max-feature-token-2$/, "ключ привязки с новым chatId и токеном");
+  assert.equal(second.__token, "max-feature-token-2", "__token обновлён");
+  assert.equal(second.polling, true, "новый поллер стартовал");
+});
+
+test("052: без MAX-токена канал не поднимается, warn без падения", async (t) => {
+  const api = maxFeatureFetch();
+  const stand = await maxFeatureStand(t, { withToken: false });
+  const { commandsFeature } = await import("../lib/features/commands.js");
+
+  const result = await commandsFeature.apply(stand.ctx, { max: { fetch: api.fetch, apiBase: "https://platform-api.max.ru" } }, stand.deps);
+
+  assert.equal(typeof result?.ensureTransport, "function", "apply вернул API фичи");
+  const facade = stand.provided.get("remoteTransport");
+  assert.equal(facade.current, null, "канала нет без токена");
+  assert.deepEqual(api.calls, [], "поллинга нет: ни одного запроса к MAX API");
+  assert.match(stand.logs.join("\n"), /привязка на MAX, а секрета .* нет — канал не поднят/);
+});
+
+test("052: пропал MAX-токен — прежний поллер остановлен", async (t) => {
+  const api = maxFeatureFetch();
+  const stand = await maxFeatureStand(t);
+  const { commandsFeature } = await import("../lib/features/commands.js");
+
+  const feature = await commandsFeature.apply(stand.ctx, { max: { fetch: api.fetch, apiBase: "https://platform-api.max.ru" } }, stand.deps);
+  const facade = stand.provided.get("remoteTransport");
+  const first = facade.current;
+  assert.equal(first.polling, true, "канал поднят");
+
+  stand.secret.token = null;
+  const result = await feature.ensureTransport();
+
+  assert.equal(result, null, "без секрета транспорт не поднят");
+  assert.equal(facade.current, null, "фасад пуст");
+  assert.equal(first.polling, false, "старый поллер остановлен, а не продолжает работать без токена");
+  assert.match(stand.logs.join("\n"), /привязка на MAX, а секрета .* нет — канал не поднят/);
+});
