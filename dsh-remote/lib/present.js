@@ -523,8 +523,14 @@ export function renderBody(question = {}, caps = {}) {
   // Тело усекаем отдельно от шапки и подсказок: длинный ответ агента не должен
   // вытеснять «как ответить», а хвост «…ещё N строк» не считает их строками.
   const reserved = head.length + 1 + hintBlock.length + linkBlock.length;
-  const budget = Math.max(1, maxText - reserved);
-  const body = truncateLines(content, budget, { lang });
+  // 047: если тело обрезано внутри ```-блока, закрываем fence, иначе подсказка
+  // уедет внутрь <pre> и разметка сломается. Пара закрывающих ``` — 4 символа.
+  const fences = (content.match(/^\s*```/gm) ?? []).length;
+  // Место под возможное закрытие fence: обрезка могла убрать закрывающий ```.
+  const fenceReserve = fences > 0 ? 4 : 0;
+  const budget = Math.max(1, maxText - reserved - fenceReserve);
+  let body = truncateLines(content, budget, { lang });
+  if ((body.match(/^\s*```/gm) ?? []).length % 2 === 1) body += "\n```";
   const message = `${head}\n${body}${hintBlock}${linkBlock}`;
   return message.length <= maxText ? message : truncate(message, maxText, t("present.truncationMarker", {}, lang));
 }

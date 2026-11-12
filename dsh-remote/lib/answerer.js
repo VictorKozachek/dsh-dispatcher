@@ -535,7 +535,8 @@ export function createAnswerer({
         now: now(),
         log,
       });
-      for (const created of createdList) {        known.set(created.shortId, created);
+      for (const created of createdList) {
+        known.set(created.shortId, created);
         if (known.size > 200) known.delete(known.keys().next().value);
         questions.push(created);
         try {
