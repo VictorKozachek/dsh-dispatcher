@@ -19,6 +19,8 @@
  * публикацией в канал, а при таймауте берёт `timeoutOutcome()`.
  */
 
+import { DEFAULT_LANG, normalizeLang, t } from "../i18n.js";
+
 /** Инструменты, которые по умолчанию можно подтверждать удалённо. */
 export const DEFAULT_TOOLS = Object.freeze([
   "read_file",
@@ -163,13 +165,17 @@ export function timeoutOutcome(policy) {
 }
 
 /** Человеческое описание политики для `/remote status`. */
-export function describePolicy(policy) {
+export function describePolicy(policy, lang = DEFAULT_LANG) {
+  const code = normalizeLang(lang) ?? DEFAULT_LANG;
   const tools = policy?.tools ?? [];
   const deny = policy?.denyRemote ?? [];
   return [
-    `approvals: tools=[${tools.join(", ") || "—"}]`,
-    `approvals: denyRemote=[${deny.join(", ") || "—"}]`,
-    `approvals: onTimeout=${timeoutOutcome(policy)} (отказ), ttl=${Math.round((policy?.ttlMs ?? DEFAULT_TTL_MS) / 60000)} мин`,
+    t("policy.tools", { p0: tools.join(", ") || "—" }, code),
+    t("policy.denyRemote", { p0: deny.join(", ") || "—" }, code),
+    t("policy.timeout", {
+      p0: timeoutOutcome(policy),
+      p1: Math.round((policy?.ttlMs ?? DEFAULT_TTL_MS) / 60000),
+    }, code),
   ];
 }
 
@@ -183,6 +189,6 @@ export function createApprovalPolicy(config, options) {
     ...policy,
     decide: (request) => decide(policy, request),
     timeoutOutcome: () => timeoutOutcome(policy),
-    describe: () => describePolicy(policy),
+    describe: (lang = DEFAULT_LANG) => describePolicy(policy, lang),
   };
 }

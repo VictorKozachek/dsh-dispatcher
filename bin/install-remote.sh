@@ -5,11 +5,14 @@
 #   bin/install-remote.sh [--profile web|desktop] [--dry-run]
 #   bin/install-remote.sh --update [--dry-run]
 #   bin/install-remote.sh --rollback <версия> [--dry-run]
+#   bin/install-remote.sh --uninstall [--profile ...] [--dry-run]
 #
 #   --profile <имя>  профиль DSH (по умолчанию web)
 #   --dry-run        только напечатать план: ничего не пишет и не трогает ~/.dsh
 #   --update         сравнить установленную версию с текущим пакетом и обновить
 #   --rollback <v>   вернуть ранее установленную версию из кэша (~/.dsh/plugin-cache)
+#   --uninstall      убрать плагин из профиля: зависимость, бандл и симлинк
+#                    node_modules. Идемпотентно; чужие зависимости не трогает.
 #
 # Штатный путь: пакет объявляет dsh.bundle, поэтому `dsh plugin add` дописывает
 # его в dsh.profile.bundles профиля, а cordis.patch.yml пакета вставляет
@@ -59,6 +62,10 @@ while [[ $# -gt 0 ]]; do
       MODE="rollback"
       ROLLBACK_VERSION="$2"
       shift 2
+      ;;
+    --uninstall)
+      MODE="uninstall"
+      shift
       ;;
     -h|--help)
       usage
@@ -212,6 +219,28 @@ PY
   fi
 fi
 
+
+# --- uninstall ---------------------------------------------------------------
+# Убрать плагин из профиля: запись в dependencies, имя в dsh.profile.bundles и
+# симлинк в node_modules. Ручной ряд ui-remote в cordis.patch.yml профиля не
+# трогаем — его ставит только ручная вставка, а удалять чужие ряды наугад нельзя;
+# если он есть, скрипт просто предупреждает.
+if [[ "$MODE" == "uninstall" ]]; then
+  if [[ ! -f "$MANIFEST" ]]; then
+    problem "профиль '$PROFILE' не инициализирован: нет $MANIFEST"
+  fi
+  echo "dsh-remote ← профиль '$PROFILE' (удаление)"
+  echo "профиль: $PROFILE_DIR"
+  python3 "$ROOT/bin/uninstall-remote.py" "$MANIFEST" "$PLUGIN_NAME" "$PROFILE_DIR" "$DRY_RUN"
+  if grep -q "ui-remote" "$PATCH_FILE" 2>/dev/null; then
+    echo
+    echo "внимание: в $PATCH_FILE есть строка 'ui-remote' — это ручная вставка ряда." >&2
+    echo "плагин продолжил бы монтироваться; уберите её руками, если она ваша." >&2
+  fi
+  echo
+  echo "готово. Перезапустите профиль, чтобы плагин перестал подниматься."
+  exit 0
+fi
 
 # --- совместимость (032/035) -------------------------------------------------
 # Перед установкой проверяем, что пакет хотя бы парсится и что состояние из

@@ -21,9 +21,11 @@
  */
 
 import { DEFAULT_CAPS } from "../transport/base.js";
-import { TELEGRAM_TOKEN_REF, createRemoteCommands } from "../commands.js";
+import { MAX_TOKEN_REF, TELEGRAM_TOKEN_REF, createRemoteCommands } from "../commands.js";
 import { createCredentialAccess, createStore } from "../store.js";
 import { createTelegramTransport } from "../transport/telegram.js";
+import { RELAY_TOKEN_REF, createRelayTransport } from "../transport/relay.js";
+import { createMaxTransport, maxApiBaseFromConfig } from "../transport/max.js";
 import { answererFeature } from "./answerer.js";
 
 /** Имя сервиса транспорта: то же, что ждёт фича answerer в своих `needs`. */
@@ -139,14 +141,130 @@ function createTransportFacade() {
  * изменились: после `/remote disconnect` + `/remote connect` старый поллер с
  * прежним токеном не должен продолжать работать.
  */
-async function ensureTransport(ctx, store, deps, facade, isDisposed = () => false) {
+async function ensureTransport(ctx, store, deps, facade, isDisposed = () => false, config = null) {
   const log = (message) => deps.logger.debug(message);
   const binding = store.read().bindings;
+  /** 048: явная база MAX из конфига — фолбэк тогда не нужен. */
+  const configuredMaxBase = maxApiBaseFromConfig(config);
 
-  if (binding === null || binding.transport !== "telegram") {
+  // 038: привязка на релей — канал создаём здесь же, чтобы `/remote connect relay`
+  // переключал публикацию сразу, а не только после перезагрузки профиля.
+  if (binding !== null && binding.transport === "relay") {
+    const credentials = createCredentialAccess(ctx, { log });
+    const relaySettings = config?.relay !== null && typeof config?.relay === "object" ? config.relay : {};
+    const tokenRef = typeof relaySettings.tokenRef === "string" && relaySettings.tokenRef !== "" ? relaySettings.tokenRef : RELAY_TOKEN_REF;
+    const token = await credentials.resolve(tokenRef);
+    if (isDisposed()) {
+      await facade.stop();
+      return null;
+    }
+    if (token === null) {
+      deps.logger.warn(`фича commands: привязка на релей, а секрета ${tokenRef} нет — канал не поднят`);
+      return null;
+    }
+    const key = `relay|${binding.url ?? ""}|${token}`;
+    const currentRelay = facade.current;
+    if (currentRelay !== null && currentRelay.__bindingKey === key) return currentRelay;
+    if (currentRelay !== null) await facade.stop();
+    let relayTransport;
+    try {
+      relayTransport = createRelayTransport({
+        url: binding.url,
+        agentToken: token,
+        fetch: relaySettings.fetch,
+        wsFactory: relaySettings.wsFactory,
+        log: (message) => deps.logger.debug(message),
+      });
+    } catch (error) {
+      deps.logger.warn(`фича commands: транспорт релея не создан (${error?.message ?? error})`);
+      return null;
+    }
+    relayTransport.__bindingKey = key;
+    facade.set(relayTransport);
+    try {
+      await relayTransport.start();
+    } catch (error) {
+      deps.logger.warn(`фича commands: канал релея не стартовал (${error?.message ?? error})`);
+    }
+    deps.logger.info("фича commands: канал релея поднят из сохранённой привязки");
+    return relayTransport;
+  }
+
+  // 039: привязка на MAX — канал создаём здесь же, чтобы `/remote connect MAX`
+  // начинал публиковать сразу, без перезагрузки профиля.
+  if (binding !== null && binding.transport === "max") {
+    const credentials = createCredentialAccess(ctx, { log });
+    const maxSettings = config?.max !== null && typeof config?.max === "object" ? config.max : {};
+    const tokenRef = typeof maxSettings.tokenRef === "string" && maxSettings.tokenRef !== "" ? maxSettings.tokenRef : MAX_TOKEN_REF;
+    const token = await credentials.resolve(tokenRef);
+    if (isDisposed()) {
+      await facade.stop();
+      return null;
+    }
+    if (token === null) {
+      // Секрет пропал/ротировался: старый MAX-поллер с прежним токеном не должен
+      // продолжать работать (052) — как в telegram-ветке.
+      await facade.stop();
+      deps.logger.warn(`фича commands: привязка на MAX, а секрета ${tokenRef} нет — канал не поднят`);
+      return null;
+    }
+    const key = `max|${binding.chatId ?? ""}|${binding.userId ?? ""}|${token}`;
+    const currentMax = facade.current;
+    if (currentMax !== null && currentMax.__bindingKey === key) return currentMax;
+    if (currentMax !== null) await facade.stop();
+    let maxTransport;
+    try {
+      maxTransport = createMaxTransport({
+        token,
+        chatId: binding.chatId ?? null,
+        userId: binding.userId ?? null,
+        allowedUserIds: binding.userId === null || binding.userId === undefined ? [] : [binding.userId],
+        ...(Number.isFinite(binding.marker) ? { marker: binding.marker } : {}),
+        persistMarker: (marker) => {
+          try {
+            store.update((state) => {
+              if (state.bindings !== null && state.bindings.transport === "max") state.bindings.marker = marker;
+              return state;
+            });
+          } catch (error) {
+            deps.logger.debug(`фича commands: marker MAX не сохранён (${error?.message ?? error})`);
+          }
+        },
+        // 048: явная база (config.maxApiBase главнее config.max.apiBase) отключает
+        // фолбэк; не задана — transport сам уйдёт с api2 на platform-api.max.ru по TLS.
+        ...(configuredMaxBase === null ? {} : { apiBase: configuredMaxBase }),
+        ...(typeof maxSettings.fetch === "function" ? { fetch: maxSettings.fetch } : {}),
+        ...(Number.isFinite(maxSettings.pollTimeoutSec) ? { pollTimeoutSec: maxSettings.pollTimeoutSec } : {}),
+        log: (message) => deps.logger.debug(message),
+      });
+    } catch (error) {
+      deps.logger.warn(`фича commands: транспорт MAX не создан (${error?.message ?? error})`);
+      return null;
+    }
+    maxTransport.__bindingKey = key;
+    maxTransport.__token = token;
+    facade.set(maxTransport);
+    try {
+      await maxTransport.start();
+    } catch (error) {
+      deps.logger.warn(`фича commands: канал MAX не стартовал (${error?.message ?? error})`);
+    }
+    deps.logger.info("фича commands: канал MAX поднят из сохранённой привязки");
+    return maxTransport;
+  }
+
+  // 052: MAX обрабатывается отдельной веткой ниже; в «не telegram» его не
+  // отправляем, иначе ветка max недостижима и канал не поднимается.
+  if (binding === null || (binding.transport !== "telegram" && binding.transport !== "max")) {
     // Канал из config.telegram (004) мы не создавали — его не гасим: без привязки
     // в состоянии он и есть рабочий канал.
     const adopted = facade.current;
+    const boundId = typeof binding?.transport === "string" ? binding.transport : null;
+    if (boundId !== null) {
+      // 038: привязка на другой транспорт (relay/max) — config-канал не активен.
+      if (adopted !== null && adopted.id === boundId) return adopted;
+      return null;
+    }
     if (adopted !== null && adopted.__bindingKey === undefined) return adopted;
     if (adopted !== null) await facade.stop();
     return null;
@@ -203,7 +321,10 @@ export const commandsFeature = {
   needs: [],
   async apply(ctx, config, deps) {
     const log = (message) => deps.logger.debug(message);
+    const trace = deps.trace ?? (() => {});
+    trace("commands:старт");
     const store = createStore({ log });
+    trace("commands:store создан");
 
     /** Выгрузили ли плагин, пока мы ждали credentials.resolve. */
     let disposed = false;
@@ -214,6 +335,7 @@ export const commandsFeature = {
     // Реестр каналов (012): в него складывают транспорты фичи telegram/max,
     // чтобы ответчик мог публиковать вопрос сразу в несколько.
     const transportRegistry = new Map();
+    deps.expose?.("remoteTransports", transportRegistry);
     try {
       ctx.provide?.("remoteTransports", transportRegistry);
     } catch (error) {
@@ -221,6 +343,7 @@ export const commandsFeature = {
     }
 
     // Состояние как сервис: ответчик читает его для реестра режима.
+    deps.expose?.(STATE_SERVICE, store);
     try {
       ctx.provide?.(STATE_SERVICE, store);
     } catch (error) {
@@ -230,9 +353,13 @@ export const commandsFeature = {
     // Фасад регистрируем всегда: он же управляет каналом из config.telegram (004),
     // который фича telegram положит внутрь (adopt), а connect/disconnect смогут
     // остановить и заменить.
+    trace("commands:сервисы provide");
     const existing = ctx?.get?.(TRANSPORT_SERVICE) ?? null;
     const facade = existing?.__isTransportFacade === true ? existing : createTransportFacade();
-    if (existing !== null && existing !== facade) facade.set(existing);
+    /** Чужой транспорт (из config или тестов): его нельзя терять при старте. */
+    const foreign = existing !== null && existing !== facade ? existing : null;
+    if (foreign !== null) facade.set(foreign);
+    deps.expose?.(TRANSPORT_SERVICE, facade);
     if (existing === null || existing !== facade) {
       try {
         ctx.provide?.(TRANSPORT_SERVICE, facade);
@@ -251,7 +378,7 @@ export const commandsFeature = {
     /** Стартовый подъём канала: ответчика применит каркас (порядок фич). */
     const ensureAtStart = async () => {
       if (disposed) return null;
-      const transport = await ensureTransport(ctx, store, deps, facade, () => disposed);
+      const transport = await ensureTransport(ctx, store, deps, facade, () => disposed, config);
       if (disposed) {
         await facade.stop();
         return null;
@@ -259,13 +386,22 @@ export const commandsFeature = {
       return transport;
     };
 
-    /** Хук для connect: канал поднимаем и ответчика применяем сразу, если ещё нет. */
+    /**
+     * Хук для connect: канал поднимаем и фичи, ждавшие `remoteTransport`,
+     * поднимаем сразу — иначе `reliability`/`answerer`/`approvals` остались бы
+     * пропущенными до перезапуска, и вопрос некуда было бы отправить.
+     */
     const ensure = async () => {
       const transport = await ensureAtStart();
       if (transport !== null) transportRegistry.set(transport.id ?? "telegram", transport);
       if (transport !== null && !answererReady) {
         answererReady = true;
-        await answererFeature.apply(ctx, config, deps);
+        if (typeof deps.retryPending === "function") {
+          await deps.retryPending("канал поднят");
+        } else {
+          // Фолбэк для хостов без каркасного `retryPending` (тесты, старые версии).
+          await answererFeature.apply(ctx, config, deps);
+        }
       }
       return transport;
     };
@@ -273,13 +409,69 @@ export const commandsFeature = {
     // 012: в мультиканальном режиме фасад пуст, каналы живут в реестре —
     // status/on должны видеть хотя бы один живой канал.
     const currentChannel = () => facade.current ?? [...transportRegistry.values()][0] ?? null;
-    const remote = createRemoteCommands({ ctx, store, log, ensureTransport: ensure, currentChannel });
+    trace("commands:createRemoteCommands");
+    const configuredMaxBase = maxApiBaseFromConfig(config);
+    const remote = createRemoteCommands({
+      ctx,
+      store,
+      log,
+      ensureTransport: ensure,
+      currentChannel,
+      lang: config?.lang ?? null,
+      // 039: long polling для pairing MAX; можно переопределить в config.max.
+      ...(Number.isFinite(config?.max?.pollTimeoutSec) ? { maxPairingPollTimeoutSec: config.max.pollTimeoutSec } : {}),
+      ...(Number.isFinite(config?.max?.pairingDeadlineMs) ? { maxPairingDeadlineMs: config.max.pairingDeadlineMs } : {}),
+      // 048: config.maxApiBase — явная база MAX (фолбэк тогда выключен).
+      ...(configuredMaxBase === null ? {} : { maxApiBase: configuredMaxBase }),
+    });
+    trace("commands:register");
     deps.onDispose(remote.register(), "commands");
+    trace("commands:зарегистрирована");
 
     // Привязка из прошлого запуска: поднимаем канал до того, как каркас дойдёт до
     // фичи ответчика, — её `needs` уже будут выполнены.
-    const transport = await ensureAtStart();
+    trace("commands:ensureAtStart");
+    let transport = await ensureAtStart();
+    // Чужой транспорт мог быть снят внутри ensureTransport (например, при
+    // отсутствии привязки он решает «канала нет»). Но если он был в контексте —
+    // это рабочий канал (config.telegram или тестовый), возвращаем его на место.
+    if (facade.current === null && foreign !== null) facade.set(foreign);
+    trace(`commands:чужой транспорт ${foreign === null ? "не было" : facade.current === foreign ? "на месте" : "не удержан"}`);
+    trace(`commands:ensureAtStart готов (${transport === null ? "канала нет" : transport.id ?? "канал"})`);
     if (transport !== null) answererReady = true;
+
+    // Канал мог не подняться на старте: например, сервис секретов cordis
+    // монтируется позже плагина, и `credentials.resolve` вернул null (живой сбой
+    // 2026-11-11: после перезапуска бот молчал, хотя привязка была в состоянии).
+    // Поэтому пробуем ещё несколько раз с паузой, пока канал не встанет.
+    if (transport === null) {
+      const delays = [1000, 3000, 7000, 15000];
+      let attempt = 0;
+      const retry = async () => {
+        if (disposed || facade.current !== null) return;
+        attempt += 1;
+        trace(`commands:повтор подъёма канала #${attempt}`);
+        try {
+          const started = await ensureAtStart();
+          if (started !== null) {
+            transportRegistry.set(started.id ?? "telegram", started);
+            answererReady = true;
+            trace(`commands:канал поднят повтором #${attempt}`);
+            return;
+          }
+        } catch (error) {
+          deps.logger.warn(`фича commands: повтор подъёма канала не удался (${error?.message ?? error})`);
+        }
+        if (attempt < delays.length) {
+          const timer = setTimeout(() => void retry(), delays[attempt]);
+          timer.unref?.();
+          deps.onDispose(() => clearTimeout(timer), "timers");
+        }
+      };
+      const first = setTimeout(() => void retry(), delays[0]);
+      first.unref?.();
+      deps.onDispose(() => clearTimeout(first), "timers");
+    }
 
     deps.logger.info("фича commands: /remote зарегистрирована");
     // Возвращаем точку подъёма канала: тестам она нужна, чтобы проверить

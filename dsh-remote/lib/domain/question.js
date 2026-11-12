@@ -19,6 +19,9 @@
 
 import { randomBytes, randomUUID } from "node:crypto";
 
+import { normalizeQuickReplies } from "../quick-replies.js";
+import { normalizeLang } from "../i18n.js";
+
 /** Статусы вопроса. `pending` — создан, но ещё не отправлен. */
 export const QUESTION_STATUS = Object.freeze({
   pending: "pending",
@@ -101,6 +104,9 @@ export class RemoteQuestion {
     this.workspace = context.workspace ?? null;
     this.role = context.role ?? null;
     this.taskId = context.taskId ?? null;
+    /** 047: короткая ссылка на ветку/рабочее дерево задачи (для подсказки). */
+    this.branch = typeof context.branch === "string" && context.branch !== "" ? context.branch : null;
+    this.worktree = typeof context.worktree === "string" && context.worktree !== "" ? context.worktree : null;
     /** 015: канал проекта (`chatId` + опциональный `threadId` топика). */
     this.chatId = context.chatId ?? null;
     this.threadId = context.threadId ?? null;
@@ -112,6 +118,9 @@ export class RemoteQuestion {
     this.multiSelect = item.multiSelect === true;
     /** Свободный ответ: у plan-review его нет — там выбор из «approve/decline». */
     this.allowFreeText = item.intent?.kind === "plan-review" ? false : true;
+    /** 044: быстрые ответы для вопроса без вариантов (конфиг плагина). */
+    this.lang = normalizeLang(context.lang) ?? "ru";
+    this.quickReplies = normalizeQuickReplies(context.quickReplies, this.lang);
     this.createdAt = now;
     this.expiresAt = now + ttlMs;
     this.status = QUESTION_STATUS.pending;
@@ -260,6 +269,8 @@ export class RemoteQuestion {
       workspace: this.workspace,
       role: this.role,
       taskId: this.taskId,
+      branch: this.branch,
+      worktree: this.worktree,
       title: this.title,
       body: this.body,
       options: this.options,
@@ -284,5 +295,13 @@ export function createQuestion(item, context = {}) {
 
 /** Вопросы запроса одной пачкой: один контекст на всю пачку. */
 export function createQuestions(items, context = {}) {
-  return (Array.isArray(items) ? items : []).map((item) => createQuestion(item, context));
+  const list = Array.isArray(items) ? items : [];
+  // Номер и всего вопросов — для шапки сообщения («вопрос 2/2»): в мессенджере
+  // пачка выглядит как несколько сообщений, и человек должен видеть, сколько их.
+  return list.map((item, index) => {
+    const question = createQuestion(item, context);
+    question.index = index + 1;
+    question.total = list.length;
+    return question;
+  });
 }

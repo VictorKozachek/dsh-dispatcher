@@ -1,0 +1,11 @@
+Проверь патч:
+
+<pre>if (a &lt; b &amp;&amp; c &gt; d) {
+  return "x &amp; y";
+}</pre>
+
+<pre>--- a/dsh-remote/lib/x.js
++++ b/dsh-remote/lib/x.js
+@@ -1,2 +1,2 @@
+-const old = 1;
++const next = 2;</pre>

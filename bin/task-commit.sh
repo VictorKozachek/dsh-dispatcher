@@ -9,7 +9,12 @@
 #   [{SHORT_BRANCH_NAME}] Message
 #
 # Короткое имя берётся из ветки задачи: ключ трекера, если он есть в имени
-# (release/NJ-001 → NJ-001), иначе последний сегмент (task/007 → 007).
+# (release/NJ-001 → NJ-001), иначе последний сегмент (feature/007 → 007,
+# bug/007 → 007).
+#
+# Куда мержит: в develop (рабочая ветка). Слияние задачи прямо в main запрещено —
+# main собирается из develop скриптом bin/release.sh после ревью и тестов.
+# Переопределение цели — $KANBAN_TARGET_BRANCH или --allow-main (осознанно).
 #
 # Пуш не делает никто из агентов: git push — ручная операция человека, когда все
 # задачи готовы и закоммичены. Скрипт только мержит и коммитит локально.
@@ -62,13 +67,14 @@ require_value() {
 }
 
 id="${1#\#}"; shift
-MESSAGE=""; BRANCH=""; DRY_RUN=0; NO_MERGE=0; REASON=""
+MESSAGE=""; BRANCH=""; DRY_RUN=0; NO_MERGE=0; REASON=""; ALLOW_MAIN=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --message)
       if [[ $# -lt 2 ]]; then echo "--message требует значения" >&2; exit 2; fi
       require_value --message "$2"; MESSAGE="$2"; shift 2 ;;
     --message=*) MESSAGE="${1#*=}"; shift ;;
+    --allow-main) ALLOW_MAIN=1; shift ;;
     --branch)
       if [[ $# -lt 2 ]]; then echo "--branch требует значения" >&2; exit 2; fi
       require_value --branch "$2"; BRANCH="$2"; shift 2 ;;
@@ -125,7 +131,16 @@ MSG
   exit 1
 fi
 
-[[ -n "$BRANCH" ]] || BRANCH="task/$id"
+# Ветка задачи: feature/<id>, bug/<id> или унаследованная task/<id>.
+if [[ -z "$BRANCH" ]]; then
+  for candidate in "feature/$id" "bug/$id" "task/$id"; do
+    if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$candidate"; then
+      BRANCH="$candidate"
+      break
+    fi
+  done
+  [[ -n "$BRANCH" ]] || BRANCH="feature/$id"
+fi
 
 # Рабочее дерево задачи по её ветке — в нём карточка и живёт до слияния.
 worktree_for_branch() {
@@ -188,7 +203,15 @@ branch_exists() {
   git -C "$ROOT" show-ref --verify --quiet "refs/heads/$candidate" || [[ -n "$(worktree_for_branch "$candidate")" ]]
 }
 
-task_branch="task/$id"
+# Куда смотреть, если ветки задачи нет: сначала feature/, потом bug/ и task/.
+task_branch=""
+for candidate in "feature/$id" "bug/$id" "task/$id"; do
+  if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$candidate"; then
+    task_branch="$candidate"
+    break
+  fi
+done
+[[ -n "$task_branch" ]] || task_branch="feature/$id"
 
 if (( NO_MERGE == 1 )); then
   if [[ -z "$(printf '%s' "$REASON" | tr -d '[:space:]')" ]]; then
@@ -245,7 +268,13 @@ MESSAGE="$(printf '%s' "$MESSAGE" | tr '\n' ' ' | sed -e 's/[[:space:]]\{1,\}/ /
 short="$(short_branch_name "$BRANCH")"
 subject="[$short] $MESSAGE"
 body="Card: $id (kanban, branch $BRANCH)"
-target="$(git -C "$ROOT" symbolic-ref --short -q HEAD || echo main)"
+target="${KANBAN_TARGET_BRANCH:-$(git -C "$ROOT" symbolic-ref --short -q HEAD || echo develop)}"
+if [[ "$target" == "main" && "$ALLOW_MAIN" -eq 0 ]] && git -C "$ROOT" show-ref --verify --quiet refs/heads/develop; then
+  echo "слияние задачи в main запрещено протоколом: рабочая ветка — develop." >&2
+  echo "main собирается из develop скриптом bin/release.sh после ревью и тестов." >&2
+  echo "осознанный обход (например, hotfix релиза): --allow-main" >&2
+  exit 1
+fi
 
 # Ветка может существовать и быть уже влитой: тогда слияние не создаёт коммита,
 # и обещать его нельзя. Отличаем «сливать нечего» от настоящего слияния.

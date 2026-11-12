@@ -36,10 +36,168 @@ import {
   splitText,
   throttle,
 } from "./base.js";
-import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderRows } from "../present.js";
+import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderHtml, renderRows } from "../present.js";
 
 /** Базовый адрес MAX Bot API: документация просит именно platform-api2. */
 export const MAX_API_BASE = "https://platform-api2.max.ru";
+
+/**
+ * Запасной адрес **того же** MAX Bot API (048).
+ *
+ * Сертификат `platform-api2.max.ru` выписан Russian Trusted Sub CA (Минцифры), а
+ * его корня нет в trust store macOS/Node — первый же `GET /me` падает с
+ * `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`. У `platform-api.max.ru` обычный публичный
+ * CA и тот же API, поэтому при TLS/сетевой ошибке запрос повторяется туда.
+ * Переопределение хоста (`maxApiBase`/`MAX_API_BASE`) фолбэк отключает.
+ */
+export const MAX_API_FALLBACK_BASE = "https://platform-api.max.ru";
+
+/** Коды Node/OpenSSL, которые означают «сертификат не принят». */
+const MAX_TLS_CODES = new Set([
+  "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+  "UNABLE_TO_GET_ISSUER_CERT",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "UNABLE_TO_DECRYPT_CERT_SIGNATURE",
+  "SELF_SIGNED_CERT_IN_CHAIN",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "CERT_HAS_EXPIRED",
+  "CERT_NOT_YET_VALID",
+  "CERT_UNTRUSTED",
+]);
+
+/** Коды сетевых сбоев (сюда же попадает undici: `fetch failed`). */
+const MAX_NETWORK_CODES = new Set([
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ECONNABORTED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ETIMEDOUT",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EPIPE",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+]);
+
+/**
+ * Развернуть ошибку (включая `cause` undici и `AggregateError.errors`) в коды и
+ * тексты. `fetch failed` — это обёртка: настоящая причина лежит в `cause`.
+ */
+function maxErrorFacts(error) {
+  const codes = [];
+  const texts = [];
+  const seen = new Set();
+  const visit = (value) => {
+    if (value === null || typeof value !== "object" || seen.has(value)) return;
+    seen.add(value);
+    if (typeof value.code === "string") codes.push(value.code);
+    if (typeof value.message === "string") texts.push(value.message);
+    if (Array.isArray(value.errors)) for (const item of value.errors) visit(item);
+    visit(value.cause);
+  };
+  visit(error);
+  return { codes, texts };
+}
+
+/** Это TLS-ошибка (сертификат не принят)? */
+export function isMaxTlsError(error) {
+  const { codes, texts } = maxErrorFacts(error);
+  if (codes.some((code) => MAX_TLS_CODES.has(code) || /^ERR_TLS_|^ERR_SSL_/.test(code))) return true;
+  return texts.some((text) => /certificate|issuer|self[- ]signed|TLS|SSL/i.test(text));
+}
+
+/**
+ * Это сетевой сбой (включая TLS)? Фолбэк хоста включается только на них: 401,
+ * 403 и 429 — это токен и лимиты, подмена хоста там только запутает.
+ */
+export function isMaxNetworkError(error) {
+  if (isMaxTlsError(error)) return true;
+  const { codes, texts } = maxErrorFacts(error);
+  if (codes.some((code) => MAX_NETWORK_CODES.has(code) || /^ERR_NETWORK|^UND_ERR_/.test(code))) return true;
+  return texts.some((text) => /fetch failed|socket hang up|network|timed? ?out|ECONN|ENOTFOUND|EAI_AGAIN/i.test(text));
+}
+
+function nonEmptyBase(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+/** Хост с портом для человеческого текста; кривой URL возвращаем как есть. */
+export function maxHostOf(base) {
+  try {
+    return new URL(base).host;
+  } catch {
+    return String(base ?? "");
+  }
+}
+
+/**
+ * Куда обращаться: явное переопределение (`maxApiBase`/`MAX_API_BASE`) или
+ * штатный api2 с запасной базой (тот же API, публичный CA).
+ *
+ * @param {object} options
+ * @param {string} [options.apiBase] — явная база (config.maxApiBase, тесты).
+ * @param {object} [options.env] — окружение (по умолчанию `process.env`).
+ * @returns {{primary: string, fallback: (string|null), overridden: boolean}}
+ */
+export function maxApiEndpoint({ apiBase, env = globalThis.process?.env ?? {} } = {}) {
+  const explicit = nonEmptyBase(apiBase) ?? nonEmptyBase(env?.MAX_API_BASE);
+  if (explicit !== null) return { primary: explicit, fallback: null, overridden: true };
+  return { primary: MAX_API_BASE, fallback: MAX_API_FALLBACK_BASE, overridden: false };
+}
+
+/**
+ * Явная база из конфига профиля (048): `config.maxApiBase` главнее
+ * `config.max.apiBase`, пустая строка — «не задано».
+ */
+export function maxApiBaseFromConfig(config) {
+  const top = nonEmptyBase(config?.maxApiBase);
+  if (top !== null) return top;
+  return nonEmptyBase(config?.max?.apiBase);
+}
+
+/**
+ * Понятная ошибка «MAX недоступен»: без `fetch failed` и без токена.
+ *
+ * Для TLS-причины объясняем про Russian Trusted CA и даём два варианта
+ * (фолбэк на `platform-api.max.ru` или `NODE_EXTRA_CA_CERTS`); для сети —
+ * про прокси/файрвол. Код `MAX_TLS`/`MAX_NETWORK` позволяет команде `connect`
+ * не писать сверху «MAX не принял токен».
+ */
+export function maxUnreachableError({ primary, fallback = null, tried = [] } = {}) {
+  const items = (Array.isArray(tried) ? tried : []).filter((item) => item !== null && item !== undefined);
+  const hosts = items.length > 0
+    ? items.map((item) => maxHostOf(item.base))
+    : [maxHostOf(primary ?? MAX_API_BASE)];
+  const tls = items.some((item) => isMaxTlsError(item.error));
+
+  if (tls) {
+    const fallbackHost = maxHostOf(fallback ?? MAX_API_FALLBACK_BASE);
+    const both = hosts.length > 1 ? ` Пробовали ${hosts.join(" и ")} — TLS не прошёл ни там, ни там.` : "";
+    const fallbackOption = fallback === null
+      ? `(а) убрать переопределение хоста (maxApiBase/MAX_API_BASE) — тогда плагин сам повторит запрос на ${fallbackHost}`
+      : `(а) оставить фолбэк на ${fallbackHost} — плагин повторяет запрос туда автоматически`;
+    const message = `TLS к MAX не проходит: сертификат ${hosts[0]} выписан Russian Trusted Sub CA (Минцифры), `
+      + `и его корня нет в доверенных хранилищах macOS/Node.${both} `
+      + `Варианты: ${fallbackOption}; (б) добавить корень Минцифры в доверенные: `
+      + "NODE_EXTRA_CA_CERTS=/путь/к/russian_trusted_root_ca.pem";
+    const error = new Error(message);
+    error.code = "MAX_TLS";
+    error.tried = items.map((item) => ({ base: item.base, error: item.error }));
+    return error;
+  }
+
+  const message = `MAX недоступен по сети: ${hosts.join(" и ")}. `
+    + "Проверьте интернет, прокси и файрвол; хост можно задать явно через maxApiBase или MAX_API_BASE.";
+  const error = new Error(message);
+  error.code = "MAX_NETWORK";
+  error.tried = items.map((item) => ({ base: item.base, error: item.error }));
+  return error;
+}
 
 /** Возможности MAX: кнопки есть, править можно, текст ≤ 4000, вариантов ≤ 7. */
 export const MAX_CAPS = Object.freeze({
@@ -51,6 +209,12 @@ export const MAX_CAPS = Object.freeze({
 
 /** Лимит платформы: не больше 2 запросов в секунду в один чат. */
 export const MAX_CHAT_RPS_INTERVAL_MS = 500;
+
+/**
+ * Таймаут long polling для pairing (`GET /updates?timeout=…`), секунды.
+ * 039: без него MAX-опрос был бы коротким раз в секунду (лишняя нагрузка).
+ */
+export const MAX_PAIRING_POLL_TIMEOUT_SEC = 5;
 
 /** Причины, при которых сообщение закрывается молчаливой пометкой. */
 const QUIET_REASONS = new Set([
@@ -101,6 +265,44 @@ function clipEscaped(text, limit) {
   return `${cut}…`;
 }
 
+/**
+ * 047: HTML обязан влезть в `caps.maxText`, не разрывая `<pre>/<code>`.
+ *
+ * Сначала ужимаем **plain-текст** (renderBody сам держит место под подсказку),
+ * затем рендерим HTML. Если теги/экранирование всё же вывели за лимит — режем
+ * готовый HTML по границе тега и закрываем открытые `<pre>/<code>`, а не как
+ * раньше «по сырым символам» с незакрытым `<pre>`.
+ */
+function clipHtml(text, limit) {
+  if (text.length <= limit) return text;
+  let cut = text.slice(0, Math.max(0, limit - 8));
+  const lastOpen = cut.lastIndexOf("<");
+  const lastClose = cut.lastIndexOf(">");
+  if (lastOpen > lastClose) cut = cut.slice(0, lastOpen);
+  const preOpen = (cut.match(/<pre>/g) ?? []).length - (cut.match(/<\/pre>/g) ?? []).length;
+  const codeOpen = (cut.match(/<code>/g) ?? []).length - (cut.match(/<\/code>/g) ?? []).length;
+  let suffix = "…";
+  for (let index = 0; index < Math.max(0, codeOpen); index += 1) suffix += "</code>";
+  for (let index = 0; index < Math.max(0, preOpen); index += 1) suffix += "</pre>";
+  return `${cut.slice(0, Math.max(0, limit - suffix.length))}${suffix}`;
+}
+
+/** 047: plain → HTML с бюджетом на теги, без обрыва подсказки. */
+function renderMaxHtml(question, caps) {
+  const max = Number.isFinite(caps?.maxText) ? caps.maxText : MAX_CAPS.maxText;
+  let budget = max;
+  let html = "";
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const plain = renderBody(question, { ...caps, maxText: budget });
+    html = renderHtml(plain);
+    if (html.length <= max) return html;
+    budget = Math.max(40, budget - (html.length - max) - 8);
+  }
+  const plain = renderBody(question, { ...caps, maxText: Math.max(40, max - 64) });
+  html = renderHtml(plain);
+  return html.length <= max ? html : clipHtml(html, max);
+}
+
 /** Вырезать токен из произвольного текста (сервер может его отразить). */
 function maskToken(text, secret) {
   if (typeof secret !== "string" || secret === "") return String(text ?? "");
@@ -140,7 +342,13 @@ export function createMaxTransport(options = {}) {
     throw new TypeError("max: нужен токен бота");
   }
   const token = options.token;
-  const apiBase = typeof options.apiBase === "string" && options.apiBase !== "" ? options.apiBase : MAX_API_BASE;
+  // 048: штатно api2, а при TLS/сетевой ошибке — platform-api.max.ru (тот же API).
+  // Явный apiBase (config.maxApiBase/MAX_API_BASE) фолбэк отключает.
+  const endpoint = maxApiEndpoint({ apiBase: options.apiBase });
+  let activeBase = endpoint.primary;
+  let fallbackUsed = false;
+  /** Последние ошибки по базам: из них собирается понятный текст (048). */
+  let triedBases = [];
   const doFetch = typeof options.fetch === "function" ? options.fetch : globalThis.fetch;
   const now = typeof options.now === "function" ? options.now : Date.now;
   const sleep = typeof options.sleep === "function"
@@ -177,15 +385,18 @@ export function createMaxTransport(options = {}) {
 
   /** Один HTTP-вызов MAX с авторизацией заголовком и ретраями 429/503/сеть. */
   async function request(method, path, { query, body, signal, attempts = maxAttempts } = {}) {
-    const url = new URL(path, apiBase);
-    for (const [key, value] of Object.entries(query ?? {})) {
-      if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
-    }
+    const urlOf = (base) => {
+      const url = new URL(path, base);
+      for (const [key, value] of Object.entries(query ?? {})) {
+        if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+      }
+      return url;
+    };
     let remaining = attempts;
     for (let attempt = 1; ; attempt += 1) {
       let response;
       try {
-        response = await doFetch(url.toString(), {
+        response = await doFetch(urlOf(activeBase).toString(), {
           method,
           headers: {
             authorization: token,
@@ -195,14 +406,44 @@ export function createMaxTransport(options = {}) {
           ...(signal === undefined ? {} : { signal }),
         });
       } catch (error) {
+        // Отмена — не сбой сети: отдаём как есть, фолбэк и текст про TLS не нужны.
+        if (signal?.aborted) throw error;
+        const recorded = triedBases.find((item) => item.base === activeBase);
+        if (recorded === undefined) triedBases.push({ base: activeBase, error });
+        else recorded.error = error;
+        // 048: TLS/сеть на api2 — сразу пробуем запасной хост, попытку не тратим.
+        if (endpoint.fallback !== null && activeBase !== endpoint.fallback && isMaxNetworkError(error)) {
+          activeBase = endpoint.fallback;
+          fallbackUsed = true;
+          log(`max: ${maxHostOf(endpoint.primary)} недоступен по TLS/сети (${describeError(error, token)}) — `
+            + `повторяю запрос через ${maxHostOf(endpoint.fallback)}`);
+          continue;
+        }
         remaining -= 1;
-        lastError = error;
-        if (remaining <= 0 || signal?.aborted) throw error;
+        if (remaining <= 0) {
+          // 048: понятный текст — про TLS (сертификат Минцифры); обычный сбой сети
+          // отдаём как есть, чтобы не выдавать сетевую проблему за сертификат.
+          if (triedBases.some((item) => isMaxTlsError(item.error))) {
+            const friendly = maxUnreachableError({
+              primary: endpoint.primary,
+              fallback: endpoint.fallback,
+              tried: triedBases,
+            });
+            lastError = friendly;
+            throw friendly;
+          }
+          lastError = error;
+          throw error;
+        }
         await sleep(jitter(500 * 2 ** (attempt - 1)));
         continue;
       }
       const status = response.status;
-      if (status === 200) return response.json();
+      if (status === 200) {
+        // Успех: прежние сетевые ошибки больше не описывают текущее состояние.
+        triedBases = [];
+        return response.json();
+      }
       const text = maskToken(await safeText(response), token);
       const error = new Error(`MAX ${method} ${path}: ${status}${text === "" ? "" : ` ${text}`}`);
       error.status = status;
@@ -228,12 +469,14 @@ export function createMaxTransport(options = {}) {
 
   /** Ключ дедупа: глобального update_id у MAX нет. */
   function dedupeKey(update) {
-    const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? update?.callback?.chat?.chat_id ?? "";
+    const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? update?.callback?.chat?.chat_id
+      ?? update?.message?.recipient?.chat_id ?? update?.callback?.message?.recipient?.chat_id ?? "";
     const stamp = update?.timestamp ?? update?.message?.timestamp ?? update?.callback?.timestamp ?? "";
-    const identity = update?.type === "message_callback"
+    const type = updateType(update);
+    const identity = type === "message_callback"
       ? update?.callback?.callback_id ?? ""
       : update?.message?.body?.mid ?? update?.message?.mid ?? "";
-    return createHash("sha256").update(`${chat}|${update?.type ?? ""}|${identity}|${stamp}`).digest("hex");
+    return createHash("sha256").update(`${chat}|${type ?? ""}|${identity}|${stamp}`).digest("hex");
   }
 
   /** Уже видели это обновление? */
@@ -275,9 +518,12 @@ export function createMaxTransport(options = {}) {
     if (allowed.size === 0) return false;
     const sender = senderOf(update);
     if (sender === null || !allowed.has(String(sender))) return false;
+    // 054: legacy-хост кладёт chat в message.recipient, а не в callback.chat.
     const updateChat = update?.chat?.chat_id
       ?? update?.callback?.chat?.chat_id
       ?? update?.message?.chat?.chat_id
+      ?? update?.message?.recipient?.chat_id
+      ?? update?.callback?.message?.recipient?.chat_id
       ?? null;
     if (chatId !== null) return updateChat !== null && allowedChatSet().has(String(updateChat));
     if (userId !== null) return String(sender) === String(userId);
@@ -321,25 +567,26 @@ export function createMaxTransport(options = {}) {
   /** Разобрать одно обновление. */
   async function handleUpdate(update) {
     if (isDuplicate(update)) {
-      log(`max: дубль обновления ${update?.type ?? "?"} — игнор`);
+      log(`max: дубль обновления ${updateType(update) ?? "?"} — игнор`);
       return;
     }
+    const type = updateType(update);
     // Служебные события привязки не являются ответами: allowlist к ним не
     // применяем, иначе пустой список (fail-closed) скрыл бы сам факт привязки.
-    if (update?.type === "bot_started" || update?.type === "bot_added") {
-      const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? null;
+    if (type === "bot_started" || type === "bot_added") {
+      const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? update?.message?.recipient?.chat_id ?? null;
       const user = update?.user?.user_id ?? update?.message?.sender?.user_id ?? null;
       if (chat !== null) detected.chatId = chat;
       if (user !== null) detected.userId = user;
-      log(`max: ${update.type} — бот подключён (chat_id ${chat ?? "?"}, user_id ${user ?? "?"})`);
+      log(`max: ${type} — бот подключён (chat_id ${chat ?? "?"}, user_id ${user ?? "?"})`);
       return;
     }
     if (!allowedSender(update)) {
-      log(`max: отправитель не в allowlist — игнор (${update?.type ?? "?"})`);
+      log(`max: отправитель не в allowlist — игнор (${type ?? "?"})`);
       return;
     }
 
-    if (update?.type === "message_callback") {
+    if (type === "message_callback") {
       const parsed = parseCallbackData(update?.callback?.payload);
       if (parsed === null) {
         log("max: колбэк без нашего payload — игнор");
@@ -365,7 +612,7 @@ export function createMaxTransport(options = {}) {
       return;
     }
 
-    if (update?.type === "message_created") {
+    if (type === "message_created") {
       const message = update.message;
       const text = typeof message?.body?.text === "string" ? message.body.text.trim() : "";
       if (text === "") return;
@@ -384,13 +631,9 @@ export function createMaxTransport(options = {}) {
       return;
     }
 
-    if (update?.type === "bot_started" || update?.type === "bot_added") {
-      const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? null;
-      const user = update?.user?.user_id ?? update?.message?.sender?.user_id ?? null;
-      if (chat !== null) detected.chatId = chat;
-      if (user !== null) detected.userId = user;
-      log(`max: ${update.type} — бот подключён (chat_id ${chat ?? "?"}, user_id ${user ?? "?"})`);
-    }
+    // 054: legacy-хост присылает update_type; неизвестный/неразобранный тип
+    // больше не теряется молча — в журнале видно, что именно пришло.
+    log(`max: неизвестный тип апдейта ${type ?? "(пусто)"} — игнор`);
   }
 
   /** Один цикл long polling. */
@@ -444,6 +687,23 @@ export function createMaxTransport(options = {}) {
     },
     get lastError() {
       return lastError;
+    },
+    /** Активная база MAX: после TLS-фолбэка здесь `platform-api.max.ru` (048). */
+    get apiBase() {
+      return activeBase;
+    },
+    /**
+     * Куда ходим и почему (048; doctor/status): `active` — рабочая база,
+     * `fallbackUsed` — сработал ли фолбэк, `overridden` — задан ли хост явно.
+     */
+    get endpoint() {
+      return {
+        primary: endpoint.primary,
+        fallback: endpoint.fallback,
+        active: activeBase,
+        fallbackUsed,
+        overridden: endpoint.overridden,
+      };
     },
     get polling() {
       return running;
@@ -513,7 +773,7 @@ export function createMaxTransport(options = {}) {
       const targetChat = sendOptions?.chatId ?? chatId;
       const query = targetChat !== null ? { chat_id: targetChat } : { user_id: userId };
 
-      const text = clipEscaped(escapeHtml(renderBody(question, caps)), caps.maxText);
+      const text = renderMaxHtml(question, caps);
       const keyboard = buildKeyboard(question);
       const attachments = keyboard.payload.buttons.length === 0 ? undefined : [keyboard];
 
@@ -657,6 +917,283 @@ export function createMaxTransport(options = {}) {
   };
 
   return transport;
+}
+
+/**
+ * Низкоуровневый вызов MAX API без транспорта (039): нужен для `connect`, пока
+ * нет chatId/userId — транспорт создаётся только после привязки.
+ */
+export async function maxApiRequest({
+  token,
+  method = "GET",
+  path,
+  query,
+  body,
+  apiBase,
+  fetch: doFetch = globalThis.fetch,
+  signal,
+  /** 050: предел одного HTTP-запроса (мс), чтобы pairing не висел вечно. */
+  timeoutMs = 15_000,
+  /** Внутренний хук (048): какой базой в итоге ответили — им пользуются connect/polling. */
+  onBase,
+  env = globalThis.process?.env ?? {},
+} = {}) {
+  if (typeof token !== "string" || token === "") throw new TypeError("max: нужен токен бота");
+  const endpoint = maxApiEndpoint({ apiBase, env });
+  const bases = endpoint.fallback === null ? [endpoint.primary] : [endpoint.primary, endpoint.fallback];
+  const tried = [];
+  let response = null;
+  let usedBase = null;
+  for (let index = 0; index < bases.length; index += 1) {
+    const base = bases[index];
+    const url = new URL(path, base);
+    for (const [key, value] of Object.entries(query ?? {})) {
+      if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+    }
+    try {
+      // 050: каждый запрос ограничен по времени; внешний signal (отмена вопроса)
+      // комбинируется с таймаутом, а не подменяется.
+      const timeoutSignal = typeof AbortSignal?.timeout === "function" && Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? AbortSignal.timeout(timeoutMs)
+        : null;
+      const combinedSignal = signal !== undefined && timeoutSignal !== null
+        ? (typeof AbortSignal?.any === "function" ? AbortSignal.any([signal, timeoutSignal]) : signal)
+        : (signal ?? timeoutSignal);
+      response = await doFetch(url.toString(), {
+        method,
+        headers: {
+          authorization: token,
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(combinedSignal === null || combinedSignal === undefined ? {} : { signal: combinedSignal }),
+      });
+      usedBase = base;
+      break;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        const timeoutError = new Error(`MAX ${method} ${path}: таймаут ${timeoutMs} мс`);
+        timeoutError.code = "MAX_TIMEOUT";
+        timeoutError.retryable = true;
+        throw timeoutError;
+      }
+      if (signal?.aborted) throw error;
+      tried.push({ base, error });
+      // 048: фолбэк только на TLS/сеть (401/403/429 — это токен и лимиты).
+      const hasNext = index < bases.length - 1;
+      if (hasNext && isMaxNetworkError(error)) continue;
+      if (tried.some((item) => isMaxTlsError(item.error))) {
+        throw maxUnreachableError({ primary: endpoint.primary, fallback: endpoint.fallback, tried });
+      }
+      throw new Error(`MAX ${method} ${path}: сеть недоступна (${describeError(error, token)})`);
+    }
+  }
+  if (typeof onBase === "function") {
+    onBase({
+      base: usedBase,
+      primary: endpoint.primary,
+      fallback: endpoint.fallback,
+      fallbackUsed: usedBase !== endpoint.primary,
+      overridden: endpoint.overridden,
+    });
+  }
+  if (response.status === 200) return response.json();
+  let detail = "";
+  let payloadValue;
+  try {
+    const payload = await response.json();
+    detail = typeof payload?.message === "string" ? describeError(new Error(payload.message), token) : "";
+    payloadValue = payload?.retry_after ?? payload?.retryAfter;
+  } catch {
+    detail = "";
+  }
+  const error = new Error(`MAX ${method} ${path}: ${response.status}${detail === "" ? "" : ` ${detail}`}`);
+  error.status = response.status;
+  error.host = usedBase;
+  // 050: 429 — пауза по retry_after (заголовок или поле тела), иначе 1 с.
+  const headerRetry = typeof response.headers?.get === "function" ? response.headers.get("retry-after") : null;
+  let retryAfter = Number(headerRetry);
+  if (!Number.isFinite(retryAfter) && payloadValue !== undefined) {
+    const value = Number(payloadValue);
+    if (Number.isFinite(value)) retryAfter = value;
+  }
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) error.retryAfterMs = Math.floor(retryAfter * 1000);
+  throw error;
+}
+
+/**
+ * `GET /me`: проверить токен бота MAX до привязки.
+ *
+ * Возвращает ещё и базу, которая ответила (048): если api2 не прошёл TLS, а
+ * platform-api — прошёл, `connect` доопрашивает pairing уже по рабочему хосту.
+ */
+export async function maxMe({ token, apiBase, fetch: doFetch } = {}) {
+  let used = null;
+  const me = await maxApiRequest({
+    token,
+    path: "/me",
+    apiBase,
+    fetch: doFetch,
+    onBase: (info) => {
+      used = info;
+    },
+  });
+  return {
+    name: typeof me?.name === "string" && me.name !== ""
+      ? me.name
+      : typeof me?.username === "string" && me.username !== ""
+        ? me.username
+        : typeof me?.user?.name === "string" && me.user.name !== ""
+          ? me.user.name
+          : null,
+    apiBase: used?.base ?? null,
+    fallbackUsed: used?.fallbackUsed === true,
+    primaryBase: used?.primary ?? null,
+  };
+}
+
+/**
+ * Ждём сообщение с pairing-кодом боту MAX (`GET /updates`, long polling).
+ *
+ * Возвращает `{chatId, userId, marker}` или `null`, если код не пришёл до
+ * `deadline`. `marker` сохраняется вызывающим (в состоянии привязки), чтобы
+ * после привязки транспорт не перечитал старые апдейты.
+ */
+export async function maxPollForCode({
+  token,
+  code,
+  deadline,
+  pollTimeoutSec = MAX_PAIRING_POLL_TIMEOUT_SEC,
+  apiBase,
+  fetch: doFetch,
+  now = () => Date.now(),
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  signal,
+  log = () => {},
+  /** 050: сюда складывается диагностика для текста ошибки (`polls/updates/types/host`). */
+  stats = null,
+  timeoutMs = 15_000,
+} = {}) {
+  let marker = null;
+  // 048: как только один из хостов ответил, дальше опрашиваем именно его —
+  // иначе каждый long polling начинался бы с падения на TLS у api2.
+  let workingBase = apiBase;
+  let waitMs = 1_000;
+  let attempt = 0;
+  const counts = stats ?? { polls: 0, updates: 0, types: new Set(), codeSeen: 0, host: null };
+
+  while (now() < deadline) {
+    if (signal?.aborted) throw Object.assign(new Error("подключение отменено"), { name: "AbortError" });
+    const remainingSec = Math.max(0, Math.ceil((deadline - now()) / 1000));
+    const requestTimeoutSec = Math.max(0, Math.floor(pollTimeoutSec));
+    let response;
+    try {
+      response = await maxApiRequest({
+        token,
+        path: "/updates",
+        query: {
+          timeout: Math.min(90, requestTimeoutSec),
+          limit: 100,
+          ...(marker === null ? {} : { marker }),
+        },
+        apiBase: workingBase,
+        fetch: doFetch,
+        signal,
+        timeoutMs: Math.max(1_000, Math.min(timeoutMs, Math.max(0, deadline - now()))),
+        onBase: (info) => {
+          if (typeof info?.base === "string") {
+            workingBase = info.base;
+            counts.host = info.base;
+          }
+        },
+      });
+      waitMs = 1_000;
+      attempt = 0;
+      counts.lastError = null;
+    } catch (error) {
+      if (error?.name === "AbortError" || signal?.aborted) throw error;
+      const status = Number(error?.status ?? 0);
+      // 401/403 — токен/активация бота: повторять бессмысленно, пусть человек чинит.
+      if (status === 401 || status === 403) throw error;
+      attempt += 1;
+      counts.lastError = { status, code: error?.code ?? null, retryAfterMs: error?.retryAfterMs ?? null, message: describeError(error, token) };
+      let pause = waitMs;
+      if (status === 429) {
+        pause = Math.max(1_000, Number(error?.retryAfterMs ?? 0) || 1_000);
+        log(`max pairing: 429 rate limit, пауза ${Math.round(pause / 1000)} с (retry_after)`);
+      } else {
+        pause = Math.min(10_000, waitMs * 2 ** Math.min(4, attempt - 1));
+        log(`max pairing: опрос не удался (${describeError(error, token)}), backoff ${pause} мс`);
+      }
+      const left = deadline - now();
+      if (left <= 0) break;
+      await sleep(Math.min(pause, left));
+      continue;
+    }
+    counts.polls += 1;
+    if (Number.isFinite(response?.marker)) marker = response.marker;
+    const updates = Array.isArray(response?.updates) ? response.updates : [];
+    counts.updates += updates.length;
+    for (const update of updates) {
+      const type = updateType(update);
+      if (type !== null) counts.types.add(type);
+    }
+    // 050: одна строка на каждый опрос — по ней видно «пусто» vs «пришло, но не разобрали».
+    const types = counts.types.size === 0 ? "—" : [...counts.types].join(",");
+    const found = findPairingUpdate(updates, code);
+    if (found.codeSeen) counts.codeSeen += 1;
+    log(`max pairing: poll host=${counts.host ?? workingBase ?? "?"} updates=${updates.length} types=${types} code=${found.codeSeen ? "yes" : "no"}`);
+    if (found.match !== null) return { ...found.match, marker, stats: counts };
+    // Long polling уже ждал ответ `pollTimeoutSec`; короткий опрос (0) — пауза 1 с.
+    await sleep(pollTimeoutSec > 0 ? 200 : 1000);
+  }
+  stats && Object.assign(stats, counts);
+  return null;
+}
+
+/** Тип апдейта с учётом v1/v2: `type`, `update_type` или вложенный `update.update_type`. */
+export function updateType(update) {
+  for (const value of [update?.type, update?.update_type, update?.message?.type, update?.update?.update_type, update?.update?.type]) {
+    if (typeof value === "string" && value !== "") return value;
+  }
+  return null;
+}
+
+/**
+ * Найти pairing-код в апдейте, не завися от схемы v1/v2.
+ *
+ * Код ищем в сериализованном апдейте (любая вложенность), id — по цепочке
+ * известных путей. Возвращает `{match, codeSeen}`; `match` — `{chatId,userId}`.
+ */
+export function findPairingUpdate(updates, code) {
+  let codeSeen = false;
+  for (const update of Array.isArray(updates) ? updates : []) {
+    let serialized = "";
+    try {
+      serialized = JSON.stringify(update);
+    } catch {
+      serialized = "";
+    }
+    if (serialized.includes(code)) codeSeen = true;
+    // v2 иногда заворачивает событие в `update`; разбираем и плоскую, и вложенную форму.
+    const base = update?.update !== null && typeof update?.update === "object" ? update.update : update;
+    const userId = base?.message?.sender?.user_id
+      ?? base?.user?.user_id
+      ?? base?.sender?.user_id
+      ?? base?.message?.sender?.id
+      ?? null;
+    const chatId = base?.message?.recipient?.chat_id
+      ?? base?.message?.chat?.chat_id
+      ?? base?.chat?.chat_id
+      ?? base?.chat_id
+      ?? base?.recipient?.chat_id
+      ?? null;
+    if (serialized.includes(code) && chatId !== null && userId !== null) {
+      return { match: { chatId, userId }, codeSeen: true };
+    }
+  }
+  return { match: null, codeSeen };
 }
 
 /** Хелпер для тестов: разложить текст под предел MAX, не потеряв символы. */

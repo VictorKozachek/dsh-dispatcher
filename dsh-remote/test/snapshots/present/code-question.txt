@@ -1,0 +1,17 @@
+▸ dsh-dispatcher · worker · 17:41
+
+Проверь патч:
+
+```js
+if (a < b && c > d) {
+  return "x & y";
+}
+```
+
+--- a/dsh-remote/lib/x.js
++++ b/dsh-remote/lib/x.js
+@@ -1,2 +1,2 @@
+-const old = 1;
++const next = 2;
+
+↩︎ Или ответьте текстом на это сообщение.

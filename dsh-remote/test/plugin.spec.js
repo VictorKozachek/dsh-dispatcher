@@ -12,6 +12,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -140,7 +142,13 @@ test("apply поднимается на пустом ctx без сервисов
   assert.deepEqual(messages(calls, "error"), []);
   assert.match(messages(calls, "info").join("\n"), /каркас поднят/);
   assert.deepEqual(effects.map((item) => item.label), ["dsh-remote: dispose"], "cleanup — через ctx.effect");
-  assert.deepEqual(handlers.map((item) => item.event), ["dispose"], "событие dispose — хук для хостов");
+  // Ответчик вопросов и подтверждений подписан всегда: фасад транспорта существует
+  // с самого старта, а без живого канала он отдаёт запрос GUI (`next()`).
+  assert.deepEqual(
+    handlers.map((item) => item.event),
+    ["dispose", "user-questions/request", "approval/request"],
+    "подписки: dispose — хук для хостов, ответчики — на старте",
+  );
 });
 
 test("apply не падает на ctx без logger, get и on", async () => {
@@ -242,7 +250,8 @@ test("выгрузка плагина через ctx.effect снимает ре�
   assert.equal(released, 1, "выгрузка плагина снимает ресурс");
 
   // Идемпотентность: событие dispose от хоста после выгрузки ничего не ломает.
-  for (const { handler } of fake.handlers) handler();
+  // Чужие подписки (ответчики) здесь не зовём: им нужен waterfall-контракт.
+  for (const { event, handler } of fake.handlers) if (event === "dispose") handler();
   assert.equal(released, 1, "повторное снятие — no-op");
 });
 
@@ -256,7 +265,7 @@ test("package.json: поля, которые читает загрузчик п�
   const pkg = JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8"));
 
   assert.equal(pkg.name, "dsh-remote");
-  assert.equal(pkg.version, "0.2.0");
+  assert.equal(pkg.version, "0.3.0");
   assert.equal(pkg.private, true);
   assert.equal(pkg.license, "MIT");
   assert.equal(pkg.type, "module");
@@ -279,5 +288,43 @@ test("файлы из exports и files существуют", () => {
   const pkg = JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8"));
   for (const target of [pkg.main, pkg.dsh.bundle.patch, ...pkg.files]) {
     assert.ok(existsSync(path.join(packageDir, target)), `нет файла ${target}`);
+  }
+});
+
+test("трассировка старта: путь из DSH_HOME и строка на загрузку", async () => {
+  const { apply, bootTraceFile } = await import("../lib/index.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-boot-"));
+  try {
+    assert.equal(
+      bootTraceFile({ DSH_HOME: dir }),
+      path.join(dir, "remote-control", "boot.log"),
+      "по умолчанию — $DSH_HOME/remote-control/boot.log",
+    );
+    assert.equal(
+      bootTraceFile({ DSH_HOME: dir, DSH_REMOTE_BOOT_LOG: path.join(dir, "custom.log") }),
+      path.join(dir, "custom.log"),
+      "явный путь переопределяет",
+    );
+
+    const { ctx } = fakeCtx();
+    const previousHome = process.env.DSH_HOME;
+    process.env.DSH_HOME = dir;
+    try {
+      await apply(ctx, {});
+    } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previousHome;
+    }
+    const file = bootTraceFile({ DSH_HOME: dir });
+    const lines = fs.readFileSync(file, "utf8").trim().split("\n");
+    assert.ok(lines.length >= 2, "как минимум старт и итог по фичам");
+    assert.match(lines[0], /^\d{4}-\d{2}-\d{2}T.*apply pid=\d+$/, "старт: время, маркер и pid");
+    assert.match(lines[lines.length - 1], /features запущено \d+\/\d+:/, "итог: сколько фич поднялось");
+    assert.ok(
+      lines.some((line) => /step commands:старт pid=\d+$/.test(line)),
+      "видно шаги фичи commands",
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

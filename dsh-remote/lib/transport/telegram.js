@@ -33,7 +33,7 @@ import {
   chrome,
   parseCallbackData,
 } from "./base.js";
-import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderRows } from "../present.js";
+import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderHtml, renderRows } from "../present.js";
 
 /** Базовый адрес Bot API: тот же формат, что в доке (`/bot<token>/<method>`). */
 const API_BASE = "https://api.telegram.org";
@@ -318,6 +318,23 @@ export function createTelegramTransport(options = {}) {
       log(`telegram: callback_data не разобрал (${JSON.stringify(query?.data)}) — игнор`);
       return;
     }
+    // «Другой ответ…»: у inline-кнопок нет поля ввода, поэтому просим текст
+    // отдельным сообщением с force_reply — иначе человек не понимает, куда писать.
+    if (parsed.optionId === FREE_TEXT_OPTION) {
+      try {
+        await call("sendMessage", {
+          chat_id: query?.message?.chat?.id ?? chatId,
+          text: "✍️ Напишите ответ текстом — реплаем на это сообщение.",
+          reply_markup: { force_reply: true, input_field_placeholder: "Ваш ответ…", selective: true },
+          ...(query?.message?.message_id === undefined
+            ? {}
+            : { reply_parameters: { message_id: query.message.message_id, allow_sending_without_reply: true } }),
+        }, { attempts: 2 });
+      } catch (error) {
+        log(`telegram: не удалось попросить текст (${error?.message ?? error})`);
+      }
+    }
+
     emit({
       shortId: parsed.shortId,
       optionIds: [parsed.optionId],
@@ -487,7 +504,7 @@ export function createTelegramTransport(options = {}) {
       // Текст собирает слой представления (006): шапка «откуда», тело, подсказка
       // multiSelect, усечение под caps.maxText. Отправляем parse_mode HTML,
       // поэтому экранируем ВЕСЬ простой текст целиком — сущности не рвутся.
-      const text = escapeHtml(renderBody(question, caps));
+      const text = renderHtml(renderBody(question, caps));
 
       // Кнопки — тоже из представления: варианты по одной в ряд, «Показать ещё»
       // при переполнении, «Другой ответ…» последним.
@@ -503,6 +520,14 @@ export function createTelegramTransport(options = {}) {
           .filter((row) => row.length > 0)
         : [];
       const keyboard = buttons.length > 0 ? { inline_keyboard: buttons } : undefined;
+      // Вопрос без вариантов: в Telegram нет «поля ввода», поэтому просим у
+      // клиента force_reply — клавиатура откроется сама, с подсказкой. Без этого
+      // человек видел текст вопроса и не понимал, куда отвечать (сбой приёмки
+      // 2026-11-11: пачка из двух вопросов, второй — свободный текст).
+      const freeTextMarkup = buttons.length === 0 && question?.allowFreeText !== false
+        ? { force_reply: true, input_field_placeholder: "Ответьте текстом…", selective: true }
+        : undefined;
+      const replyMarkup = keyboard ?? freeTextMarkup;
 
       // Запись заводим ДО отправки: ответчик может снять вопрос (аборт), пока
       // sendMessage ещё висит. Тогда закрытие откладывается до конца отправки.
@@ -516,7 +541,7 @@ export function createTelegramTransport(options = {}) {
           ...(sendOptions?.threadId === undefined || sendOptions?.threadId === null
             ? {}
             : { message_thread_id: sendOptions.threadId }),
-          ...(keyboard === undefined ? {} : { reply_markup: keyboard }),
+          ...(replyMarkup === undefined ? {} : { reply_markup: replyMarkup }),
         }, { signal });
         if (result?.message_id !== undefined) record.messageIds.push(result.message_id);
       } catch (error) {

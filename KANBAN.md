@@ -219,7 +219,7 @@ dsh web
 
 ```bash
 bin/task-move.sh 007 in-progress --owner "$DSH_SESSION_ID" --role worker
-# ... работа только в файлах задачи, тесты, коммит в ветку task/007 ...
+# ... работа только в файлах задачи, тесты, коммит в ветку feature/007 (или bug/007) ...
 bin/task-move.sh 007 in-review --role worker --tokens auto \
   --note "что сделано, как проверить, результат тестов"
 ```
@@ -254,7 +254,7 @@ git worktree remove worktrees/007
 Прямой `bin/task-move.sh 007 merged` протокол не разрешает: статус `merged`
 ставит только `task-commit.sh`, чтобы сообщение коммита не осталось без правила.
 
-**Пуш — шаг человека**, когда все задачи готовы и закоммичены:
+**Пуш — шаг оркестратора** (человек делегировал ему GitHub), после `bin/ci.sh`:
 
 ```bash
 git push <remote> <ветка>
@@ -265,7 +265,7 @@ git push <remote> <ветка>
 
 ```
 [{SHORT_BRANCH_NAME}] Message
-release/NJ-001 → [NJ-001] …, task/007 → [007] …
+release/NJ-001 → [NJ-001] …, feature/007 → [007] …, bug/012 → [012] …
 ```
 
 Сессии и роли: команда одной задачи живёт в её Workspace (`worktrees/<id>`),
@@ -796,7 +796,7 @@ bin/session-preset.sh --restore ~/.dsh/session-backups/<id>.<ts>.zst
   профиля идемпотентно; `--takeover` убирает этот блок, сохраняя остальной патч
   байт в байт, и идемпотентен; регрессии — в `bin/test-scripts.sh`;
 - `bin/task-commit.sh`: короткое имя выводится из ветки в обоих форматах
-  (`task/001` → `001`, `release/NJ-001` → `NJ-001`), merge-коммит получает
+  (`feature/001` → `001`, `release/NJ-001` → `NJ-001`), merge-коммит получает
   сообщение `[КЛЮЧ] Message`, карточка уходит в `merged`, повторный коммит
   отвергается, а прямой `ready` → `merged` через `task-move.sh` закрыт;
 - **живая активация плагина**: перезапуск профиля прошёл, таб «Канбан» в правом
@@ -860,7 +860,7 @@ bin/session-preset.sh --restore ~/.dsh/session-backups/<id>.<ts>.zst
 | `task-move.sh` пишет «не закреплена» | карточку не выдал оркестратор: `bin/task-move.sh <id> todo --owner <session-id>`; проверка владельца — при взятии из очереди и снятии блокировки |
 | `task-move.sh` пишет «backlog → todo — это асайн» | карточку выдают из бэклога сразу с владельцем: `bin/task-move.sh <id> todo --owner <session-id>` |
 | `task-move.sh` пишет «владелец меняется только им самим» | карточка закреплена за другой сессией; переназначение — осознанно, с `--force` |
-| `task-commit.sh` пишет «ветки task/<id> нет» | работа по задаче уже в основной ветке: `bin/task-commit.sh <id> --no-merge --reason "почему слияния нет"` |
+| `task-commit.sh` пишет «ветки feature/<id> нет» | работа по задаче уже в основной ветке: `bin/task-commit.sh <id> --no-merge --reason "почему слияния нет"` |
 | Ревьювер вернул карточку, а она снова не у исполнителя | `owner` — это исполнитель задачи и не должен меняться при передачах; `role` показывает, кто держит карточку сейчас |
 | `task-commit.sh` пишет «не в статусе ready» | карточку ещё не принял тестировщик; слияние — только из `ready` |
 | `backlog-fill.sh` пишет «битый JSON» или «нет целого minTodo» | `.kanban/board.json` должен быть объектом с числом: `{ "minTodo": 3 }` |

@@ -29,6 +29,12 @@ export const panelFeature = {
       channelPresent: () => liveTransport() !== null,
       transport: liveTransport,
       reliability: () => deps.get("remoteReliability"),
+      // 045: показываем доску текущего проекта и явные корни из конфига.
+      includeCwd: true,
+      ...(Array.isArray(config?.boards) ? { workspaces: config.boards } : {}),
+      ...(Number.isFinite(config?.board?.staleMinutes) ? { staleMinutes: config.board.staleMinutes } : {}),
+      // 031: метрики рантайма (токенов в них нет — расход берётся из карточек).
+      metrics: () => deps.get("remoteMetrics")?.snapshot?.() ?? null,
     });
 
     deps.onDispose(dispose);

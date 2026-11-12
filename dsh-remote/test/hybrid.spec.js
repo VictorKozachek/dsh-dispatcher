@@ -268,11 +268,12 @@ test("два вопроса: ответ на первый не снимает т
     return { answers: [] };
   });
   await tick();
-  assert.equal(timers.delays().length, 2, "по таймеру на каждый вопрос");
+  assert.equal(timers.delays().length, 1, "037: таймер только у опубликованного вопроса");
 
   const first = transport.sent[0];
   transport.answer({ shortId: first.shortId, optionId: "o1" });
   await tick();
+  assert.deepEqual(timers.delays(), [20_000], "таймер первого снят ответом, у второго — свой");
 
   timers.tick(); // «время вышло» по второму вопросу
   await tick();

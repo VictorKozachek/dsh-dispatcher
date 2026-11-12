@@ -19,6 +19,12 @@ fi
 echo "node: $("$NODE" --which)"
 
 echo "== тесты плагина dsh-remote"
+# Изоляция: тесты не должны видеть живое состояние пользователя
+# (~/.dsh/remote-control) и живые секреты — иначе плагин при прогоне поднимает
+# настоящий поллер бота, а тесты зависят от машины, где их запустили.
+export DSH_HOME
+DSH_HOME="$(mktemp -d "${TMPDIR:-/tmp}/dsh-remote-test.XXXXXX")"
+trap 'rm -rf "$DSH_HOME"' EXIT
 if [[ -d "$ROOT/dsh-remote/test" ]]; then
   "$NODE" --test "$ROOT/dsh-remote/test"/*.spec.js
 else

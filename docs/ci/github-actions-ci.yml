@@ -1,3 +1,9 @@
+# Готовый workflow GitHub Actions, но НЕ активированный: у токена gh нет scope
+# `workflow`, а GitHub не принимает файлы `.github/workflows/*` без него.
+# Скопируйте в `.github/workflows/ci.yml` (веб-интерфейс GitHub или пуш с токеном,
+# у которого есть scope workflow) — и он заработает как есть.
+# Пока CI живёт локально: `bin/ci.sh` (те же проверки).
+
 name: CI
 
 on:

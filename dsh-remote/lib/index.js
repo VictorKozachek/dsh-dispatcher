@@ -18,6 +18,10 @@
  * трогает.
  */
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { features } from "./features.js";
 
 /** Имя плагина: оно же scope логгера и `name` ряда в `cordis.patch.yml`. */
@@ -30,6 +34,36 @@ export const name = "dsh-remote";
 export const inject = [];
 
 apply.inject = inject;
+
+/**
+ * Файл трассировки старта: одна строка на каждую загрузку плагина.
+ *
+ * Зачем: команда `/remote` и панель видны только когда плагин действительно
+ * поднялся в профиле, а `logger` пишет в консоль хоста — её не видно без
+ * отладки. Строка в файле отвечает на вопрос «загрузился ли плагин» без
+ * перезапуска с флагами. Путь переопределяется `$DSH_REMOTE_BOOT_LOG`.
+ */
+export function bootTraceFile(env = process.env) {
+  const explicit = env.DSH_REMOTE_BOOT_LOG;
+  if (explicit !== undefined && explicit !== "") return explicit;
+  const home = env.DSH_HOME !== undefined && env.DSH_HOME !== "" ? env.DSH_HOME : path.join(os.homedir(), ".dsh");
+  return path.join(home, "remote-control", "boot.log");
+}
+
+/** Записать строку трассировки; сбой трассировки не мешает плагину. */
+function recordBootTrace(logger, message = "apply") {
+  try {
+    const file = bootTraceFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.appendFileSync(file, `${new Date().toISOString()} ${message} pid=${process.pid}\n`, { mode: 0o600 });
+  } catch (error) {
+    try {
+      logger.warn(`трассировка старта не записалась: ${error?.message ?? error}`);
+    } catch {
+      /* логгер тоже может быть сломан — молчим */
+    }
+  }
+}
 
 /** Уровни лога cordis, которые нужны плагину. */
 const LEVELS = ["debug", "info", "warn", "error"];
@@ -112,6 +146,7 @@ function readConfig(config) {
  */
 export async function apply(ctx, config = {}) {
   const logger = createLogger(ctx);
+  recordBootTrace(logger);
   const { settings, invalid } = readConfig(config);
   if (invalid) logger.warn("config плагина не объект — работаю с пустым конфигом");
 
@@ -157,10 +192,30 @@ export async function apply(ctx, config = {}) {
     logger.warn(`не подписался на событие dispose: ${describeError(error)}`);
   }
 
+  /**
+   * Общий реестр значений плагина.
+   *
+   * Зачем: `ctx.provide` у cordis рассчитан на настоящие Service-объекты, а наши
+   * фасад транспорта и хранилище — обычные объекты. Живой сбой: `commands`
+   * поднимался, но `reliability`/`answerer`/`approvals` продолжали видеть
+   * `нет-remoteTransport`. Поэтому фичи кладут значения сюда, а `deps.get`
+   * смотрит сначала в cordis, потом сюда — без зависимости от семантики сервисов.
+   */
+  const shared = new Map();
+
   const deps = {
     logger,
+    /** Положить значение в общий реестр плагина (видно всем фичам через `get`). */
+    expose(name, value) {
+      shared.set(String(name), value ?? null);
+    },
+    /** Взять значение из общего реестра плагина. */
+    shared(name) {
+      return shared.get(String(name)) ?? null;
+    },
     /** Сервис из контекста: нет сервиса (или ctx без `get`) — null, не исключение. */
     get(service) {
+      if (shared.has(String(service))) return shared.get(String(service)) ?? null;
       try {
         if (typeof ctx?.get !== "function") return null;
         return ctx.get(service) ?? null;
@@ -174,6 +229,8 @@ export async function apply(ctx, config = {}) {
      * `timers` снимают сторож, `transports` останавливают поллеры/WS,
      * `commands` — фасад. По умолчанию — `other`.
      */
+    /** Точка трассировки шага фичи (пишется в boot.log). */
+    trace: (message) => recordBootTrace(logger, `step ${message}`),
     onDispose(disposer, phase = "other") {
       if (typeof disposer !== "function") return;
       const effective = DISPOSE_PHASES.includes(phase) ? phase : "other";
@@ -193,34 +250,84 @@ export async function apply(ctx, config = {}) {
   // Копия реестра: фича, добавленная во время обхода, не поедет в этом проходе.
   const registry = Array.isArray(features) ? [...features] : [];
   let started = 0;
+  /** Итог по фичам — он же попадает в трассировку старта. */
+  const report = [];
+  /** Что уже запущено: повторный проход не должен поднимать фичу дважды. */
+  const applied = new Set();
 
-  for (const [index, feature] of registry.entries()) {
-    const label = typeof feature?.name === "string" && feature.name.trim() !== ""
-      ? feature.name.trim()
-      : `#${index}`;
-
+  /**
+   * Запустить одну фичу. Возвращает `true`, если она поднялась.
+   *
+   * @param {object} feature - фича из реестра
+   * @param {string} label - имя для лога
+   * @param {string[]} [into] - куда писать итог (по умолчанию в отчёт старта)
+   */
+  async function runFeature(feature, label, into = report) {
     if (typeof feature?.apply !== "function") {
       logger.warn(`фича ${label}: нет apply — пропущена`);
-      continue;
+      into.push(`${label}:no-apply`);
+      return false;
     }
-
     const needs = Array.isArray(feature.needs) ? feature.needs.map(String) : [];
     const missing = needs.filter((service) => deps.get(service) === null);
     if (missing.length > 0) {
       logger.warn(`фича ${label}: в контексте нет ${missing.join(", ")} — пропущена, плагин работает без неё`);
-      continue;
+      into.push(`${label}:нет-${missing.join("/")}`);
+      return false;
     }
-
     try {
       // Фича может быть асинхронной (например, ждёт `credentials.resolve`):
       // дожидаемся её, иначе следующая фича проверит свои `needs` до того, как
       // сервис появится, и будет пропущена навсегда.
       const result = feature.apply(ctx, settings, deps);
       if (result !== null && typeof result?.then === "function") await result;
-      started += 1;
+      applied.add(label);
+      into.push(`${label}:ok`);
+      return true;
     } catch (error) {
       logger.warn(`фича ${label} упала: ${describeError(error)}`);
+      into.push(`${label}:упала(${describeError(error)})`);
+      // Текст и голова стека — в трассировку: консоль хоста не видна без отладки.
+      const stack = String(error?.stack ?? "").split("\n").slice(1, 4).join(" | ");
+      recordBootTrace(logger, `ошибка фичи ${label}: ${describeError(error)}${stack ? ` @ ${stack}` : ""}`);
+      return false;
     }
+  }
+
+  /**
+   * Повторный проход по пропущенным фичам.
+   *
+   * Зачем: часть фич ждёт сервисов, которых на старте ещё нет. `remoteTransport`
+   * появляется только после привязки бота (`/remote connect`) — и тогда
+   * `reliability`, `answerer` и `approvals` надо поднять, иначе вопросы некому
+   * отправлять. Реестр идёт в исходном порядке: `reliability` кладёт `deliver`,
+   * `answerer` его берёт.
+   *
+   * @param {string} reason - что изменилось (для трассировки)
+   * @returns {Promise<string[]>} имена поднятых фич
+   */
+  async function retryPending(reason) {
+    const retried = [];
+    for (const [index, feature] of registry.entries()) {
+      const label = typeof feature?.name === "string" && feature.name.trim() !== ""
+        ? feature.name.trim()
+        : `#${index}`;
+      if (applied.has(label)) continue;
+      const needs = Array.isArray(feature?.needs) ? feature.needs.map(String) : [];
+      if (needs.some((service) => deps.get(service) === null)) continue;
+      if (await runFeature(feature, label, [])) retried.push(label);
+    }
+    if (retried.length > 0) recordBootTrace(logger, `доподняты фичи (${reason}): ${retried.join(", ")}`);
+    return retried;
+  }
+
+  deps.retryPending = retryPending;
+
+  for (const [index, feature] of registry.entries()) {
+    const label = typeof feature?.name === "string" && feature.name.trim() !== ""
+      ? feature.name.trim()
+      : `#${index}`;
+    if (await runFeature(feature, label)) started += 1;
     if (disposed) {
       logger.warn("плагин выгружен во время запуска фич — остальные не запускаю");
       break;
@@ -228,4 +335,17 @@ export async function apply(ctx, config = {}) {
   }
 
   logger.info(`каркас поднят: фич ${registry.length}, запущено ${started}`);
+  // Одна строка «что поднялось» — по ней видно, дошёл ли плагин до фич и какие
+  // из них пропущены из-за отсутствующих сервисов.
+  recordBootTrace(logger, `features запущено ${started}/${registry.length}: ${report.join(", ")}`);
+
+  // Контрольная точка через 3 секунды: видно, появились ли сервисы ПОСЛЕ старта
+  // плагина (cordis монтирует ряды по графу зависимостей, порядок не гарантирован).
+  // Отсюда же видно, работает ли ленивый поиск секретов и вопросов.
+  const probe = setTimeout(() => {
+    const names = ["credentials", "commands", "userQuestions", "sessions", "sessionController"];
+    const seen = names.map((name) => `${name}=${deps.get(name) === null ? "нет" : "есть"}`).join(" ");
+    recordBootTrace(logger, `services через 3с: ${seen}`);
+  }, 3000);
+  probe.unref?.();
 }

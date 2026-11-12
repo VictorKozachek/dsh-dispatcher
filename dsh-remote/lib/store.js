@@ -23,6 +23,8 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { DEFAULT_LANG, normalizeLang } from "./i18n.js";
+
 /**
  * Текущая версия схемы `state.json` (задача 032). Растёт только вперёд, ровно
  * на одну ступень за миграцию; каждая ступень — в {@link STATE_MIGRATIONS}.
@@ -58,12 +60,19 @@ export class StateSchemaError extends Error {
 const DEFAULT_FILE_NAME = "state.json";
 const LOCK_FILE_NAME = "lock";
 
-/** Куда писать состояние: явный путь из env главнее домашнего каталога. */
+/**
+ * Куда писать состояние.
+ *
+ * Приоритет: явный `DSH_REMOTE_STATE` → `DSH_HOME` → `~/.dsh`. `DSH_HOME` важен и
+ * для тестов, и для alt-профилей: без него тесты читали живое состояние
+ * пользователя и поднимали настоящий поллер бота (сбой в приёмке 2026-11-11).
+ */
 export function statePaths({ env = process.env, home = os.homedir() } = {}) {
   const override = typeof env?.DSH_REMOTE_STATE === "string" && env.DSH_REMOTE_STATE !== ""
     ? env.DSH_REMOTE_STATE
     : null;
-  const file = override ?? path.join(home, ".dsh", "remote-control", DEFAULT_FILE_NAME);
+  const dshHome = typeof env?.DSH_HOME === "string" && env.DSH_HOME !== "" ? env.DSH_HOME : null;
+  const file = override ?? path.join(dshHome ?? path.join(home, ".dsh"), "remote-control", DEFAULT_FILE_NAME);
   const dir = path.dirname(file);
   return { file, dir, lock: path.join(dir, LOCK_FILE_NAME) };
 }
@@ -339,6 +348,8 @@ export function defaultState() {
     enabled: { global: false, workspaces: {}, sessions: {} },
     /** Гибридный режим: мессенджер → GUI через `waitMs` (задача 013). */
     hybrid: { enabled: false, waitMs: DEFAULT_HYBRID_WAIT_MS },
+    /** 046: язык пользовательских сообщений (`/remote lang`). */
+    lang: DEFAULT_LANG,
     recent: [],
     pending: [],
     /** 014: дедуп уведомлений доски: что уже отправлено и сколько было todo. */
@@ -376,15 +387,26 @@ export function credentialRef(name) {
  * видно в `status`.
  */
 export function createCredentialAccess(ctx, { log = () => {}, env = process.env } = {}) {
-  const service = ctx?.get?.("credentials") ?? null;
-  const has = (method) => typeof service?.[method] === "function";
+  // Сервис ищется ЛЕНИВО, на каждое обращение: cordis монтирует ряды по графу
+  // зависимостей, и `credentials` может появиться уже после того, как плагин
+  // стартовал. Живой сбой: сервис в профиле есть, а `ctx.get("credentials")` в
+  // момент apply вернул null — и плагин навсегда решил, что секретов нет.
+  const serviceOf = () => {
+    try {
+      return ctx?.get?.("credentials") ?? null;
+    } catch {
+      return null;
+    }
+  };
+  const has = (method) => typeof serviceOf()?.[method] === "function";
 
   /** Значение из окружения (fallback, только чтение). */
   const fromEnv = (ref) => (typeof env?.[ref] === "string" && env[ref] !== "" ? env[ref] : null);
 
   /** Вызов сервиса: любой отказ — null и строка в лог, без исключения. */
   async function settle(method, ...args) {
-    if (!has(method)) return null;
+    const service = serviceOf();
+    if (typeof service?.[method] !== "function") return null;
     try {
       return await service[method](...args);
     } catch (error) {
@@ -426,7 +448,8 @@ export function createCredentialAccess(ctx, { log = () => {}, env = process.env 
     },
     /** Записать секрет. Успех — отсутствие исключения: сервис возвращает void. */
     async set(ref, value) {
-      if (!has("set")) return false;
+      const service = serviceOf();
+      if (typeof service?.set !== "function") return false;
       try {
         await service.set(ref, value);
         return true;
@@ -437,7 +460,8 @@ export function createCredentialAccess(ctx, { log = () => {}, env = process.env 
     },
     /** Удалить секрет (не бросает: у env-источника записи нет). */
     async unset(ref) {
-      if (!has("unset")) return false;
+      const service = serviceOf();
+      if (typeof service?.unset !== "function") return false;
       try {
         await service.unset(ref);
         return true;
@@ -809,6 +833,15 @@ export function createStore({
     write,
     update,
     setEnabled,
+    /** 046: сменить язык сообщений; неизвестный — ошибка. */
+    setLang(lang) {
+      const normalized = normalizeLang(lang);
+      if (normalized === null) throw new TypeError(`setLang: неизвестный язык ${lang}`);
+      return update((state) => {
+        state.lang = normalized;
+        return state;
+      });
+    },
     setChannel,
     removeChannel,
     setHybrid,
@@ -856,6 +889,7 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT, pendi
       workspaces: booleans(enabled.workspaces),
       sessions: booleans(enabled.sessions),
     },
+    lang: normalizeLang(value.lang) ?? DEFAULT_LANG,
     hybrid: {
       enabled: value.hybrid?.enabled === true,
       waitMs: Number.isFinite(value.hybrid?.waitMs) && value.hybrid.waitMs > 0

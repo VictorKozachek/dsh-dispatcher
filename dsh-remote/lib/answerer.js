@@ -34,7 +34,7 @@
 import { randomUUID } from "node:crypto";
 
 import { ANSWERED_ELSEWHERE, createBroker } from "./broker.js";
-import { createQuestion } from "./domain/question.js";
+import { createQuestions } from "./domain/question.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, resolveContext } from "./present.js";
 
 const noopLog = () => {};
@@ -94,6 +94,14 @@ function choiceFor(question, event) {
   if (event.optionIds.length === 1 && event.optionIds[0] === FREE_TEXT_OPTION) return { awaitingText: true };
   if (event.optionIds.length === 1 && event.optionIds[0] === MORE_OPTION) return { showMore: true };
 
+  // 044: быстрая кнопка — это не вариант вопроса, а готовый свободный ответ.
+  // В сессию уходит человекочитаемый текст, а не наш внутренний id `qN`.
+  const quick = Array.isArray(question.quickReplies) ? question.quickReplies : [];
+  if (quick.length > 0 && event.optionIds.length === 1) {
+    const match = quick.find((item) => item.id === event.optionIds[0]);
+    if (match !== undefined) return { choice: { selected: [], custom: match.text } };
+  }
+
   const labels = new Map(question.options.map((option) => [option.id, option.label]));
   const selected = [];
   for (const id of event.optionIds) {
@@ -146,6 +154,10 @@ export function createAnswerer({
   hybrid = null,
   /** 031: метрики (только числа). */
   metrics = null,
+  /** 044: быстрые ответы для вопросов без вариантов. */
+  quickReplies = undefined,
+  /** 046: язык сообщений (строка или функция, чтобы читать состояние на каждый вопрос). */
+  lang = null,
   /** 013: доставка позднего ответа; по умолчанию `sessionController.prompt`. */
   steer = null,
   /** 013: таймеры инжектируются, тесты не ждут реальные 20 секунд. */
@@ -346,7 +358,18 @@ export function createAnswerer({
   }
 
   function onTransportAnswer(event, sourceTransport = null) {
-    const normalized = normalizeAnswerEvent(event);
+    let incoming = event;
+    // 037: свободный текст без reply. Транспорт обычно проставляет shortId
+    // (force_reply), но если при одном открытом вопросе его нет — роутинг
+    // однозначен: ответ адресован этому вопросу, иначе человек ждёт вечно.
+    if (event !== null && typeof event === "object"
+      && (typeof event.shortId !== "string" || event.shortId === "")
+      && pending.size === 1) {
+      const only = pending.keys().next().value;
+      incoming = { ...event, shortId: only };
+      log(`ответ транспорта без shortId: единственный открытый вопрос ${only} — принимаю`);
+    }
+    const normalized = normalizeAnswerEvent(incoming);
     if (normalized === null) {
       log("ответ транспорта: событие без shortId — игнор");
       return;
@@ -452,10 +475,15 @@ export function createAnswerer({
     const workspace = workspaceOf(sessionId);
     // Маркировка (006): роль и задача, которую ведёт эта сессия. Ошибки чтения
     // контекста не должны мешать вопросу — тогда просто без задачи.
-    let questionContext = { role: null, taskId: null };
+    let questionContext = { role: null, taskId: null, branch: null, worktree: null };
     try {
       const resolved = resolveContext({ sessionId, ctx: context, log });
-      questionContext = { role: resolved.role ?? null, taskId: resolved.taskId ?? null };
+      questionContext = {
+        role: resolved.role ?? null,
+        taskId: resolved.taskId ?? null,
+        branch: resolved.branch ?? null,
+        worktree: resolved.worktree ?? null,
+      };
     } catch (error) {
       log(`вопрос: контекст сессии не прочитан (${error?.message ?? error})`);
     }
@@ -489,19 +517,25 @@ export function createAnswerer({
 
     const questions = [];
     try {
-      for (const item of items) {
-        const primaryChannel = channelFor(primary?.id ?? null);
-        const questionChannel = { chatId: primaryChannel.chatId, threadId: primaryChannel.threadId };
-        const created = createQuestion(item, {
-          sessionId,
-          workspace,
-          role: questionContext.role,
-          taskId: questionContext.taskId,
-          chatId: questionChannel.chatId,
-          threadId: questionChannel.threadId,
-          now: now(),
-          log,
-        });
+      // 037: createQuestions даёт нумерацию «вопрос i/n»; 044 quickReplies и
+      // 046 lang передаются в общий контекст пачки.
+      const questionLang = typeof lang === "function" ? lang() : lang;
+      const primaryChannel = channelFor(primary?.id ?? null);
+      const createdList = createQuestions(items, {
+        sessionId,
+        workspace,
+        role: questionContext.role,
+        taskId: questionContext.taskId,
+        branch: questionContext.branch,
+        worktree: questionContext.worktree,
+        quickReplies,
+        lang: questionLang,
+        chatId: primaryChannel.chatId,
+        threadId: primaryChannel.threadId,
+        now: now(),
+        log,
+      });
+      for (const created of createdList) {
         known.set(created.shortId, created);
         if (known.size > 200) known.delete(known.keys().next().value);
         questions.push(created);
@@ -519,18 +553,27 @@ export function createAnswerer({
     /** Ответы, которыми TTL закрыл вопрос (empty/default-first). */
     const expiredAnswers = new Map();
 
-    // Ожидание ответа: по промису на вопрос, ключ — короткий id для кнопок.
-    // `catch`-заглушка вешается сразу: если вопрос снимают (аборт, ошибка
-    // отправки), промис остаётся неразрешённым, но не должен шуметь как
-    // необработанный отказ.
-    const waiting = [];
-    for (const question of questions) {
+    /**
+     * 037: регистрируем ожидание ровно в момент публикации вопроса. Раньше
+     * pending/markOpen/TTL создавались для всей пачки сразу — второй вопрос
+     * висел «открытым» и под TTL до отправки, а его ответ мог разрешиться
+     * раньше времени. Теперь вызывается по одному вопросу в цикле публикации.
+     */
+    function registerWaiting(question) {
+      // 037: TTL отсчитывается от публикации, а не от создания пачки. Иначе
+      // второй вопрос, прождавший долгий ответ на первый, был бы уже просрочен
+      // в момент отправки и человек не успел бы ответить; latency тоже считаем
+      // от публикации.
+      const ttlMs = Math.max(1, question.expiresAt - question.createdAt);
+      question.createdAt = now();
+      question.expiresAt = question.createdAt + ttlMs;
       question.markOpen(now());
+      // `catch`-заглушка: если вопрос снимают (аборт, ошибка отправки), промис
+      // остаётся неразрешённым, но не должен шуметь как необработанный отказ.
       const waited = new Promise((resolve, reject) => {
         pending.set(question.shortId, { question, resolve, reject, signal: request?.signal ?? null });
       });
       waited.catch(() => {});
-      waiting.push(waited);
 
       // TTL-сторож (008): по истечении вопрос получает исход из конфига. Abort
       // отклоняет ожидание (DSH получит ASK_ABORTED), empty/default-first
@@ -555,6 +598,7 @@ export function createAnswerer({
           entry.resolve(question);
         },
       });
+      return waited;
     }
 
     // Аборт слушаем ДО отправки: иначе аборт во время sendQuestion оставил бы
@@ -599,74 +643,113 @@ export function createAnswerer({
       }
     };
 
-    function armHybrid() {
+    /**
+     * 037: пачка публикуется последовательно, поэтому таймер взводим на каждый
+     * вопрос сразу после его отправки. Ответ на предыдущий вопрос к этому
+     * моменту уже получен, а гибрид для ещё не отправленного вопроса не тикает.
+     */
+    /** Снять таймеры, ожидания и TTL-сторожа пачки (успех, GUI, аборт, сбой). */
+    function cleanupBatch() {
+      cleanupHybrid();
+      for (const question of questions) pending.delete(question.shortId);
+      reliability?.unwatch?.(questions.map((question) => question.shortId));
+    }
+
+    function armHybrid(question) {
       if (hybridState.enabled !== true) return;
-      for (const question of questions) {
-        const timer = setTimeoutImpl(() => {
-          hybridTimers.delete(question.shortId);
-          const waitingEntry = pending.get(question.shortId);
-          if (waitingEntry === undefined) return; // уже ответили
-          waitingEntry.hybridTimer = null;
-          const stillOpen = questions.filter((item) => pending.has(item.shortId));
-          const anyAnswered = questions.some((item) => item.status === "answered");
-          if (anyAnswered) {
-            // Пачка уже частично отвечена: DSH вернул бы GUI весь запрос вместе
-            // с отвеченным вопросом, поэтому GUI не зовём — вопрос остаётся
-            // обычным ожиданием, его ответ идёт в результат, не в steer.
-            log(`гибрид: вопрос ${question.shortId} остался в мессенджере — пачка уже частично отвечена, GUI не зовём`);
-            return;
-          }
-          if (guiRequested) return; // next() уже звали
-          waitingEntry.hybridGui = true;
-          // Метрика — по числу вопросов, отданных в GUI, а не по числу таймеров.
-          stats.hybridHanded += stillOpen.length;
-          for (const item of stillOpen) {
-            const itemEntry = pending.get(item.shortId);
-            if (itemEntry !== undefined) itemEntry.hybridGui = true;
-          }
-          log(`гибрид: ответа нет ${hybridState.waitMs} мс — отдаю вопросы в GUI (${stillOpen.length})`);
-          guiResolver?.(HYBRID_GUI);
-        }, hybridState.waitMs);
-        timer?.unref?.();
-        hybridTimers.set(question.shortId, timer);
+      const timer = setTimeoutImpl(() => {
+        hybridTimers.delete(question.shortId);
         const waitingEntry = pending.get(question.shortId);
-        if (waitingEntry !== undefined) waitingEntry.hybridTimer = timer;
-      }
+        if (waitingEntry === undefined) return; // уже ответили
+        waitingEntry.hybridTimer = null;
+        const stillOpen = questions.filter((item) => pending.has(item.shortId));
+        const anyAnswered = questions.some((item) => item.status === "answered");
+        if (anyAnswered) {
+          // Пачка уже частично отвечена: DSH вернул бы GUI весь запрос вместе
+          // с отвеченным вопросом, поэтому GUI не зовём — вопрос остаётся
+          // обычным ожиданием, его ответ идёт в результат, не в steer.
+          log(`гибрид: вопрос ${question.shortId} остался в мессенджере — пачка уже частично отвечена, GUI не зовём`);
+          return;
+        }
+        if (guiRequested) return; // next() уже звали
+        waitingEntry.hybridGui = true;
+        // Метрика — по числу вопросов, отданных в GUI, а не по числу таймеров.
+        stats.hybridHanded += stillOpen.length;
+        for (const item of stillOpen) {
+          const itemEntry = pending.get(item.shortId);
+          if (itemEntry !== undefined) itemEntry.hybridGui = true;
+        }
+        log(`гибрид: ответа нет ${hybridState.waitMs} мс — отдаю вопросы в GUI (${stillOpen.length})`);
+        guiResolver?.(HYBRID_GUI);
+      }, hybridState.waitMs);
+      timer?.unref?.();
+      hybridTimers.set(question.shortId, timer);
+      const waitingEntry = pending.get(question.shortId);
+      if (waitingEntry !== undefined) waitingEntry.hybridTimer = timer;
     }
 
     try {
       try {
-        for (const question of questions) {
+        for (let index = 0; index < questions.length; index += 1) {
+          const question = questions[index];
           attempted.add(question);
+          const waited = registerWaiting(question);
           if (useBroker) {
             const publication = await Promise.race([publishAll(question, request?.signal, channelFor), aborted]);
             if (!publication.anyDelivered) {
               // Ни один канал не принял вопрос — он достаётся GUI, как в 008.
               log(`вопрос ${question.shortId}: ни один канал не доставил — отдаю GUI (next)`);
+              cleanupBatch();
               await closeQuestions(questions, "undelivered", attempted);
               return next();
             }
             // 012: доставки переживают рестарт (state.questions[].deliveries).
             reliability?.noteDeliveries?.(question);
-            continue;
-          }
-          const outcome = await Promise.race([sendOne(question, request?.signal), aborted]);
-          if (outcome === "give-up") {
+          } else {
+            const sent = await Promise.race([sendOne(question, request?.signal), aborted]);
+            const outcome = sent;
+            // 038: запомнить, какой канал реально доставил вопрос — после смены
+            // привязки закрывать/править его нужно в этом канале.
+            if (typeof question.addDelivery === "function"
+              && !(Array.isArray(question.deliveries) && question.deliveries.length > 0)) {
+              try {
+                question.addDelivery({
+                  transport: primary?.id ?? null,
+                  messageId: sent?.messageId ?? null,
+                  chatId: question.chatId ?? null,
+                });
+              } catch (error) {
+                log(`вопрос ${question.shortId}: доставка не записана (${error?.message ?? error})`);
+              }
+            }
+            if (outcome === "give-up") {
+              try {
+                metrics?.inc?.("deliveries.failed");
+                metrics?.transportError?.(primary?.id ?? "other");
+              } catch {
+                /* метрики не должны ронять доставку */
+              }
+              // Недоставка за отведённое время: вопрос достаётся GUI, сессия не висит.
+              log(`вопрос ${question.shortId}: не доставлен — отдаю GUI (next)`);
+              cleanupBatch();
+              await closeQuestions(questions, "undelivered", attempted);
+              return next();
+            }
             try {
-              metrics?.inc?.("deliveries.failed");
-              metrics?.transportError?.(primary?.id ?? "other");
+              metrics?.inc?.("deliveries.sent");
             } catch {
               /* метрики не должны ронять доставку */
             }
-            // Недоставка за отведённое время: вопрос достаётся GUI, сессия не висит.
-            log(`вопрос ${question.shortId}: не доставлен — отдаю GUI (next)`);
-            await closeQuestions(questions, "undelivered", attempted);
-            return next();
           }
-          try {
-            metrics?.inc?.("deliveries.sent");
-          } catch {
-            /* метрики не должны ронять доставку */
+
+          // 037: дождались ответа на текущий — только теперь публикуем следующий.
+          armHybrid(question);
+          const answered = await Promise.race([waited, aborted, guiRace]);
+          if (answered === HYBRID_GUI || guiRequested) {
+            // pending оставляем: поздний ответ из мессенджера должен уйти
+            // steer-ом, а не потеряться (как и до 037); снимаем только таймеры.
+            cleanupHybrid();
+            return next();
           }
         }
       } catch (error) {
@@ -676,6 +759,7 @@ export function createAnswerer({
           } catch {
             /* метрики не должны ронять аборт */
           }
+          cleanupBatch();
           await closeQuestions(questions, "aborted", attempted);
           throw error;
         }
@@ -685,30 +769,8 @@ export function createAnswerer({
         } catch {
           /* метрики не должны ронять отправку */
         }
+        cleanupBatch();
         await closeQuestions(questions, "send-failed", attempted);
-        return next();
-      }
-
-      armHybrid();
-      try {
-        const outcome = await Promise.race([Promise.all(waiting), aborted, guiRace]);
-        if (outcome === HYBRID_GUI || guiRequested) {
-          cleanupHybrid();
-          return next();
-        }
-      } catch (error) {
-        cleanupHybrid();
-        if (error?.name === "AbortError") {
-          try {
-            metrics?.inc?.("questions.cancelled", questions.length);
-          } catch {
-            /* метрики не должны ронять аборт */
-          }
-          await closeQuestions(questions, "aborted", attempted);
-          throw error;
-        }
-        log(`вопрос: ожидание ответа сорвалось (${error?.message ?? error}) — отдаю GUI`);
-        await closeQuestions(questions, "failed", attempted);
         return next();
       }
     } finally {
@@ -721,9 +783,7 @@ export function createAnswerer({
       }
     }
 
-    cleanupHybrid();
-    for (const question of questions) pending.delete(question.shortId);
-    reliability?.unwatch?.(questions.map((question) => question.shortId));
+    cleanupBatch();
     log(`вопросов ${questions.length}: ответ получен (${decision.scope})`);
     return {
       answers: questions.map((question) => expiredAnswers.get(question.shortId) ?? question.toAnswer()),
@@ -749,7 +809,13 @@ export function createAnswerer({
     let offAnswers = [];
     let offRequest = null;
     try {
-      offAnswers = subscribable.map((channel) => channel.onAnswer((event) => onTransportAnswer(event, channel)));
+      offAnswers = subscribable.map((channel) => channel.onAnswer((event) => onTransportAnswer(
+        event,
+        // 038: прокси динамического канала передаёт реальный источник ответа.
+        event !== null && typeof event === "object" && event.__sourceTransport !== undefined
+          ? event.__sourceTransport
+          : channel,
+      )));
     } catch (error) {
       log(`ответчик не подписан: транспорт не отдал onAnswer (${error?.message ?? error})`);
       for (const off of offAnswers) {
@@ -819,5 +885,34 @@ export function createAnswerer({
     return stats;
   }
 
-  return { attach, handler, dispose, stats };
+  /**
+   * 038: снять открытые вопросы, доставленные в канал, который отключаем (до
+   * transport.stop). Закрываем сообщения в том же канале, ожидания отклоняем.
+   */
+  async function cancelChannel(transportId, reason = "канал отключён") {
+    let cancelled = 0;
+    for (const [shortId, entry] of [...pending.entries()]) {
+      const question = entry.question;
+      const deliveries = Array.isArray(question?.deliveries) ? question.deliveries : [];
+      const via = question?.answeredVia;
+      if (via !== transportId && !deliveries.some((delivery) => delivery?.transport === transportId)) continue;
+      pending.delete(shortId);
+      rememberClosed(question);
+      reliability?.unwatch?.(shortId);
+      if (!question.cancel(reason, now())) continue;
+      try {
+        const closing = useBroker && (question.deliveries?.length ?? 0) > 0
+          ? broker.closeAll(question, { winner: null, summary: reason })
+          : primary?.closeQuestion?.(question, reason);
+        if (closing !== null && typeof closing?.then === "function") closing.catch(() => {});
+      } catch (error) {
+        log(`вопрос ${shortId}: закрыть сообщение при отключении канала не удалось (${error?.message ?? error})`);
+      }
+      entry.reject(abortError(reason));
+      cancelled += 1;
+    }
+    return cancelled;
+  }
+
+  return { attach, handler, dispose, stats, cancelChannel, pending, known };
 }

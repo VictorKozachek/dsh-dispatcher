@@ -67,6 +67,7 @@ bin/install-remote.sh             # поставить плагин в проф�
 - [`.kanban/specs/001.md`](.kanban/specs/001.md) — спека первой очереди;
 - [`AGENTS.md`](AGENTS.md) — протокол работы агентов, роли, жизненный цикл задачи;
 - [`docs/user-guide.md`](docs/user-guide.md) — инструкция пользователя;
+- [`docs/acceptance.md`](docs/acceptance.md) — чек-лист живой приёмки (бот, телефон, отказы);
 - [`dsh-remote/README.md`](dsh-remote/README.md) — плагин: установка, панель, `/remote`;
 - [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — эксплуатация: инциденты, диагностика, SLO;
 - [`docs/approvals.md`](docs/approvals.md) — удалённые подтверждения и политика;
@@ -82,7 +83,7 @@ dsh-remote/          плагин DSH (host + клиентский бандл, �
 .kanban/             доска: tasks/, specs/, board.json
 bin/                 скрипты: установщик, доска, задачи, тесты
 docs/                концепция, руководство пользователя, research/
-worktrees/<id>/      рабочие деревья задач (ветка task/<id>)
+worktrees/<id>/      рабочие деревья задач (ветка feature/<id> | bug/<id>)
 AGENTS.md            протокол ролей и карточек
 KANBAN.md            шпаргалка по доске
 ```
@@ -98,14 +99,39 @@ cd apps/ios && swift test     # iOS-клиент: 19 тестов
 cd apps/android && ./gradlew test
 cd docs/relay/impl/kotlin && ./gradlew test   # крипто-векторы (Kotlin)
 cd docs/relay/impl/swift && swift test        # крипто-векторы (Swift)
+
+./bin/ci.sh            # всё сразу: плагин, скрипты, релей, Swift, Kotlin
+./bin/ci.sh --fast     # только плагин и скрипты (секунды)
+./bin/ci.sh --android  # плюс юнит-тесты Android
 ```
 
-GitHub Actions гоняет то же самое на каждый push в `main`
-([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): плагин и скрипты,
-релей, оба Swift-пакета, крипто-векторы Kotlin и юнит-тесты Android.
+CI — **локальный**: `bin/ci.sh` прогоняет те же проверки, что и будущий
+workflow (плагин и скрипты, релей, оба Swift-пакета, крипто-векторы Kotlin,
+опционально Android). Готовый файл GitHub Actions лежит в
+[`docs/ci/github-actions-ci.yml`](docs/ci/github-actions-ci.yml): он не
+активирован, потому что у токена `gh` нет scope `workflow`; скопируйте его в
+`.github/workflows/ci.yml` — и он заработает как есть.
 
-Пуш в remote — шаг человека; агенты и скрипты набора не пушат и не сливают
-ветки в `main` (это делает оркестратор через `bin/task-commit.sh`).
+Пуш в remote делает оркестратор (GitHub делегирован ему человеком), после
+`bin/ci.sh`; роли — исполнитель, ревьювер, тестировщик — не пушат, а скрипты
+набора пушат только по явной команде.
+
+## Ветвление
+
+```
+main        релизная ветка: сюда попадает только develop, через bin/release.sh (+ тег vX.Y.Z)
+ └─ develop рабочая ветка: сюда вливаются задачи и баги через bin/task-commit.sh
+     ├─ feature/<id>  задача с доски   (bin/task-new.sh "…")
+     └─ bug/<id>      баг              (bin/task-new.sh "…" --type bug)
+```
+
+- Ветка задачи создаётся **от `develop`**, карточка живёт в ней.
+- Перед сдачей в ревью исполнитель делает `git rebase develop` в каталоге задачи
+  и прогоняет тесты заново — иначе ревьювер вернёт «ребейзнись».
+- Слияние задачи — `bin/task-commit.sh <id>` (только в `develop`; в `main` скрипт
+  откажет).
+- Релиз — `bin/release.sh --tag vX.Y.Z`: проверяет чистое дерево, гоняет
+  `bin/test.sh`, мержит `develop` → `main` и ставит тег. Пуш — человек.
 
 ## Безопасность
 

@@ -952,3 +952,30 @@ test("фича telegram: config + токен в окружении без ctx.cr
   assert.equal(entry.service.polling, true);
   await entry.service.stop();
 });
+
+test("вопрос без вариантов: быстрые ответы кнопками вместо force_reply", async (t) => {
+  const { transport, calls } = setup();
+  t.after(() => transport.stop());
+
+  await transport.sendQuestion({ shortId: "a1b2c3d4", body: "Продолжать?", options: [], allowFreeText: true });
+
+  const send = calls.find((call) => call.method === "sendMessage");
+  assert.equal(send.payload.reply_markup.force_reply, undefined, "кнопки и force_reply не конфликтуют");
+  const quick = send.payload.reply_markup.inline_keyboard.flat();
+  assert.deepEqual(quick.map((button) => button.text), ["Да", "Нет", "Отложить", "Решай сам"]);
+
+  // Пустой конфиг quickReplies выключает кнопки — остаётся поле ввода.
+  await transport.sendQuestion({ shortId: "c1b2c3d4", body: "Напиши слово", options: [], allowFreeText: true, quickReplies: [] });
+  const free = calls.filter((call) => call.method === "sendMessage").at(-1);
+  assert.deepEqual(
+    free.payload.reply_markup,
+    { force_reply: true, input_field_placeholder: "Ответьте текстом…", selective: true },
+    "без набора — запрос ввода",
+  );
+
+  // Вопрос с вариантами — по-прежнему кнопки, без force_reply.
+  await transport.sendQuestion({ shortId: "b1b2c3d4", body: "Выбери", options: [{ id: "o1", label: "Да" }] });
+  const withButtons = calls.filter((call) => call.method === "sendMessage").at(-1);
+  assert.ok(withButtons.payload.reply_markup.inline_keyboard.length > 0, "варианты — кнопками");
+  assert.equal(withButtons.payload.reply_markup.force_reply, undefined, "force_reply только для свободного ответа");
+});

@@ -10,6 +10,15 @@
  * попадают: только имена ссылок, источники и права.
  */
 
+import { DEFAULT_LANG, normalizeLang, t } from "./i18n.js";
+
+/** Язык текущего вывода doctor (049). */
+let doctorLang = DEFAULT_LANG;
+
+function dt(key, params = {}) {
+  return t(key, params, doctorLang);
+}
+
 /** Статусы проверок в порядке возрастания серьёзности. */
 export const DOCTOR_STATUS = Object.freeze(["ok", "warn", "fail"]);
 
@@ -21,10 +30,10 @@ export const EXIT_CODES = Object.freeze({ ok: 0, warn: 1, fail: 2 });
  * (что делать; обязателен для `fail`).
  */
 export function createCheck({ id, status = "ok", detail = "", action = undefined } = {}) {
-  if (typeof id !== "string" || id === "") throw new TypeError("doctor: у проверки нет id");
-  if (!DOCTOR_STATUS.includes(status)) throw new TypeError(`doctor: неизвестный статус ${status}`);
+  if (typeof id !== "string" || id === "") throw new TypeError(dt("doctor.createCheck.1"));
+  if (!DOCTOR_STATUS.includes(status)) throw new TypeError(dt("doctor.createCheck.2", { p0: status }));
   if (status === "fail" && (typeof action !== "string" || action === "")) {
-    throw new TypeError(`doctor: fail-проверка ${id} без action`);
+    throw new TypeError(dt("doctor.createCheck.3", { p0: id }));
   }
   return {
     id,
@@ -88,7 +97,8 @@ export function serializeReport(report) {
 }
 
 /** Человеческий вывод: те же машинные id плюс «→ что делать», итог и код. */
-export function formatHealthReport(report) {
+export function formatHealthReport(report, lang = DEFAULT_LANG) {
+  doctorLang = normalizeLang(lang) ?? DEFAULT_LANG;
   const lines = report.checks.map((check) => {
     const head = `[${check.status}] ${check.id}: ${check.detail}`;
     return check.action === undefined ? head : `${head}\n      → ${check.action}`;
@@ -96,15 +106,15 @@ export function formatHealthReport(report) {
   const failed = report.checks.filter((check) => check.status === "fail").length;
   const warned = report.checks.filter((check) => check.status === "warn").length;
   const summary = failed > 0
-    ? `есть проблемы: ${failed} fail, ${warned} warn — сделайте шаги из подсказок`
+    ? dt("doctor.formatHealthReport.1", { p0: failed, p1: warned })
     : warned > 0
-      ? `работает, но есть предупреждения: ${warned}`
-      : "всё в порядке";
+      ? dt("doctor.formatHealthReport.2", { p0: warned })
+      : dt("doctor.formatHealthReport.3");
   return [...lines, "", lastLine(summary, report.exitCode)].join("\n");
 }
 
 function lastLine(summary, exitCode) {
-  return `${summary} (код ${exitCode})`;
+  return dt("doctor.lastLine.1", { p0: summary, p1: exitCode });
 }
 
 /** Преобразовать legacy-проверки 010 в новую модель: старые заголовки узнаваемы. */
@@ -123,7 +133,7 @@ export function fromLegacyChecks(checks) {
     status: check.level,
     detail: `${check.title}: ${check.detail ?? ""}`,
     // Legacy fail без hint не должен ломать модель: даём защитный action.
-    action: check.hint ?? (check.level === "fail" ? "проверьте пункт вручную: /remote doctor" : undefined),
+    action: check.hint ?? (check.level === "fail" ? dt("doctor.fromLegacyChecks.7") : undefined),
   }));
 }
 
@@ -141,7 +151,9 @@ export async function runHealthChecks({
   store = null,
   reliability = null,
   supportedSchemaVersion = null,
+  lang = DEFAULT_LANG,
 } = {}) {
+  doctorLang = normalizeLang(lang) ?? DEFAULT_LANG;
   const checks = [...fromLegacyChecks(legacyChecks)];
 
   // --- credentials: ссылки, источник, writable ---------------------------------
@@ -150,11 +162,11 @@ export async function runHealthChecks({
     checks.push(createCheck({
       id: "credentials",
       status: "warn",
-      detail: "ctx.credentials недоступен",
-      action: "проверьте установку плагина: bin/install-remote.sh",
+      detail: dt("doctor.runHealthChecks.1"),
+      action: dt("doctor.runHealthChecks.2"),
     }));
   } else if (refs.length === 0) {
-    checks.push(createCheck({ id: "credentials", status: "ok", detail: "ссылки на секреты не настроены" }));
+    checks.push(createCheck({ id: "credentials", status: "ok", detail: dt("doctor.runHealthChecks.3") }));
   } else {
     for (const ref of refs) {
       let info = null;
@@ -167,8 +179,8 @@ export async function runHealthChecks({
         checks.push(createCheck({
           id: `credentials:${ref}`,
           status: "warn",
-          detail: `${ref}: describe() не ответил`,
-          action: "проверьте секрет вручную: /remote connect",
+          detail: dt("doctor.runHealthChecks.4", { p0: ref }),
+          action: dt("doctor.runHealthChecks.5"),
         }));
         continue;
       }
@@ -181,39 +193,39 @@ export async function runHealthChecks({
         checks.push(createCheck({
           id: `credentials:${ref}`,
           status: "fail",
-          detail: `${ref}: секрет не найден`,
-          action: "задайте секрет: /remote connect (или переменную окружения)",
+          detail: dt("doctor.runHealthChecks.6", { p0: ref }),
+          action: dt("doctor.runHealthChecks.7"),
         }));
         continue;
       }
-      const writable = info.writable === false ? "только чтение" : "запись доступна";
-      const priority = source === "env" ? "приоритет env: переменная окружения перекрывает файл" : `источник: ${source}`;
+      const writable = info.writable === false ? dt("doctor.runHealthChecks.8") : dt("doctor.runHealthChecks.9");
+      const priority = source === "env" ? dt("doctor.runHealthChecks.10") : dt("doctor.runHealthChecks.11", { p0: source });
       checks.push(createCheck({
         id: `credentials:${ref}`,
         status: info.writable === false ? "warn" : "ok",
         detail: `${ref}: ${priority}, ${writable}`,
-        ...(info.writable === false ? { action: "секрет только для чтения — обновите его вручную или через /remote connect" } : {}),
+        ...(info.writable === false ? { action: dt("doctor.runHealthChecks.12") } : {}),
       }));
     }
   }
 
   // --- relay: /healthz, WS и переподключения -----------------------------------
   if (relay === null || typeof relay !== "object") {
-    checks.push(createCheck({ id: "relay", status: "ok", detail: "релей не настроен (каналы мессенджеров)" }));
+    checks.push(createCheck({ id: "relay", status: "ok", detail: dt("doctor.runHealthChecks.13") }));
   } else {
     const transport = relay.transport ?? relay;
     const health = typeof transport?.healthCheck === "function"
       ? await Promise.resolve(transport.healthCheck()).catch((error) => ({ ok: false, detail: String(error?.message ?? error) }))
-      : { ok: false, detail: "healthCheck недоступен" };
+      : { ok: false, detail: dt("doctor.runHealthChecks.14") };
     const stats = relay.stats ?? transport?.stats ?? null;
-    const ws = typeof stats?.wsState === "string" ? `WS: ${stats.wsState}` : "WS: неизвестно";
-    const attempts = Number.isFinite(stats?.reconnectAttempts) ? `, переподключений: ${stats.reconnectAttempts}` : "";
-    const pending = Number.isFinite(transport?.pending) ? `, ждёт ответа: ${transport.pending}` : "";
+    const ws = typeof stats?.wsState === "string" ? `WS: ${stats.wsState}` : dt("doctor.runHealthChecks.15");
+    const attempts = Number.isFinite(stats?.reconnectAttempts) ? dt("doctor.runHealthChecks.16", { p0: stats.reconnectAttempts }) : "";
+    const pending = Number.isFinite(transport?.pending) ? dt("doctor.runHealthChecks.17", { p0: transport.pending }) : "";
     checks.push(createCheck({
       id: "relay",
       status: health?.ok === true ? "ok" : "fail",
-      detail: `${relay.url ?? "relay"}: ${health?.ok === true ? "на связи" : `нет связи (${health?.detail ?? "?"})`}; ${ws}${attempts}${pending}`,
-      ...(health?.ok === true ? {} : { action: "проверьте URL/токен и /healthz релея: /remote doctor" }),
+      detail: dt("doctor.runHealthChecks.18", { p0: relay.url ?? "relay", p1: health?.ok === true ? dt("doctor.runHealthChecks.34") : dt("doctor.runHealthChecks.35", { p0: health?.detail ?? "?" }), p2: ws, p3: attempts, p4: pending }),
+      ...(health?.ok === true ? {} : { action: dt("doctor.runHealthChecks.19") }),
     }));
   }
 
@@ -243,26 +255,26 @@ export async function runHealthChecks({
       id: "schema",
       status: "fail",
       detail: schemaStatus.error.message,
-      action: schemaStatus.error.instruction ?? "восстановите state.json из state.json.bak-* или обновите плагин",
+      action: schemaStatus.error.instruction ?? dt("doctor.runHealthChecks.20"),
     }));
   } else if (supportedSchemaVersion === null) {
-    checks.push(createCheck({ id: "schema", status: "ok", detail: `версия схемы не проверяется (state: ${stateVersion ?? "?"})` }));
+    checks.push(createCheck({ id: "schema", status: "ok", detail: dt("doctor.runHealthChecks.21", { p0: stateVersion ?? "?" }) }));
   } else if (stateVersion === null) {
     checks.push(createCheck({
       id: "schema",
       status: "warn",
-      detail: stateReadError === null ? "версия схемы state.json не прочитана" : `state.json не прочитан: ${stateReadError}`,
-      action: "проверьте state.json: /remote connect",
+      detail: stateReadError === null ? dt("doctor.runHealthChecks.22") : dt("doctor.runHealthChecks.23", { p0: stateReadError }),
+      action: dt("doctor.runHealthChecks.24"),
     }));
   } else if (stateVersion > supportedSchemaVersion) {
     checks.push(createCheck({
       id: "schema",
       status: "fail",
-      detail: `state.json версии ${stateVersion} новее плагина (${supportedSchemaVersion})`,
-      action: "обновите плагин dsh-remote или восстановите state.json из state.json.bak-*",
+      detail: dt("doctor.runHealthChecks.25", { p0: stateVersion, p1: supportedSchemaVersion }),
+      action: dt("doctor.runHealthChecks.26"),
     }));
   } else {
-    checks.push(createCheck({ id: "schema", status: "ok", detail: `state.json версии ${stateVersion} (поддерживается ${supportedSchemaVersion})` }));
+    checks.push(createCheck({ id: "schema", status: "ok", detail: dt("doctor.runHealthChecks.27", { p0: stateVersion, p1: supportedSchemaVersion }) }));
   }
 
   // --- timers: повисшие TTL-таймеры (031) --------------------------------------
@@ -272,7 +284,7 @@ export async function runHealthChecks({
     checks.push(createCheck({
       id: "timers",
       status: "ok",
-      detail: "пропущено: счётчики TTL-таймеров (031) не установлены",
+      detail: dt("doctor.runHealthChecks.28"),
     }));
   } else {
     const health = await Promise.resolve(reliability.healthCheck()).catch((error) => ({ error }));
@@ -280,8 +292,8 @@ export async function runHealthChecks({
       checks.push(createCheck({
         id: "timers",
         status: "fail",
-        detail: `healthCheck устойчивости упал: ${health.error?.message ?? health.error}`,
-        action: "проверьте журнал плагина и state.json; перезапустите профиль",
+        detail: dt("doctor.runHealthChecks.29", { p0: health.error?.message ?? health.error }),
+        action: dt("doctor.runHealthChecks.30"),
       }));
     } else {
       const watching = Number.isFinite(health?.watching) ? health.watching : null;
@@ -290,9 +302,9 @@ export async function runHealthChecks({
       checks.push(createCheck({
         id: "timers",
         status: healthy ? "ok" : "warn",
-        detail: `TTL: активных ${watching ?? "?"}, в pending ${pending ?? "?"}`
-          + (healthy ? "" : "; канал устойчивости не в порядке"),
-        ...(healthy ? {} : { action: "проверьте канал и журнал: /remote status" }),
+        detail: dt("doctor.runHealthChecks.31", { p0: watching ?? "?", p1: pending ?? "?" })
+          + (healthy ? "" : dt("doctor.runHealthChecks.32")),
+        ...(healthy ? {} : { action: dt("doctor.runHealthChecks.33") }),
       }));
     }
   }
