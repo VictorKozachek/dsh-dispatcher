@@ -202,6 +202,9 @@ async function ensureTransport(ctx, store, deps, facade, isDisposed = () => fals
       return null;
     }
     if (token === null) {
+      // Секрет пропал/ротировался: старый MAX-поллер с прежним токеном не должен
+      // продолжать работать (052) — как в telegram-ветке.
+      await facade.stop();
       deps.logger.warn(`фича commands: привязка на MAX, а секрета ${tokenRef} нет — канал не поднят`);
       return null;
     }
