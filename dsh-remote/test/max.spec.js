@@ -183,6 +183,91 @@ test("нажатие кнопки: message_callback -> /answers и один от
   assert.equal(call.body.text, undefined, "плоского text в теле нет");
 });
 
+test("054 legacy: message_callback с update_type -> ответ и /answers", async (t) => {
+  const updates = [{
+    update_type: "message_callback",
+    type: null,
+    timestamp: 1000,
+    callback: { callback_id: "legacy-cb1", payload: "q:a1b2c3d4:o2", user: { user_id: 7 }, timestamp: 1000 },
+    message: { body: { text: "⌛ ждёт ответа" }, recipient: { chat_id: 42 } },
+  }];
+  const { transport, calls } = setup(t, { routes: { updates } });
+
+  await transport.sendQuestion(question());
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.deepEqual(answers, [{ shortId: "a1b2c3d4", optionIds: ["o2"], answeredBy: "7" }]);
+  const call = calls.find((item) => item.key === "POST /answers");
+  assert.ok(call, "legacy-нажатие подтверждено");
+  assert.equal(call.url.searchParams.get("callback_id"), "legacy-cb1");
+});
+
+test("054 legacy: message_created с update_type -> свободный текст", async (t) => {
+  const updates = [{
+    update_type: "message_created",
+    type: null,
+    timestamp: 2000,
+    message: {
+      body: { text: "да, пришло" },
+      sender: { user_id: 7 },
+      recipient: { chat_id: 42 },
+    },
+  }];
+  const { transport, calls } = setup(t, { routes: { updates } });
+
+  await transport.sendQuestion(question());
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.deepEqual(answers, [{ shortId: "a1b2c3d4", optionIds: [], text: "да, пришло", answeredBy: "7" }]);
+  assert.equal(calls.filter((item) => item.key === "POST /answers").length, 0, "текст не требует /answers");
+});
+
+test("054 legacy: дедуп по update_type", async (t) => {
+  const update = {
+    update_type: "message_callback",
+    callback: { callback_id: "legacy-cb2", payload: "q:a1b2c3d4:o1", user: { user_id: 7 } },
+    message: { recipient: { chat_id: 42 } },
+  };
+  const { transport, calls } = setup(t, { routes: { updates: [update, update] } });
+
+  await transport.sendQuestion(question());
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.equal(answers.length, 1, "дубль отброшен");
+  assert.equal(calls.filter((item) => item.key === "POST /answers").length, 1);
+});
+
+test("054 legacy: неизвестный тип апдейта логируется, а не теряется молча", async (t) => {
+  const logs = [];
+  const updates = [{
+    update_type: "message_edited",
+    message: { body: { text: "x" }, sender: { user_id: 7 }, recipient: { chat_id: 42 } },
+  }];
+  const { transport, calls } = setup(t, { routes: { updates }, options: { log: (line) => logs.push(line) } });
+
+  await transport.sendQuestion(question());
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  const joined = logs.join("\n");
+  assert.match(joined, /max: неизвестный тип апдейта message_edited/);
+  assert.equal(joined.includes("message_edited — бот подключён"), false);
+  assert.equal(calls.filter((item) => item.key === "POST /answers").length, 0);
+});
+
 test("дедуп: одно и то же обновление не обрабатывается дважды", async (t) => {
   const update = {
     type: "message_callback",
@@ -834,6 +919,23 @@ test("050: pairing находит код в схеме v1 (другая влож
   })]);
   const match = await setup.run();
   assert.deepEqual({ chatId: match.chatId, userId: match.userId }, { chatId: 9, userId: 5 });
+});
+
+test("054 legacy: pairing находит код в update_type-схеме", async () => {
+  const setup = pairingSetup([response({
+    marker: 54,
+    updates: [{
+      update_type: "message_created",
+      type: null,
+      message: { body: { text: `код ${CODE}` }, sender: { user_id: 7 }, recipient: { chat_id: 549732759 } },
+    }],
+  })]);
+  const match = await setup.run();
+
+  assert.equal(match.chatId, 549732759);
+  assert.equal(match.userId, 7);
+  assert.equal(match.marker, 54);
+  assert.match(setup.logs.join("\n"), /types=message_created/);
 });
 
 test("050: pairing терпим к вложенному update_type и message.created", async () => {

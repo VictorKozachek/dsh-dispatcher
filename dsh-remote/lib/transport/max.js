@@ -469,12 +469,14 @@ export function createMaxTransport(options = {}) {
 
   /** Ключ дедупа: глобального update_id у MAX нет. */
   function dedupeKey(update) {
-    const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? update?.callback?.chat?.chat_id ?? "";
+    const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? update?.callback?.chat?.chat_id
+      ?? update?.message?.recipient?.chat_id ?? update?.callback?.message?.recipient?.chat_id ?? "";
     const stamp = update?.timestamp ?? update?.message?.timestamp ?? update?.callback?.timestamp ?? "";
-    const identity = update?.type === "message_callback"
+    const type = updateType(update);
+    const identity = type === "message_callback"
       ? update?.callback?.callback_id ?? ""
       : update?.message?.body?.mid ?? update?.message?.mid ?? "";
-    return createHash("sha256").update(`${chat}|${update?.type ?? ""}|${identity}|${stamp}`).digest("hex");
+    return createHash("sha256").update(`${chat}|${type ?? ""}|${identity}|${stamp}`).digest("hex");
   }
 
   /** Уже видели это обновление? */
@@ -516,9 +518,12 @@ export function createMaxTransport(options = {}) {
     if (allowed.size === 0) return false;
     const sender = senderOf(update);
     if (sender === null || !allowed.has(String(sender))) return false;
+    // 054: legacy-хост кладёт chat в message.recipient, а не в callback.chat.
     const updateChat = update?.chat?.chat_id
       ?? update?.callback?.chat?.chat_id
       ?? update?.message?.chat?.chat_id
+      ?? update?.message?.recipient?.chat_id
+      ?? update?.callback?.message?.recipient?.chat_id
       ?? null;
     if (chatId !== null) return updateChat !== null && allowedChatSet().has(String(updateChat));
     if (userId !== null) return String(sender) === String(userId);
@@ -562,25 +567,26 @@ export function createMaxTransport(options = {}) {
   /** Разобрать одно обновление. */
   async function handleUpdate(update) {
     if (isDuplicate(update)) {
-      log(`max: дубль обновления ${update?.type ?? "?"} — игнор`);
+      log(`max: дубль обновления ${updateType(update) ?? "?"} — игнор`);
       return;
     }
+    const type = updateType(update);
     // Служебные события привязки не являются ответами: allowlist к ним не
     // применяем, иначе пустой список (fail-closed) скрыл бы сам факт привязки.
-    if (update?.type === "bot_started" || update?.type === "bot_added") {
-      const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? null;
+    if (type === "bot_started" || type === "bot_added") {
+      const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? update?.message?.recipient?.chat_id ?? null;
       const user = update?.user?.user_id ?? update?.message?.sender?.user_id ?? null;
       if (chat !== null) detected.chatId = chat;
       if (user !== null) detected.userId = user;
-      log(`max: ${update.type} — бот подключён (chat_id ${chat ?? "?"}, user_id ${user ?? "?"})`);
+      log(`max: ${type} — бот подключён (chat_id ${chat ?? "?"}, user_id ${user ?? "?"})`);
       return;
     }
     if (!allowedSender(update)) {
-      log(`max: отправитель не в allowlist — игнор (${update?.type ?? "?"})`);
+      log(`max: отправитель не в allowlist — игнор (${type ?? "?"})`);
       return;
     }
 
-    if (update?.type === "message_callback") {
+    if (type === "message_callback") {
       const parsed = parseCallbackData(update?.callback?.payload);
       if (parsed === null) {
         log("max: колбэк без нашего payload — игнор");
@@ -606,7 +612,7 @@ export function createMaxTransport(options = {}) {
       return;
     }
 
-    if (update?.type === "message_created") {
+    if (type === "message_created") {
       const message = update.message;
       const text = typeof message?.body?.text === "string" ? message.body.text.trim() : "";
       if (text === "") return;
@@ -625,13 +631,9 @@ export function createMaxTransport(options = {}) {
       return;
     }
 
-    if (update?.type === "bot_started" || update?.type === "bot_added") {
-      const chat = update?.chat?.chat_id ?? update?.message?.chat?.chat_id ?? null;
-      const user = update?.user?.user_id ?? update?.message?.sender?.user_id ?? null;
-      if (chat !== null) detected.chatId = chat;
-      if (user !== null) detected.userId = user;
-      log(`max: ${update.type} — бот подключён (chat_id ${chat ?? "?"}, user_id ${user ?? "?"})`);
-    }
+    // 054: legacy-хост присылает update_type; неизвестный/неразобранный тип
+    // больше не теряется молча — в журнале видно, что именно пришло.
+    log(`max: неизвестный тип апдейта ${type ?? "(пусто)"} — игнор`);
   }
 
   /** Один цикл long polling. */
@@ -1151,7 +1153,7 @@ export async function maxPollForCode({
 }
 
 /** Тип апдейта с учётом v1/v2: `type`, `update_type` или вложенный `update.update_type`. */
-function updateType(update) {
+export function updateType(update) {
   for (const value of [update?.type, update?.update_type, update?.message?.type, update?.update?.update_type, update?.update?.type]) {
     if (typeof value === "string" && value !== "") return value;
   }
