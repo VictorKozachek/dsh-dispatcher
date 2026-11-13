@@ -82,6 +82,8 @@ const dictionariesBase = Object.freeze({
 
 
     "commands.status.language": "язык: {lang}",
+    "commands.status.journal": "журнал: {p0}",
+    "commands.status.journalDisabled": "журнал выключен: {p0}",
     "commands.status.notBound": "бот не привязан: /remote connect",
     "commands.status.secret": "секрет: {ref} — не найден",
     "commands.status.hybrid": "гибрид: {state}",
@@ -143,6 +145,8 @@ const dictionariesBase = Object.freeze({
 
 
     "commands.status.language": "language: {lang}",
+    "commands.status.journal": "journal: {p0}",
+    "commands.status.journalDisabled": "journal disabled: {p0}",
     "commands.status.notBound": "bot is not bound: /remote connect",
     "commands.status.secret": "secret: {ref} — not found",
     "commands.status.hybrid": "hybrid: {state}",

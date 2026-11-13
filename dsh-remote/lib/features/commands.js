@@ -417,6 +417,9 @@ export const commandsFeature = {
       log,
       ensureTransport: ensure,
       currentChannel,
+      // 056: журнал публикует journalFeature через deps.expose; ctx.get в cordis
+      // обычный объект не видит, поэтому передаём сервис явно.
+      journal: deps.get("remoteJournal") ?? null,
       lang: config?.lang ?? null,
       // 039: long polling для pairing MAX; можно переопределить в config.max.
       ...(Number.isFinite(config?.max?.pollTimeoutSec) ? { maxPairingPollTimeoutSec: config.max.pollTimeoutSec } : {}),

@@ -465,6 +465,8 @@ export function createRemoteCommands({
   ensureTransport = null,
   /** Живой транспорт канала (фасад): null, если канала нет. */
   currentChannel = null,
+  /** 056: сервис журнала из общего реестра фич (`deps.get`), ctx.get — страховка. */
+  journal = null,
   /** 046: язык из конфига плагина (если `/remote lang` ещё не задан). */
   lang = null,
   testAnswerTimeoutMs = 30 * 60 * 1000,
@@ -472,6 +474,8 @@ export function createRemoteCommands({
 } = {}) {
   const registry = createRegistry({ readState: () => store.read().enabled, log });
   const credentials = createCredentialAccess(ctx, { log });
+  /** 056: журнал: явный сервис из deps.expose важнее ctx.get (cordis его не видит). */
+  const journalService = () => journal ?? ctx?.get?.("remoteJournal") ?? null;
 
   /** Журнал решений (026): читаем тот же `audit.jsonl`, куда пишет ответчик. */
   const audit = createAudit({
@@ -883,7 +887,8 @@ export function createRemoteCommands({
         sleep,
         signal: invocation?.signal,
         log,
-        journal: ctx?.get?.("remoteJournal") ?? null,
+        // 056: журнал виден и через общий реестр, и через ctx.get.
+        journal: journalService(),
         stats,
       });
     } catch (error) {
@@ -1194,6 +1199,14 @@ export function createRemoteCommands({
     const lines = [];
 
     lines.push(t("commands.status.language", { lang }, lang));
+    // 056: путь журнала виден в статусе; если сервис не поднялся — строки нет.
+    const journal = journalService();
+    if (journal !== null && typeof journal === "object") {
+      const journalFile = typeof journal.file === "string" && journal.file !== "" ? journal.file : "?";
+      lines.push(journal.enabled === false
+        ? t("commands.status.journalDisabled", { p0: journalFile }, lang)
+        : t("commands.status.journal", { p0: journalFile }, lang));
+    }
     if (state.bindings === null && liveTransport() === null) {
       lines.push(t("commands.status.notBound", {}, lang));
     } else if (state.bindings === null) {
@@ -1556,6 +1569,7 @@ export function createRemoteCommands({
       relay,
       store,
       reliability: ctx?.get?.("remoteReliability") ?? null,
+      journal: journalService(),
       supportedSchemaVersion: STATE_VERSION,
       lang: commandLang,
     });
