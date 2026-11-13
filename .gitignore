@@ -2,6 +2,7 @@
 .kanban/.watcher-state.json
 .kanban/.watcher-roles.json
 .kanban/.watcher-pending.json
+.kanban/.watcher-resume.json
 .kanban/.workers.json
 .kanban/worktrees.json
 
