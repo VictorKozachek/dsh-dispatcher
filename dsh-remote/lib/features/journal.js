@@ -28,11 +28,13 @@ export const journalFeature = {
       enabled: config?.logFile !== false,
       logger: (message) => deps.logger.warn(message),
     });
+    // 056: cordis не публикует обычный объект через ctx.provide; общий реестр
+    // фич (deps.expose) — основной путь, ctx.provide остаётся для команд/панели.
+    deps.expose?.(JOURNAL_SERVICE, journal);
     try {
       ctx.provide?.(JOURNAL_SERVICE, journal);
     } catch (error) {
       deps.logger.warn(`journal: сервис ${JOURNAL_SERVICE} не зарегистрирован (${error?.message ?? error})`);
-      return;
     }
     deps.logger.debug(`journal: ${journal.enabled ? `пишу в ${file}` : "выключен конфигом"}`);
   },

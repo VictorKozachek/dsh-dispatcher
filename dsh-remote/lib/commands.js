@@ -883,6 +883,7 @@ export function createRemoteCommands({
         sleep,
         signal: invocation?.signal,
         log,
+        // 056: журнал виден и через общий реестр, и через ctx.get.
         journal: ctx?.get?.("remoteJournal") ?? null,
         stats,
       });
@@ -1194,6 +1195,14 @@ export function createRemoteCommands({
     const lines = [];
 
     lines.push(t("commands.status.language", { lang }, lang));
+    // 056: путь журнала виден в статусе; если сервис не поднялся — строки нет.
+    const journal = ctx?.get?.("remoteJournal") ?? null;
+    if (journal !== null && typeof journal === "object") {
+      const journalFile = typeof journal.file === "string" && journal.file !== "" ? journal.file : "?";
+      lines.push(journal.enabled === false
+        ? t("commands.status.journalDisabled", { p0: journalFile }, lang)
+        : t("commands.status.journal", { p0: journalFile }, lang));
+    }
     if (state.bindings === null && liveTransport() === null) {
       lines.push(t("commands.status.notBound", {}, lang));
     } else if (state.bindings === null) {
@@ -1556,6 +1565,7 @@ export function createRemoteCommands({
       relay,
       store,
       reliability: ctx?.get?.("remoteReliability") ?? null,
+      journal: ctx?.get?.("remoteJournal") ?? null,
       supportedSchemaVersion: STATE_VERSION,
       lang: commandLang,
     });

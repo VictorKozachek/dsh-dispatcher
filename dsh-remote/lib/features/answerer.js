@@ -239,7 +239,9 @@ export const answererFeature = {
       hybrid: () => (store?.read?.().hybrid ?? { enabled: false }),
       registry,
       quickReplies: config?.quickReplies,
-      journal: deps.get("remoteJournal") ?? null,
+      // 056: журнал мог не попасть в общий реестр (или deps.get вернул null) —
+      // страховка через ctx.get, как у транспорта.
+      journal: deps.get("remoteJournal") ?? ctx?.get?.("remoteJournal") ?? null,
       lang: () => resolveLanguage({ explicit: store?.read?.().lang ?? config?.lang ?? null }),
       reliability,
       metrics: deps.get("remoteMetrics") ?? null,

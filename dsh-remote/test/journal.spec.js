@@ -10,7 +10,10 @@ import path from "node:path";
 
 import { createJournal, journalPath, redactJournalText } from "../lib/journal.js";
 import { createAnswerer } from "../lib/answerer.js";
+import { createRemoteCommands } from "../lib/commands.js";
 import { createRegistry } from "../lib/domain/registry.js";
+import { runHealthChecks } from "../lib/doctor.js";
+import { createStore } from "../lib/store.js";
 
 function tempDir(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-journal-"));
@@ -223,15 +226,173 @@ test("051: фича journal публикует сервис, logFile:false вы�
   const ctx = { provide: (name, service) => provided.set(name, service) };
   const deps = { logger: { debug: () => {}, warn: () => {} }, get: () => null };
 
-  journalFeature.apply(ctx, { logFile: false }, deps);
+  const exposed = new Map();
+  const exposingDeps = { ...deps, expose: (name, service) => exposed.set(name, service) };
+  journalFeature.apply(ctx, { logFile: false }, exposingDeps);
+  assert.equal(exposed.get("remoteJournal"), provided.get("remoteJournal"), "056: сервис в общем реестре");
   const disabled = provided.get("remoteJournal");
   assert.equal(disabled.enabled, false);
   assert.equal(disabled.record("question.send"), false);
 
   const dir = tempDir({ after: () => {} });
-  journalFeature.apply({ provide: (name, service) => provided.set(name, service) }, { logFile: path.join(dir, "custom.jsonl") }, deps);
+  journalFeature.apply({ provide: (name, service) => provided.set(name, service) }, { logFile: path.join(dir, "custom.jsonl") }, exposingDeps);
   const enabled = provided.get("remoteJournal");
   assert.equal(enabled.enabled, true);
   assert.equal(enabled.record("question.sent", { transport: "max" }), true);
   assert.equal(fs.existsSync(path.join(dir, "custom.jsonl")), true);
+});
+
+
+/** 056: мини-каркас фич: общий реестр (`expose/get`) + ctx (`provide/get`). */
+function featureStand(t, file, { hideJournalFromDeps = false } = {}) {
+  const shared = new Map();
+  const provided = new Map();
+  const handlers = new Set();
+  const services = {
+    sessions: { get: () => null },
+    remoteTransports: new Map(),
+  };
+  const logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+  const ctx = {
+    logger,
+    get(name) {
+      return provided.get(name) ?? services[name] ?? null;
+    },
+    provide(name, value) {
+      provided.set(name, value);
+    },
+    on(event, handler) {
+      if (event === "user-questions/request") handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+  };
+  const sent = [];
+  const transport = {
+    id: "max",
+    caps: { inlineButtons: true, maxText: 4000, maxOptions: 8 },
+    async sendQuestion(question) {
+      sent.push(question);
+      return { messageId: "m-1" };
+    },
+    async closeQuestion() {},
+    onAnswer() {
+      return () => {};
+    },
+  };
+  services.remoteTransport = transport;
+  services.remoteStore = {
+    read: () => ({ enabled: { global: true }, bindings: null }),
+    paths: { dir: path.dirname(file) },
+  };
+  const deps = {
+    logger,
+    expose: (name, value) => shared.set(name, value),
+    get: (name) => (hideJournalFromDeps && name === "remoteJournal"
+      ? null
+      : shared.get(name) ?? ctx.get(name)),
+    onDispose: () => {},
+  };
+  return { ctx, deps, handlers, sent, shared, provided, transport };
+}
+
+async function runFeatureQuestion(stand) {
+  const { journalFeature } = await import("../lib/features/journal.js");
+  const { answererFeature } = await import("../lib/features/answerer.js");
+  journalFeature.apply(stand.ctx, { logFile: stand.file }, stand.deps);
+  answererFeature.apply(stand.ctx, {}, stand.deps);
+  const handler = [...stand.handlers][0];
+  assert.equal(typeof handler, "function", "ответчик подписан каркасом");
+  const controller = new AbortController();
+  const pending = handler({
+    questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }],
+    agent: { id: "s1" },
+    signal: controller.signal,
+  }, () => assert.fail("next() не должен вызываться"));
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  await pending.catch(() => {});
+  return stand;
+}
+
+test("056: каркас journalFeature → deps → answerer пишет question.send в файл", async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "log.jsonl");
+  const stand = featureStand(t, file);
+  stand.file = file;
+
+  await runFeatureQuestion(stand);
+
+  const entries = lines(file);
+  const names = entries.map((entry) => entry.event);
+  assert.deepEqual(names, ["question.send", "question.sent"], "обе записи через общий реестр");
+  assert.equal(entries[0].transport, "max");
+  assert.equal(JSON.parse(entries[1].detail).messageId, "m-1");
+});
+
+test("056: answerer берёт журнал через ctx.get, если deps.get вернул null", async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "log.jsonl");
+  const stand = featureStand(t, file, { hideJournalFromDeps: true });
+  stand.file = file;
+
+  await runFeatureQuestion(stand);
+
+  const names = lines(file).map((entry) => entry.event);
+  assert.deepEqual(names, ["question.send", "question.sent"], "страховочный путь ctx.get");
+});
+
+test("056: сервис, видимый обоими путями, не даёт двойной записи", async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "log.jsonl");
+  const stand = featureStand(t, file);
+  stand.file = file;
+
+  await runFeatureQuestion(stand);
+
+  const names = lines(file).map((entry) => entry.event);
+  assert.equal(names.filter((name) => name === "question.send").length, 1, "question.send один раз");
+  assert.equal(names.filter((name) => name === "question.sent").length, 1, "question.sent один раз");
+});
+
+function createStoreForStatus(dir) {
+  return createStore({ file: path.join(dir, "state.json") });
+}
+
+function createRemoteCommandsForStatus({ journal, store }) {
+  return createRemoteCommands({
+    ctx: { get: (name) => (name === "remoteJournal" ? journal : null) },
+    store,
+    log: () => {},
+    now: () => 1_000,
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true, result: true }) }),
+  });
+}
+
+test("056: /remote status показывает путь журнала без падения", async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "log.jsonl");
+  const { createJournal } = await import("../lib/journal.js");
+  const journal = createJournal({ file });
+  const store = createStoreForStatus(dir);
+  const remote = createRemoteCommandsForStatus({ journal, store });
+  const result = await remote.handler({
+    commandId: "status-1",
+    agent: { id: "s1", session: { id: "s1" } },
+    rawInput: "status",
+    signal: new AbortController().signal,
+  });
+  assert.equal(result.kind, "success");
+  assert.match(result.text, new RegExp(file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+
+test("056: doctor показывает журнал и предупреждает о выключенном", async () => {
+  const enabled = await runHealthChecks({ journal: { file: "/tmp/log.jsonl", enabled: true } });
+  const journalCheck = enabled.find((check) => check.id === "journal");
+  assert.ok(journalCheck, "проверка журнала есть");
+  assert.equal(journalCheck.status, "ok");
+  assert.match(journalCheck.detail, /log\.jsonl/);
+
+  const disabled = await runHealthChecks({ journal: { file: "/tmp/log.jsonl", enabled: false } });
+  assert.equal(disabled.find((check) => check.id === "journal").status, "warn");
 });
