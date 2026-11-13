@@ -360,7 +360,9 @@ function createStoreForStatus(dir) {
 
 function createRemoteCommandsForStatus({ journal, store }) {
   return createRemoteCommands({
-    ctx: { get: (name) => (name === "remoteJournal" ? journal : null) },
+    // Реальный cordis: обычный объект через ctx.provide не виден, ctx.get → null.
+    ctx: { get: () => null },
+    journal,
     store,
     log: () => {},
     now: () => 1_000,
@@ -383,6 +385,16 @@ test("056: /remote status показывает путь журнала без п
   });
   assert.equal(result.kind, "success");
   assert.match(result.text, new RegExp(file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+  const doctor = await remote.handler({
+    commandId: "doctor-1",
+    agent: { id: "s1", session: { id: "s1" } },
+    rawInput: "doctor",
+    signal: new AbortController().signal,
+  });
+  assert.equal(doctor.kind, "success");
+  assert.match(doctor.text, /журнал:|journal:/);
+  assert.match(doctor.text, /log\.jsonl/);
 });
 
 
@@ -395,4 +407,65 @@ test("056: doctor показывает журнал и предупреждае�
 
   const disabled = await runHealthChecks({ journal: { file: "/tmp/log.jsonl", enabled: false } });
   assert.equal(disabled.find((check) => check.id === "journal").status, "warn");
+});
+
+test("056: commandsFeature берёт журнал из deps.expose при ctx.get(remoteJournal)=null", async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "log.jsonl");
+  const previousHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = dir;
+  const { journalFeature } = await import("../lib/features/journal.js");
+  const { commandsFeature } = await import("../lib/features/commands.js");
+  const shared = new Map();
+  const registered = [];
+  const logger = { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} };
+  const ctx = {
+    logger,
+    get(name) {
+      if (name === "commands") return { register: (definition) => { registered.push(definition); return () => {}; } };
+      if (name === "credentials") {
+        return {
+          resolve: async () => null,
+          describe: async () => ({ configured: false, source: null, writable: false }),
+          set: async () => true,
+          unset: async () => true,
+        };
+      }
+      return null; // как в cordis: remoteJournal через ctx не виден
+    },
+    provide: () => {},
+    on: () => () => {},
+  };
+  const deps = {
+    logger,
+    expose: (name, value) => shared.set(name, value),
+    get: (name) => shared.get(name) ?? null,
+    onDispose: () => {},
+    trace: () => {},
+  };
+  try {
+    journalFeature.apply(ctx, { logFile: file }, deps);
+    await commandsFeature.apply(ctx, {}, deps);
+    const definition = registered.find((item) => item.name === "remote");
+    assert.ok(definition, "/remote зарегистрирована");
+    const status = await definition.handler({
+      commandId: "feature-status",
+      agent: { id: "s1", session: { id: "s1" } },
+      rawInput: "status",
+      signal: new AbortController().signal,
+    });
+    assert.equal(status.kind, "success");
+    assert.match(status.text, /log\.jsonl/, "status видит журнал из deps.expose");
+    const doctor = await definition.handler({
+      commandId: "feature-doctor",
+      agent: { id: "s1", session: { id: "s1" } },
+      rawInput: "doctor",
+      signal: new AbortController().signal,
+    });
+    assert.equal(doctor.kind, "success");
+    assert.match(doctor.text, /журнал:|journal:/);
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previousHome;
+  }
 });
