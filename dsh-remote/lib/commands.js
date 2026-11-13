@@ -883,6 +883,7 @@ export function createRemoteCommands({
         sleep,
         signal: invocation?.signal,
         log,
+        journal: ctx?.get?.("remoteJournal") ?? null,
         stats,
       });
     } catch (error) {

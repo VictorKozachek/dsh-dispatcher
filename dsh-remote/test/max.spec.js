@@ -1059,3 +1059,26 @@ test("050: таймаут запроса сохраняется в статис�
   assert.equal(result, null);
   assert.equal(stats.lastError?.code, "MAX_TIMEOUT");
 });
+
+test("051: pairing пишет pairing.poll/code в журнал без текста", async () => {
+  const events = [];
+  const journal = { record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
+  const clock = fakeClock();
+  const result = await maxPollForCode({
+    token: TOKEN,
+    code: CODE,
+    deadline: clock.clock + 5_000,
+    pollTimeoutSec: 0,
+    apiBase: "https://platform-api2.max.ru",
+    fetch: async () => response({
+      updates: [{ type: "message_created", message: { sender: { user_id: 7 }, recipient: { chat_id: 42 }, body: { text: CODE } } }],
+    }),
+    now: clock.now,
+    sleep: clock.sleep,
+    journal,
+  });
+  assert.equal(result.chatId, 42);
+  assert.deepEqual(events.map((entry) => entry.event), ["pairing.poll", "pairing.code"]);
+  assert.equal(events[0].transport, "max");
+  assert.equal(JSON.stringify(events).includes(CODE), false, "код не в журнале");
+});
