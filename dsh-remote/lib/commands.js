@@ -1139,7 +1139,23 @@ export function createRemoteCommands({
       if (flags.has("hybrid")) store.setHybrid({ enabled });
       if (flags.has("no-hybrid")) store.setHybrid({ enabled: false });
       if (flags.has("all")) {
+        const before = store.read().enabled;
         store.setEnabled({ kind: "global" }, enabled);
+        const after = store.read().enabled;
+        const removed = [];
+        for (const group of ["workspaces", "sessions"]) {
+          for (const key of Object.keys(before?.[group] ?? {})) {
+            if (before[group][key] === !enabled && after?.[group]?.[key] === undefined) removed.push(`${group}:${key}`);
+          }
+        }
+        if (removed.length > 0) {
+          log(tx(enabled ? "commands.log.modeAllOn" : "commands.log.modeAllOff", { p0: removed.join(", ") }));
+          try {
+            journalService()?.record?.("mode.all", { detail: { enabled, removed } });
+          } catch (error) {
+            log(tx("commands.log.modeAllJournalError", { p0: error?.message ?? error }));
+          }
+        }
         const decision = registry.resolve({ sessionId, workspace: cwd });
         return success(tx("commands.setMode.4", { p0: enabled ? tx("commands.setMode.10") : tx("commands.setMode.11"), p1: describeEffective(decision) }));
       }
@@ -1264,7 +1280,31 @@ export function createRemoteCommands({
     const approvalAudit = audit.stats();
     lines.push(tx("commands.status.16", { p0: approvalAudit.remote, p1: approvalAudit.gui, p2: approvalAudit.timeout, p3: approvalAudit.total }));
     lines.push(tx("commands.status.17", { p0: state.enabled.global ? tx("commands.status.31") : tx("commands.status.14"), p1: cwd === null ? "?" : cwd, p2: cwd !== null && state.enabled.workspaces[cwd] === true ? tx("commands.status.31") : tx("commands.status.14"), p3: sessionId === null ? "?" : sessionId, p4: sessionId !== null && state.enabled.sessions[sessionId] === true ? tx("commands.status.31") : tx("commands.status.14") }));
-    lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
+    const decision = registry.resolve({ sessionId, workspace: cwd });
+    lines.push(describeEffective(decision));
+    // 057: если проект/сессия перекрывают глобальное значение — показываем оба
+    // факта и источник, иначе status врёт «включено для всех».
+    const globalEnabled = state.enabled.global === true;
+    if (decision.scope !== null && decision.scope !== "global" && decision.enabled !== globalEnabled) {
+      const scopeLabel = decision.scope === "session" ? `session ${sessionId ?? "?"}` : `workspace ${cwd ?? "?"}`;
+      lines.push(t("commands.status.override", {
+        p0: globalEnabled ? tx("commands.status.31") : tx("commands.status.14"),
+        p1: scopeLabel,
+        p2: decision.enabled ? tx("commands.status.31") : tx("commands.status.14"),
+        p3: decision.scope,
+      }, lang));
+      log(tx("commands.log.modeOverride", {
+        p0: globalEnabled ? tx("commands.status.31") : tx("commands.status.14"),
+        p1: scopeLabel,
+        p2: decision.enabled ? tx("commands.status.31") : tx("commands.status.14"),
+        p3: decision.scope,
+      }));
+      try {
+        journalService()?.record?.("mode.override", { detail: { scope: decision.scope, effective: decision.enabled, global: globalEnabled } });
+      } catch (error) {
+        log(tx("commands.log.modeOverrideJournalError", { p0: error?.message ?? error }));
+      }
+    }
 
     // 025: действующая политика подтверждений (публикует ответчик approvals 024).
     try {

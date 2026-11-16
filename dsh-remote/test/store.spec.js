@@ -285,3 +285,25 @@ test("credentials: настоящий API (async resolve/describe/set/unset) и 
   assert.equal(missing.available, false);
   assert.equal(await missing.resolve(ref), null);
 });
+
+test("057: global value снимает спорящие явные исключения", (t) => {
+  const dir = tempDir(t);
+  const { store } = makeStore(dir);
+
+  store.setEnabled({ kind: "workspace", id: "/p" }, false);
+  store.setEnabled({ kind: "session", id: "s1" }, false);
+  store.setEnabled({ kind: "global" }, true);
+
+  let state = store.read();
+  assert.equal(state.enabled.global, true);
+  assert.deepEqual(state.enabled.workspaces, {}, "явный запрет проекта снят");
+  assert.deepEqual(state.enabled.sessions, {}, "явный запрет сессии снят");
+
+  store.setEnabled({ kind: "workspace", id: "/p" }, true);
+  store.setEnabled({ kind: "session", id: "s1" }, true);
+  store.setEnabled({ kind: "global" }, false);
+  state = store.read();
+  assert.equal(state.enabled.global, false);
+  assert.deepEqual(state.enabled.workspaces, {}, "явное разрешение проекта снято");
+  assert.deepEqual(state.enabled.sessions, {}, "явное разрешение сессии снято");
+});
