@@ -91,7 +91,25 @@ waterfall(...args) {
 3. вернуть ответ, **не дожидаясь** `next()` — тогда downstream-запрос остаётся
    висеть: у плагина нет ссылки, чтобы его отменить/завершить.
 
-Эксперимент на распакованном `@deepseek-ai/cordis` (не мок, реальный waterfall):
+Эксперимент на распакованном `@deepseek-ai/dsh-user-questions` и реальном
+`@deepseek-ai/cordis` (не мок): создан настоящий `UserQuestionService(ctx)`,
+зарегистрирован «GUI»-слушатель и prepend-слушатель тестового плагина; плагин
+вызвал `next()`, дождался ответа GUI и вернул другой ответ. Прототип сервиса:
+
+```
+[ 'constructor', 'releaseReply', 'assertLiveRoot', 'continued',
+  'answer', 'attachWait', 'askTimed', 'ask',
+  '@deepseek-ai/dsh-typert-protocol/remote-methods' ]
+```
+
+(никаких `cancel/settle/list/pending`). Результат `service.ask()`:
+
+```
+ASK_RESULT {"answers":[{"id":"q1","selected":["from-messenger"]}]}
+EVENTS plugin:next | gui:request | gui:answer | plugin:gui={"answers":[{"id":"q1","selected":["from-gui"]}]}
+```
+
+Тот же waterfall на чистом Cordis:
 
 ```
 plugin:before-next | gui:got-request | gui:answered | plugin:after-next:{"answers":[{"id":"q1","selected":["from-gui"]}]}
@@ -219,8 +237,10 @@ GUI — источник истины; плагин **не забирает** в
 `~/.dsh/profiles` вне рабочей директории задачи запрещена. Проверено:
 
 - код хоста 0.2.1-rc.5 (распакованный `app.asar`) — методы/события/строки выше;
-- реальный `@deepseek-ai/cordis` waterfall — два harness-эксперимента (§3):
-  `next()` + override и early-return с зависшим downstream;
+- настоящий `UserQuestionService` из распакованного пакета (прототип без
+  cancel/settle) и реальный `@deepseek-ai/cordis` waterfall — три
+  harness-эксперимента (§3): `ask()` с `next()`+override, ранний возврат с
+  зависшим downstream и список методов сервиса;
 - код клиентской карточки — условие удаления и поведение `dismiss` (§2).
 
 Для приёмки B нужен один ручной прогон с живой карточкой GUI (ответ в GUI →
