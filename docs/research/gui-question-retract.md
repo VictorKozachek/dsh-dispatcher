@@ -231,6 +231,19 @@ GUI — источник истины; плагин **не забирает** в
 5. Отдельно (если нужен A) — карточка на хост: `UserQuestionService` cancel/
    settle для живого запроса + forwarded event; без неё A не начинать.
 
+## 9. Одноразовый probe-плагин для живой проверки
+
+В `/tmp/dsh-question-probe/` лежит одноразовый плагин (не в репозитории):
+регистрирует prepend-слушатель `user-questions/request`, пишет в
+`/tmp/question-probe.log` запрос (id вопросов и `wait.callId`), ответ GUI и
+результат `ctx.userQuestions.answer(...)` после ответа GUI. Ожидаемо для live
+(legacy) вопроса `answer.after-gui = false` — это подтверждает §1; для timed
+`continued` — `true`.
+
+Установка — только в отдельный профиль: `dsh plugin --profile <temp> add
+/tmp/dsh-question-probe`, затем задать агенту `ask_user_question` и посмотреть
+лог + плашку. Правку общего профиля делает оркестратор/человек.
+
 ## 8. Ограничения аудита
 
 Живой GUI-клиент в этом аудите не подключался: профиль DSH общий и правка
