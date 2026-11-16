@@ -16,6 +16,7 @@ import path from "node:path";
 import { createStore } from "../lib/store.js";
 import { createAudit } from "../lib/audit.js";
 import { commandsFeature } from "../lib/features/commands.js";
+import { createRegistry } from "../lib/domain/registry.js";
 import { telegramFeature } from "../lib/features/telegram.js";
 import { answererFeature } from "../lib/features/answerer.js";
 import { RELAY_TOKEN_REF } from "../lib/transport/relay.js";
@@ -396,6 +397,88 @@ test("on/off: воркспейс по умолчанию, --all и --session", a
   const off = await remote.handler(invoke("off --all"));
   assert.equal(off.kind, "success");
   assert.equal(stand.store.read().enabled.global, false);
+});
+
+test("057: on --all снимает прежние проектные запреты, off --all — разрешения", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  const channel = { id: "telegram", start: async () => {}, stop: async () => {}, sendQuestion: async () => ({}) };
+  const logs = [];
+  const journalEvents = [];
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: (line) => logs.push(line),
+    journal: { record: (event, fields) => journalEvents.push({ event, ...fields }) },
+    now: () => stand.clock,
+    currentChannel: () => channel,
+  });
+
+  // Прежний точечный запрет + выключенный глобальный режим.
+  stand.store.setEnabled({ kind: "workspace", id: WORKSPACE }, false);
+  const on = await remote.handler(invoke("on --all"));
+  assert.equal(on.kind, "success");
+  let state = stand.store.read();
+  assert.equal(state.enabled.global, true);
+  assert.equal(Object.hasOwn(state.enabled.workspaces, WORKSPACE), false, "запрет снят");
+  assert.deepEqual(createRegistry({ readState: () => state.enabled }).resolve({ workspace: WORKSPACE }), { enabled: true, scope: "global" });
+  assert.match(logs.join("\n"), /сняты явные запреты/);
+  assert.equal(journalEvents.at(-1).event, "mode.all");
+
+  // Теперь точечное разрешение + off --all: разрешение тоже снимается.
+  stand.store.setEnabled({ kind: "workspace", id: WORKSPACE }, true);
+  const off = await remote.handler(invoke("off --all"));
+  assert.equal(off.kind, "success");
+  state = stand.store.read();
+  assert.equal(state.enabled.global, false);
+  assert.equal(Object.hasOwn(state.enabled.workspaces, WORKSPACE), false, "разрешение снято");
+  assert.deepEqual(createRegistry({ readState: () => state.enabled }).resolve({ workspace: WORKSPACE }), { enabled: false, scope: "global" });
+});
+
+test("057: после --all точечные on/off снова перекрывают глобальное", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  const channel = { id: "telegram", start: async () => {}, stop: async () => {}, sendQuestion: async () => ({}) };
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    currentChannel: () => channel,
+  });
+
+  await remote.handler(invoke("on --all"));
+  const offProject = await remote.handler(invoke("off"));
+  assert.equal(offProject.kind, "success");
+  assert.equal(stand.store.read().enabled.workspaces[WORKSPACE], false);
+  assert.deepEqual(createRegistry({ readState: () => stand.store.read().enabled }).resolve({ workspace: WORKSPACE }), { enabled: false, scope: "workspace" });
+
+  const onProject = await remote.handler(invoke("on"));
+  assert.equal(onProject.kind, "success");
+  assert.equal(stand.store.read().enabled.workspaces[WORKSPACE], true);
+  assert.deepEqual(createRegistry({ readState: () => stand.store.read().enabled }).resolve({ workspace: WORKSPACE }), { enabled: true, scope: "workspace" });
+});
+
+test("057: status показывает перекрытие проекта при включённом глобальном", async (t) => {
+  const stand = harness(t);
+  stand.store.setEnabled({ kind: "global" }, true);
+  stand.store.setEnabled({ kind: "workspace", id: WORKSPACE }, false);
+  const logs = [];
+  const journalEvents = [];
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: (line) => logs.push(line),
+    journal: { record: (event, fields) => journalEvents.push({ event, ...fields }) },
+    now: () => stand.clock,
+  });
+
+  const result = await remote.handler(invoke("status"));
+  assert.equal(result.kind, "success");
+  assert.match(result.text, /scope: workspace/);
+  assert.match(result.text, /проект|workspace/);
+  assert.match(logs.join("\n"), /scope: workspace/);
+  assert.equal(journalEvents.some((entry) => entry.event === "mode.override"), true);
 });
 
 test("on без cwd: подсказка про --all и --session", async (t) => {
