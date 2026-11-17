@@ -27,6 +27,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createRegistry } from "./domain/registry.js";
+import { detectMirrorMode } from "./answerer.js";
 import { STATE_VERSION, credentialRef, createCredentialAccess } from "./store.js";
 import {
   buildReport,
@@ -1226,7 +1227,7 @@ export function createRemoteCommands({
   /** 063: возможности хоста для mirror: settle + событие (ctx.on). */
   function mirrorCapability() {
     const host = ctx?.get?.("userQuestions") ?? null;
-    const full = typeof host?.settle === "function" && typeof ctx?.on === "function";
+    const full = detectMirrorMode(host) === "full";
     return { mode: full ? "full" : "notify", reason: full ? null : tx("commands.mirror.noSettle") };
   }
 

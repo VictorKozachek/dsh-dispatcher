@@ -232,7 +232,7 @@ export const answererFeature = {
     // 063: feature-detect возможностей хоста. settle + событие (ctx.on) — полное
     // зеркало; без settle — деградация B (GUI источник истины, канал уведомляет).
     const userQuestions = deps.get("userQuestions") ?? ctx?.get?.("userQuestions") ?? null;
-    const mirrorCaps = detectMirrorMode(userQuestions, ctx);
+    const mirrorCaps = detectMirrorMode(userQuestions);
     // Гибрид (013): ждём ответ в мессенджере `hybrid.waitMs`, потом отдаём в GUI.
     const answerer = createAnswerer({
       transport: activeTransport,

@@ -42,7 +42,7 @@ function fakeJournal() {
   return { events, record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
 }
 
-function mirrorHarness({ mode = "full", next = () => new Promise(() => {}) } = {}) {
+function mirrorHarness({ mode = "full", next = () => new Promise(() => {}), withCancel = true } = {}) {
   const transport = fakeTransport();
   const journal = fakeJournal();
   const settles = [];
@@ -76,10 +76,12 @@ function mirrorHarness({ mode = "full", next = () => new Promise(() => {}) } = {
   return { answerer, transport, journal, settles, cancels, request, next, reliability, expire: () => expire };
 }
 
-test("063: detectMirrorMode — full только с settle + событием, иначе notify", () => {
-  assert.equal(detectMirrorMode({ settle() {} }, { on() {} }), "full");
-  assert.equal(detectMirrorMode({ settle() {} }, {}), "notify");
-  assert.equal(detectMirrorMode({}, { on() {} }), "notify");
+test("063: detectMirrorMode — full только с settle+cancel+resolved, иначе notify", () => {
+  assert.equal(detectMirrorMode({ settle() {}, cancel() {}, capabilities: { resolvedEvent: true } }), "full");
+  assert.equal(detectMirrorMode({ settle() {}, cancel() {} }), "notify", "без подтверждённого события");
+  assert.equal(detectMirrorMode({ settle() {}, capabilities: { resolvedEvent: true } }), "notify", "без cancel");
+  assert.equal(detectMirrorMode({ cancel() {} }), "notify", "без settle");
+  assert.equal(detectMirrorMode({}), "notify");
 });
 
 test("063 full: ответ из канала settle-ит GUI один раз и возвращает ответ", async () => {
@@ -188,7 +190,7 @@ function commandStand({ host = null } = {}) {
 }
 
 test("063: /remote mirror on|off и status показывают режим и причину", async () => {
-  const full = commandStand({ host: { settle: async () => true, cancel: async () => true } });
+  const full = commandStand({ host: { settle: async () => true, cancel: async () => true, capabilities: { resolvedEvent: true } } });
   const on = await full.remote.handler({ commandId: "1", agent: { id: "s1", session: { id: "s1" } }, rawInput: "mirror on", signal: new AbortController().signal });
   assert.equal(on.kind, "success");
   assert.match(on.text, /full/);
@@ -204,6 +206,25 @@ test("063: /remote mirror on|off и status показывают режим и п
   const notifyStatus = await notify.remote.handler({ commandId: "5", agent: { id: "s1", session: { id: "s1" } }, rawInput: "mirror", signal: new AbortController().signal });
   assert.match(notifyStatus.text, /mirror: notify/);
   assert.match(notifyStatus.text, /settle|хост/);
+});
+
+test("063 answerer: mode full без cancel деградирует в notify", async () => {
+  const guiAnswer = { answers: [{ id: "q1", selected: ["GUI"] }] };
+  const stand = mirrorHarness({ mode: "full", withCancel: false, next: async () => guiAnswer });
+  const result = await stand.answerer.handler(stand.request(), stand.next);
+  assert.deepEqual(result, guiAnswer, "GUI остаётся источником истины");
+  stand.transport.answer({ shortId: stand.transport.sent[0].shortId, optionId: "o1" });
+  assert.equal(stand.settles.length, 0);
+  assert.equal(stand.transport.closed.length, 1);
+});
+
+test("063: settle без cancel не включает full — режим notify", async () => {
+  const host = { settle: async () => true };
+  assert.equal(detectMirrorMode(host), "notify");
+  const stand = commandStand({ host });
+  await stand.remote.handler({ commandId: "7", agent: { id: "s1", session: { id: "s1" } }, rawInput: "mirror on", signal: new AbortController().signal });
+  const status = await stand.remote.handler({ commandId: "8", agent: { id: "s1", session: { id: "s1" } }, rawInput: "mirror", signal: new AbortController().signal });
+  assert.match(status.text, /mirror: notify/);
 });
 
 test("063: mirror в status — none, если режим не включён", async () => {

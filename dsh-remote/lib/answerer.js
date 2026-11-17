@@ -139,9 +139,18 @@ function answerSummary(question) {
  * @param {() => number} [options.now] — часы (мс epoch), в тестах подменяются.
  * @returns {{attach: (ctx: object) => () => void, handler: Function, dispose: (reason?: string) => void}}
  */
-/** 063: полное зеркало только если хост даёт settle и событие (ctx.on). */
-export function detectMirrorMode(host, ctx) {
-  return typeof host?.settle === "function" && typeof ctx?.on === "function" ? "full" : "notify";
+/**
+ * 063: полное зеркало только если хост даёт settle+cancel и подтверждает
+ * forwarded-событие resolved (`capabilities.resolvedEvent`). Наличие ctx.on
+ * само по себе ничего не доказывает — cordis даёт его всегда.
+ */
+export function detectMirrorMode(host) {
+  const hasSettle = typeof host?.settle === "function";
+  const hasCancel = typeof host?.cancel === "function";
+  const hasResolved = host?.capabilities?.resolvedEvent === true
+    || host?.resolvedEvent === true
+    || host?.supportsResolvedEvent === true;
+  return hasSettle && hasCancel && hasResolved ? "full" : "notify";
 }
 
 export function createAnswerer({
@@ -215,13 +224,11 @@ export function createAnswerer({
       }
     }
     if (value === null || typeof value !== "object" || value.enabled !== true) return { mode: "none" };
-    const mode = value.mode === "full" || value.mode === "notify" ? value.mode : (typeof value.settle === "function" ? "full" : "notify");
-    return {
-      mode,
-      settle: typeof value.settle === "function" ? value.settle : null,
-      cancel: typeof value.cancel === "function" ? value.cancel : null,
-      host: value.host ?? null,
-    };
+    const settle = typeof value.settle === "function" ? value.settle : null;
+    const cancel = typeof value.cancel === "function" ? value.cancel : null;
+    // full требует и settle, и cancel; иначе честно notify.
+    const mode = value.mode === "full" && settle !== null && cancel !== null ? "full" : "notify";
+    return { mode, settle, cancel, host: value.host ?? null };
   }
 
   /** Отправить поздний ответ в сессию как уточнение (`steer`). */
