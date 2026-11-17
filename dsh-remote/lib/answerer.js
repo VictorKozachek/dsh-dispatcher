@@ -139,6 +139,11 @@ function answerSummary(question) {
  * @param {() => number} [options.now] — часы (мс epoch), в тестах подменяются.
  * @returns {{attach: (ctx: object) => () => void, handler: Function, dispose: (reason?: string) => void}}
  */
+/** 063: полное зеркало только если хост даёт settle и событие (ctx.on). */
+export function detectMirrorMode(host, ctx) {
+  return typeof host?.settle === "function" && typeof ctx?.on === "function" ? "full" : "notify";
+}
+
 export function createAnswerer({
   transport = null,
   transports = null,
@@ -160,6 +165,8 @@ export function createAnswerer({
   lang = null,
   /** 051: рабочий журнал (log.jsonl), необязателен. */
   journal = null,
+  /** 063: mirror `{enabled, mode:full|notify|none, settle, cancel, host}` или функция. */
+  mirror = null,
   /** 013: доставка позднего ответа; по умолчанию `sessionController.prompt`. */
   steer = null,
   /** 013: таймеры инжектируются, тесты не ждут реальные 20 секунд. */
@@ -193,6 +200,27 @@ export function createAnswerer({
     return {
       enabled: value.enabled === true,
       waitMs: Number.isFinite(value.waitMs) && value.waitMs > 0 ? Math.floor(value.waitMs) : 20_000,
+    };
+  }
+
+  /** 063: текущая конфигурация mirror; ошибка конфига — обычный режим. */
+  function mirrorConfig() {
+    let value = mirror;
+    if (typeof value === "function") {
+      try {
+        value = value();
+      } catch (error) {
+        log(`mirror: конфиг не прочитан (${error?.message ?? error})`);
+        value = null;
+      }
+    }
+    if (value === null || typeof value !== "object" || value.enabled !== true) return { mode: "none" };
+    const mode = value.mode === "full" || value.mode === "notify" ? value.mode : (typeof value.settle === "function" ? "full" : "notify");
+    return {
+      mode,
+      settle: typeof value.settle === "function" ? value.settle : null,
+      cancel: typeof value.cancel === "function" ? value.cancel : null,
+      host: value.host ?? null,
     };
   }
 
@@ -395,6 +423,21 @@ export function createAnswerer({
       detail: { optionIds: normalized.optionIds, customLength: normalized.text.length },
     });
     const entry = pending.get(normalized.shortId);
+    if (entry !== undefined && (entry.mirrorGui === true || entry.mirrorNotify === true)) {
+      journalEvent("answer.dropped", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { reason: entry.mirrorNotify === true ? "notify" : "gui" },
+      });
+      if (entry.mirrorNotify === true) {
+        try {
+          void Promise.resolve(primary?.closeQuestion?.(entry.question, "ответьте в GUI")).catch(() => {});
+        } catch {
+          /* подсказка не должна ронять ответчик */
+        }
+      }
+      return;
+    }
     if (entry !== undefined && entry.hybridGui === true) {
       // Вопрос уже показан в GUI: ответ из мессенджера — не результат
       // инструмента, а уточнение к сессии. Принимаем один раз и шлём steer.
@@ -416,6 +459,16 @@ export function createAnswerer({
       return;
     }
     if (entry === undefined) {
+      // 063: ответ канала после mirror-settle/GUI — dropped, не unmatched.
+      const closedMirror = recentlyClosed.get(normalized.shortId);
+      if (closedMirror?.mirrorSettled === true || closedMirror?.mirrorGui === true) {
+        journalEvent("answer.dropped", {
+          transport: sourceTransport?.id ?? null,
+          shortId: normalized.shortId,
+          detail: { reason: closedMirror.mirrorSettled === true ? "settled" : "gui" },
+        });
+        return;
+      }
       journalEvent("answer.unmatched", {
         transport: sourceTransport?.id ?? null,
         shortId: normalized.shortId,
@@ -431,6 +484,14 @@ export function createAnswerer({
       // Поздний ответ: вопрос уже снят (TTL/аборт/перезапуск). Это не игнор —
       // карточка требует, чтобы ответ дошёл до сессии через `steer`.
       const closedQuestion = recentlyClosed.get(normalized.shortId);
+      if (closedQuestion?.mirrorSettled === true || closedQuestion?.mirrorGui === true) {
+        journalEvent("answer.dropped", {
+          transport: sourceTransport?.id ?? null,
+          shortId: normalized.shortId,
+          detail: { reason: closedQuestion.mirrorSettled === true ? "settled" : "gui" },
+        });
+        return;
+      }
       if (closedQuestion === undefined || typeof reliability?.applyLateAnswer !== "function") {
         log(`ответ на ${normalized.shortId}: вопроса нет (уже отвечен или закрыт) — игнор`);
         return;
@@ -531,6 +592,13 @@ export function createAnswerer({
       log("вопрос: транспорт не умеет sendQuestion — отдаю GUI (next)");
       return next();
     }
+    const mirrorState = mirrorConfig();
+    const mirrorFull = mirrorState.mode === "full" && typeof mirrorState.settle === "function";
+    const mirrorNotify = mirrorState.mode === "notify";
+    const callId = request?.callId ?? request?.toolCallId ?? request?.id ?? null;
+    let mirrorGuiPromise = null;
+    let mirrorGuiWon = false;
+    let mirrorCancelCalled = false;
 
     // 015: канал проекта — свой для каждого транспорта; нет канала —
     // общий чат этого транспорта.
@@ -601,7 +669,7 @@ export function createAnswerer({
       // `catch`-заглушка: если вопрос снимают (аборт, ошибка отправки), промис
       // остаётся неразрешённым, но не должен шуметь как необработанный отказ.
       const waited = new Promise((resolve, reject) => {
-        pending.set(question.shortId, { question, resolve, reject, signal: request?.signal ?? null });
+        pending.set(question.shortId, { question, resolve, reject, signal: request?.signal ?? null, mirrorFull, mirrorNotify });
       });
       waited.catch(() => {});
 
@@ -621,6 +689,14 @@ export function createAnswerer({
           pending.delete(question.shortId);
           rememberClosed(question);
           if (info?.kind === "abort") {
+            if (mirrorFull && !mirrorCancelCalled) {
+              mirrorCancelCalled = true;
+              try {
+                void Promise.resolve(mirrorState.cancel?.(request?.agent ?? { id: question.sessionId }, callId, "ttl")).catch(() => {});
+              } catch {
+                /* отмена GUI не должна ронять TTL */
+              }
+            }
             entry.reject(info.error ?? abortError("вопрос истёк по TTL"));
             return;
           }
@@ -810,9 +886,47 @@ export function createAnswerer({
             });
           }
 
+          // 063: mirror. Full — вопрос уже в канале, теперь отдаём его и в GUI
+          // (next()); notify — GUI источник истины, канал лишь уведомление.
+          if (mirrorNotify) {
+            for (const item of questions) {
+              const itemEntry = pending.get(item.shortId);
+              if (itemEntry !== undefined) itemEntry.mirrorNotify = true;
+            }
+            journalEvent("question.mirror.published", { detail: { mode: "notify", targets: [primary?.id ?? null] } });
+            cleanupHybrid();
+            return next();
+          }
+          if (mirrorFull && mirrorGuiPromise === null && typeof next === "function") {
+            mirrorGuiPromise = Promise.resolve()
+              .then(() => next())
+              .catch((error) => {
+                log(`mirror: next() не ответил (${error?.message ?? error})`);
+                return undefined;
+              });
+            journalEvent("question.mirror.published", { detail: { mode: "full", targets: [primary?.id ?? null] } });
+          }
+
           // 037: дождались ответа на текущий — только теперь публикуем следующий.
           armHybrid(question);
-          const answered = await Promise.race([waited, aborted, guiRace]);
+          const races = [waited, aborted, guiRace];
+          if (mirrorGuiPromise !== null) races.push(mirrorGuiPromise);
+          const answered = await Promise.race(races);
+          if (mirrorGuiPromise !== null && answered !== question
+            && answered !== HYBRID_GUI
+            && !(answered !== null && typeof answered === "object" && typeof answered.shortId === "string")) {
+            // GUI ответил первым: гасим сообщения, поздние ответы канала — dropped.
+            mirrorGuiWon = true;
+            for (const item of questions) {
+              item.mirrorGui = true;
+              const itemEntry = pending.get(item.shortId);
+              if (itemEntry !== undefined) itemEntry.mirrorGui = true;
+            }
+            cleanupHybrid();
+            await closeQuestions(questions, "answered-in-gui", attempted);
+            journalEvent("answer.from_gui", { detail: { mode: "full", targets: [primary?.id ?? null] } });
+            return answered;
+          }
           if (answered === HYBRID_GUI || guiRequested) {
             // pending оставляем: поздний ответ из мессенджера должен уйти
             // steer-ом, а не потеряться (как и до 037); снимаем только таймеры.
@@ -829,6 +943,14 @@ export function createAnswerer({
           }
           cleanupBatch();
           await closeQuestions(questions, "aborted", attempted);
+          if (mirrorFull && !mirrorCancelCalled) {
+            mirrorCancelCalled = true;
+            try {
+              await mirrorState.cancel?.(request?.agent ?? { id: sessionId }, callId, "aborted");
+            } catch (cancelError) {
+              log(`mirror: cancel не удался (${cancelError?.message ?? cancelError})`);
+            }
+          }
           throw error;
         }
         log(`вопрос: доставить не удалось (${error?.message ?? error}) — снимаю и отдаю GUI`);
@@ -857,10 +979,24 @@ export function createAnswerer({
     }
 
     cleanupBatch();
-    log(`вопросов ${questions.length}: ответ получен (${decision.scope})`);
-    return {
+    const result = {
       answers: questions.map((question) => expiredAnswers.get(question.shortId) ?? question.toAnswer()),
     };
+    if (mirrorFull && mirrorGuiWon !== true) {
+      try {
+        journalEvent("answer.from_transport", { detail: { mode: "full", targets: [primary?.id ?? null] } });
+        await mirrorState.settle?.(request?.agent ?? { id: sessionId }, callId, result);
+        for (const question of questions) {
+          question.mirrorSettled = true;
+          rememberClosed(question);
+        }
+        journalEvent("answer.settled", { detail: { mode: "full", callId } });
+      } catch (error) {
+        log(`mirror: settle не удался (${error?.message ?? error})`);
+      }
+    }
+    log(`вопросов ${questions.length}: ответ получен (${decision.scope})`);
+    return result;
   }
 
   /**

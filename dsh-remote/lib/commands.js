@@ -1223,6 +1223,36 @@ export function createRemoteCommands({
     return success(t("commands.lang.set", { lang: normalized }, normalized));
   }
 
+  /** 063: возможности хоста для mirror: settle + событие (ctx.on). */
+  function mirrorCapability() {
+    const host = ctx?.get?.("userQuestions") ?? null;
+    const full = typeof host?.settle === "function" && typeof ctx?.on === "function";
+    return { mode: full ? "full" : "notify", reason: full ? null : tx("commands.mirror.noSettle") };
+  }
+
+  /** `/remote mirror [on|off]`. */
+  async function mirrorCommand(rest) {
+    const value = Array.isArray(rest) ? String(rest[0] ?? "").toLowerCase() : "";
+    if (value !== "on" && value !== "off") {
+      const capability = mirrorCapability();
+      const enabled = store.read().mirror?.enabled === true;
+      const mode = enabled ? capability.mode : "none";
+      return success(tx("commands.mirror.status", {
+        p0: mode,
+        p1: mode === "none" ? "" : capability.reason === null ? "" : tx("commands.mirror.reason", { p0: capability.reason }),
+      }));
+    }
+    if (value === "on") {
+      if (store.read().bindings === null && liveTransport() === null) {
+        return failure(tx("commands.mirror.noChannel"));
+      }
+      store.setMirror(true);
+      return success(tx("commands.mirror.on", { p0: mirrorCapability().mode }));
+    }
+    store.setMirror(false);
+    return success(tx("commands.mirror.off"));
+  }
+
   async function status(invocation) {
     const state = store.read();
     const lang = currentLang();
@@ -1288,6 +1318,16 @@ export function createRemoteCommands({
 
     const hybridState = state.hybrid.enabled ? tx("commands.status.13", { p0: Math.round(state.hybrid.waitMs / 1000) }) : tx("commands.status.14");
     lines.push(t("commands.status.hybrid", { state: hybridState }, lang));
+    // 063: mirror режим и причина, если полное зеркало недоступно.
+    {
+      const capability = mirrorCapability();
+      const enabled = state.mirror?.enabled === true;
+      const mode = enabled ? capability.mode : "none";
+      lines.push(t("commands.status.mirror", {
+        p0: mode,
+        p1: mode === "none" ? "" : capability.reason === null ? "" : tx("commands.mirror.reason", { p0: capability.reason }),
+      }, lang));
+    }
     const hybridStats = ctx?.get?.("remoteAnswerer")?.stats ?? null;
     if (hybridStats !== null && (hybridStats.hybridHanded > 0 || hybridStats.hybridPhoneAnswers > 0)) {
       lines.push(tx("commands.status.15", { p0: hybridStats.hybridHanded, p1: hybridStats.hybridPhoneAnswers }));
@@ -1764,6 +1804,8 @@ export function createRemoteCommands({
           return await setMode(invocation, false, flags);
         case "status":
           return await status(invocation);
+        case "mirror":
+          return await mirrorCommand(rest);
         case "lang":
           return await langCommand(rest);
         case "audit":
@@ -1798,7 +1840,7 @@ export function createRemoteCommands({
   const definition = {
     name: "remote",
     description: tx("commands.help.1"),
-    input: { hint: "connect|on|off|status|test|who|disconnect" },
+    input: { hint: "connect|on|off|mirror|status|test|who|disconnect" },
     recordInput: false,
     handler,
   };
