@@ -979,3 +979,11 @@ test("вопрос без вариантов: быстрые ответы кно
   assert.ok(withButtons.payload.reply_markup.inline_keyboard.length > 0, "варианты — кнопками");
   assert.equal(withButtons.payload.reply_markup.force_reply, undefined, "force_reply только для свободного ответа");
 });
+
+test("055: Telegram по-прежнему режет текст по 4096", async () => {
+  const { transport, calls } = setup();
+  await transport.sendQuestion(question({ body: "y".repeat(5000), options: [], allowFreeText: false }));
+  const send = calls.find((call) => call.method === "sendMessage");
+  assert.ok(send, "sendMessage ушёл");
+  assert.ok(send.payload.text.length <= 4096, `длина ${send.payload.text.length}`);
+});

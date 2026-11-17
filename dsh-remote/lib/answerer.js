@@ -158,6 +158,8 @@ export function createAnswerer({
   quickReplies = undefined,
   /** 046: язык сообщений (строка или функция, чтобы читать состояние на каждый вопрос). */
   lang = null,
+  /** 051: рабочий журнал (log.jsonl), необязателен. */
+  journal = null,
   /** 013: доставка позднего ответа; по умолчанию `sessionController.prompt`. */
   steer = null,
   /** 013: таймеры инжектируются, тесты не ждут реальные 20 секунд. */
@@ -166,6 +168,15 @@ export function createAnswerer({
 } = {}) {
   /** Счётчики гибрида для журнала и `/remote status`. */
   const stats = { hybridHanded: 0, hybridPhoneAnswers: 0 };
+
+  /** 051: запись в журнал; ошибка журнала не должна ронять вопрос. */
+  function journalEvent(event, fields) {
+    try {
+      journal?.record?.(event, fields);
+    } catch {
+      /* журнал не должен ронять плагин */
+    }
+  }
 
   /** Текущая конфигурация гибрида: функция вызывается на каждый вопрос. */
   function hybridConfig() {
@@ -372,8 +383,17 @@ export function createAnswerer({
     const normalized = normalizeAnswerEvent(incoming);
     if (normalized === null) {
       log("ответ транспорта: событие без shortId — игнор");
+      journalEvent("answer.unmatched", {
+        transport: sourceTransport?.id ?? null,
+        detail: { reason: "shortId", optionIds: Array.isArray(event?.optionIds) ? event.optionIds : [] },
+      });
       return;
     }
+    journalEvent("answer.received", {
+      transport: sourceTransport?.id ?? null,
+      shortId: normalized.shortId,
+      detail: { optionIds: normalized.optionIds, customLength: normalized.text.length },
+    });
     const entry = pending.get(normalized.shortId);
     if (entry !== undefined && entry.hybridGui === true) {
       // Вопрос уже показан в GUI: ответ из мессенджера — не результат
@@ -396,6 +416,11 @@ export function createAnswerer({
       return;
     }
     if (entry === undefined) {
+      journalEvent("answer.unmatched", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { reason: "shortId", optionIds: normalized.optionIds },
+      });
       const knownQuestion = known.get(normalized.shortId);
       if (knownQuestion !== undefined && knownQuestion.status === "answered") {
         // Ответ из канала, который проиграл гонку: решение уже принято.
@@ -429,6 +454,11 @@ export function createAnswerer({
     }
     if (parsed.error !== undefined) {
       log(`ответ на ${normalized.shortId} отклонён: ${parsed.error}`);
+      journalEvent("answer.unmatched", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { reason: "optionId", optionIds: normalized.optionIds },
+      });
       return;
     }
     if (!entry.question.accept(parsed.choice, { answeredBy: normalized.answeredBy, now: now() })) return;
@@ -688,23 +718,48 @@ export function createAnswerer({
       if (waitingEntry !== undefined) waitingEntry.hybridTimer = timer;
     }
 
+    let currentQuestion = null;
     try {
       try {
         for (let index = 0; index < questions.length; index += 1) {
           const question = questions[index];
+          currentQuestion = question;
           attempted.add(question);
           const waited = registerWaiting(question);
+          journalEvent("question.send", {
+            transport: primary?.id ?? null,
+            shortId: question.shortId,
+            detail: {
+              chatId: question.chatId ?? null,
+              options: Array.isArray(question.options) ? question.options.length : 0,
+              quickReplies: Array.isArray(question.quickReplies) ? question.quickReplies.length : 0,
+            },
+          });
           if (useBroker) {
             const publication = await Promise.race([publishAll(question, request?.signal, channelFor), aborted]);
             if (!publication.anyDelivered) {
               // Ни один канал не принял вопрос — он достаётся GUI, как в 008.
               log(`вопрос ${question.shortId}: ни один канал не доставил — отдаю GUI (next)`);
+              journalEvent("question.error", {
+                transport: primary?.id ?? null,
+                shortId: question.shortId,
+                detail: { status: "undelivered", failed: publication.failed ?? [] },
+              });
               cleanupBatch();
               await closeQuestions(questions, "undelivered", attempted);
               return next();
             }
             // 012: доставки переживают рестарт (state.questions[].deliveries).
             reliability?.noteDeliveries?.(question);
+            const winner = Array.isArray(publication.delivered) ? publication.delivered[0] : null;
+            journalEvent("question.sent", {
+              transport: winner?.transport ?? primary?.id ?? null,
+              shortId: question.shortId,
+              detail: {
+                messageId: winner?.messageId ?? null,
+                keyboard: (question.options?.length ?? 0) > 0 || (question.quickReplies?.length ?? 0) > 0,
+              },
+            });
           } else {
             const sent = await Promise.race([sendOne(question, request?.signal), aborted]);
             const outcome = sent;
@@ -731,6 +786,11 @@ export function createAnswerer({
               }
               // Недоставка за отведённое время: вопрос достаётся GUI, сессия не висит.
               log(`вопрос ${question.shortId}: не доставлен — отдаю GUI (next)`);
+              journalEvent("question.error", {
+                transport: primary?.id ?? null,
+                shortId: question.shortId,
+                detail: { status: "give-up" },
+              });
               cleanupBatch();
               await closeQuestions(questions, "undelivered", attempted);
               return next();
@@ -740,6 +800,14 @@ export function createAnswerer({
             } catch {
               /* метрики не должны ронять доставку */
             }
+            journalEvent("question.sent", {
+              transport: primary?.id ?? null,
+              shortId: question.shortId,
+              detail: {
+                messageId: sent?.messageId ?? null,
+                keyboard: (question.options?.length ?? 0) > 0 || (question.quickReplies?.length ?? 0) > 0,
+              },
+            });
           }
 
           // 037: дождались ответа на текущий — только теперь публикуем следующий.
@@ -764,6 +832,11 @@ export function createAnswerer({
           throw error;
         }
         log(`вопрос: доставить не удалось (${error?.message ?? error}) — снимаю и отдаю GUI`);
+        journalEvent("question.error", {
+          transport: primary?.id ?? null,
+          shortId: currentQuestion?.shortId ?? null,
+          detail: { status: error?.status ?? 0, code: error?.code ?? "", message: error?.message ?? String(error) },
+        });
         try {
           metrics?.inc?.("questions.cancelled", questions.length);
         } catch {

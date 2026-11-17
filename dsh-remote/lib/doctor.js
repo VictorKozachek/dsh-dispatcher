@@ -151,10 +151,23 @@ export async function runHealthChecks({
   store = null,
   reliability = null,
   supportedSchemaVersion = null,
+  journal = null,
   lang = DEFAULT_LANG,
 } = {}) {
   doctorLang = normalizeLang(lang) ?? DEFAULT_LANG;
   const checks = [...fromLegacyChecks(legacyChecks)];
+
+  // --- journal (056): сервис виден — показываем путь; выключен — warn --------
+  if (journal !== null && typeof journal === "object") {
+    const file = typeof journal.file === "string" && journal.file !== "" ? journal.file : "?";
+    checks.push(createCheck({
+      id: "journal",
+      status: journal.enabled === false ? "warn" : "ok",
+      detail: journal.enabled === false
+        ? dt("doctor.runHealthChecks.journalDisabled", { p0: file })
+        : dt("doctor.runHealthChecks.journal", { p0: file }),
+    }));
+  }
 
   // --- credentials: ссылки, источник, writable ---------------------------------
   const refs = (Array.isArray(tokenRefs) ? tokenRefs : []).filter((ref) => typeof ref === "string" && ref !== "");

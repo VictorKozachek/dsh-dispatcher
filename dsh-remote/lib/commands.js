@@ -30,6 +30,7 @@ import { createRegistry } from "./domain/registry.js";
 import { STATE_VERSION, credentialRef, createCredentialAccess } from "./store.js";
 import {
   buildReport,
+  createCheck,
   formatHealthReport,
   runHealthChecks,
   serializeReport,
@@ -206,6 +207,8 @@ export async function runDoctorChecks({
   telegramCallImpl = null,
   version = null,
   now = () => Date.now(),
+  tokenRefs = null,
+  config = null,
 } = {}) {
   const checks = [];
   const add = (level, title, detail, hint) => {
@@ -220,13 +223,22 @@ export async function runDoctorChecks({
   );
 
   // --- токен ---------------------------------------------------------------
-  // 039: проверяем секрет АКТИВНОГО канала (MAX живёт по своему токену).
+  // 053: проверяем секрет АКТИВНОГО канала; без привязки — только каналы из
+  // config (config.telegram/config.max), иначе doctor краснел за удалённый токен.
   const binding = typeof store?.read === "function" ? store.read()?.bindings ?? null : null;
-  const activeTransport = typeof binding?.transport === "string" ? binding.transport : "telegram";
-  const tokenRef = tokenRefFor(activeTransport);
+  const activeTransport = typeof binding?.transport === "string" ? binding.transport : null;
+  const explicitRefs = Array.isArray(tokenRefs) ? tokenRefs.filter((ref) => typeof ref === "string" && ref !== "") : null;
+  const tokenRef = explicitRefs?.[0]
+    ?? (activeTransport !== null
+      ? tokenRefFor(activeTransport)
+      : (config?.telegram !== null && typeof config?.telegram === "object"
+        ? TELEGRAM_TOKEN_REF
+        : (config?.max !== null && typeof config?.max === "object" ? MAX_TOKEN_REF : null)));
   let token = null;
   const access = credentials;
-  if (access === null || typeof access?.availableFor !== "function") {
+  if (tokenRef === null) {
+    // Нет активного канала и ничего не задано конфигом — проверять нечего.
+  } else if (access === null || typeof access?.availableFor !== "function") {
     add("fail", tx("commands.runDoctorChecks.4"), tx("commands.runDoctorChecks.5"), tx("commands.runDoctorChecks.6"));
   } else if (!access.availableFor(tokenRef)) {
     add("fail", tx("commands.runDoctorChecks.4"), tx("commands.runDoctorChecks.7", { p0: tokenRef }), tx("commands.runDoctorChecks.8"));
@@ -283,7 +295,7 @@ export async function runDoctorChecks({
       add("fail", "getMe", tx("commands.runDoctorChecks.21", { p0: humanError(error, token) }), tx("commands.runDoctorChecks.22"));
     }
   } else if (activeTransport === "telegram" && token !== null) {
-    add("warn", "getMe", tx("commands.runDoctorChecks.23"));
+    add("warn", tx("commands.runDoctorChecks.23"));
   }
 
   // --- поллеры -------------------------------------------------------------
@@ -305,7 +317,8 @@ export async function runDoctorChecks({
 
   // --- канал ---------------------------------------------------------------
   if (transport === null) {
-    add("warn", tx("commands.runDoctorChecks.13"), tx("commands.runDoctorChecks.31"), tx("commands.runDoctorChecks.32"));
+    // 053: привязка есть, а канала нет — это fail (токен есть, канал не поднят).
+    add(binding === null ? "warn" : "fail", tx("commands.runDoctorChecks.13"), tx("commands.runDoctorChecks.31"), tx("commands.runDoctorChecks.32"));
   } else {
     const lastError = transport.lastError ?? null;
     const updateId = transport.lastUpdateId ?? null;
@@ -465,6 +478,10 @@ export function createRemoteCommands({
   ensureTransport = null,
   /** Живой транспорт канала (фасад): null, если канала нет. */
   currentChannel = null,
+  /** 056: сервис журнала из общего реестра фич (`deps.get`), ctx.get — страховка. */
+  journal = null,
+  /** 053: config каналов (config.telegram/config.max) для doctor без привязки. */
+  config = {},
   /** 046: язык из конфига плагина (если `/remote lang` ещё не задан). */
   lang = null,
   testAnswerTimeoutMs = 30 * 60 * 1000,
@@ -472,6 +489,8 @@ export function createRemoteCommands({
 } = {}) {
   const registry = createRegistry({ readState: () => store.read().enabled, log });
   const credentials = createCredentialAccess(ctx, { log });
+  /** 056: журнал: явный сервис из deps.expose важнее ctx.get (cordis его не видит). */
+  const journalService = () => journal ?? ctx?.get?.("remoteJournal") ?? null;
 
   /** Журнал решений (026): читаем тот же `audit.jsonl`, куда пишет ответчик. */
   const audit = createAudit({
@@ -883,6 +902,8 @@ export function createRemoteCommands({
         sleep,
         signal: invocation?.signal,
         log,
+        // 056: журнал виден и через общий реестр, и через ctx.get.
+        journal: journalService(),
         stats,
       });
     } catch (error) {
@@ -1133,7 +1154,23 @@ export function createRemoteCommands({
       if (flags.has("hybrid")) store.setHybrid({ enabled });
       if (flags.has("no-hybrid")) store.setHybrid({ enabled: false });
       if (flags.has("all")) {
+        const before = store.read().enabled;
         store.setEnabled({ kind: "global" }, enabled);
+        const after = store.read().enabled;
+        const removed = [];
+        for (const group of ["workspaces", "sessions"]) {
+          for (const key of Object.keys(before?.[group] ?? {})) {
+            if (before[group][key] === !enabled && after?.[group]?.[key] === undefined) removed.push(`${group}:${key}`);
+          }
+        }
+        if (removed.length > 0) {
+          log(tx(enabled ? "commands.log.modeAllOn" : "commands.log.modeAllOff", { p0: removed.join(", ") }));
+          try {
+            journalService()?.record?.("mode.all", { detail: { enabled, removed } });
+          } catch (error) {
+            log(tx("commands.log.modeAllJournalError", { p0: error?.message ?? error }));
+          }
+        }
         const decision = registry.resolve({ sessionId, workspace: cwd });
         return success(tx("commands.setMode.4", { p0: enabled ? tx("commands.setMode.10") : tx("commands.setMode.11"), p1: describeEffective(decision) }));
       }
@@ -1193,6 +1230,14 @@ export function createRemoteCommands({
     const lines = [];
 
     lines.push(t("commands.status.language", { lang }, lang));
+    // 056: путь журнала виден в статусе; если сервис не поднялся — строки нет.
+    const journal = journalService();
+    if (journal !== null && typeof journal === "object") {
+      const journalFile = typeof journal.file === "string" && journal.file !== "" ? journal.file : "?";
+      lines.push(journal.enabled === false
+        ? t("commands.status.journalDisabled", { p0: journalFile }, lang)
+        : t("commands.status.journal", { p0: journalFile }, lang));
+    }
     if (state.bindings === null && liveTransport() === null) {
       lines.push(t("commands.status.notBound", {}, lang));
     } else if (state.bindings === null) {
@@ -1250,7 +1295,31 @@ export function createRemoteCommands({
     const approvalAudit = audit.stats();
     lines.push(tx("commands.status.16", { p0: approvalAudit.remote, p1: approvalAudit.gui, p2: approvalAudit.timeout, p3: approvalAudit.total }));
     lines.push(tx("commands.status.17", { p0: state.enabled.global ? tx("commands.status.31") : tx("commands.status.14"), p1: cwd === null ? "?" : cwd, p2: cwd !== null && state.enabled.workspaces[cwd] === true ? tx("commands.status.31") : tx("commands.status.14"), p3: sessionId === null ? "?" : sessionId, p4: sessionId !== null && state.enabled.sessions[sessionId] === true ? tx("commands.status.31") : tx("commands.status.14") }));
-    lines.push(describeEffective(registry.resolve({ sessionId, workspace: cwd })));
+    const decision = registry.resolve({ sessionId, workspace: cwd });
+    lines.push(describeEffective(decision));
+    // 057: если проект/сессия перекрывают глобальное значение — показываем оба
+    // факта и источник, иначе status врёт «включено для всех».
+    const globalEnabled = state.enabled.global === true;
+    if (decision.scope !== null && decision.scope !== "global" && decision.enabled !== globalEnabled) {
+      const scopeLabel = decision.scope === "session" ? `session ${sessionId ?? "?"}` : `workspace ${cwd ?? "?"}`;
+      lines.push(t("commands.status.override", {
+        p0: globalEnabled ? tx("commands.status.31") : tx("commands.status.14"),
+        p1: scopeLabel,
+        p2: decision.enabled ? tx("commands.status.31") : tx("commands.status.14"),
+        p3: decision.scope,
+      }, lang));
+      log(tx("commands.log.modeOverride", {
+        p0: globalEnabled ? tx("commands.status.31") : tx("commands.status.14"),
+        p1: scopeLabel,
+        p2: decision.enabled ? tx("commands.status.31") : tx("commands.status.14"),
+        p3: decision.scope,
+      }));
+      try {
+        journalService()?.record?.("mode.override", { detail: { scope: decision.scope, effective: decision.enabled, global: globalEnabled } });
+      } catch (error) {
+        log(tx("commands.log.modeOverrideJournalError", { p0: error?.message ?? error }));
+      }
+    }
 
     // 025: действующая политика подтверждений (публикует ответчик approvals 024).
     try {
@@ -1525,6 +1594,14 @@ export function createRemoteCommands({
     // на текущем языке.
     const json = flags?.has?.("json") === true;
     commandLang = json ? DEFAULT_LANG : currentLang();
+    // 053: обязательные секреты — только по активной привязке; без привязки —
+    // лишь каналы, заданные конфигом (config.telegram/config.max).
+    const binding = store.read().bindings;
+    const activeTransport = typeof binding?.transport === "string" ? binding.transport : null;
+    const configuredRefs = [];
+    if (config?.telegram !== null && typeof config?.telegram === "object") configuredRefs.push(TELEGRAM_TOKEN_REF);
+    if (config?.max !== null && typeof config?.max === "object") configuredRefs.push(MAX_TOKEN_REF);
+    const tokenRefs = activeTransport !== null ? [tokenRefFor(activeTransport)] : configuredRefs;
     const legacyChecks = await runDoctorChecks({
 
       store,
@@ -1533,6 +1610,8 @@ export function createRemoteCommands({
       telegramCallImpl: (token, method) => telegramCall(token, method),
       version: readPluginVersion(),
       now,
+      tokenRefs,
+      config,
     });
 
     const relayService = ctx?.get?.("remoteRelay") ?? null;
@@ -1547,7 +1626,7 @@ export function createRemoteCommands({
 
     // Ссылку relay-токена проверяем только когда релей действительно настроен:
     // на Telegram-only установке её отсутствие — норма, а не fail.
-    const tokenRefs = relay === null ? [TELEGRAM_TOKEN_REF] : [TELEGRAM_TOKEN_REF, RELAY_TOKEN_REF];
+    if (relay !== null && !tokenRefs.includes(RELAY_TOKEN_REF)) tokenRefs.push(RELAY_TOKEN_REF);
     const checks = await runHealthChecks({
       legacyChecks,
       credentials,
@@ -1555,9 +1634,29 @@ export function createRemoteCommands({
       relay,
       store,
       reliability: ctx?.get?.("remoteReliability") ?? null,
+      journal: journalService(),
       supportedSchemaVersion: STATE_VERSION,
       lang: commandLang,
     });
+    // 053: отключённый канал не проверяем как обязательный, но показываем
+    // информационной строкой, что с его токеном (например, telegram удалён).
+    if (activeTransport !== null && typeof binding?.previousTransport === "string" && binding.previousTransport !== ""
+      && binding.previousTransport !== activeTransport) {
+      const previousRef = tokenRefFor(binding.previousTransport);
+      let present = false;
+      try {
+        const info = await credentials.describe(previousRef);
+        present = info?.present === true || info?.configured === true
+          || (info?.present === undefined && info?.configured === undefined && info?.source !== null && info?.source !== undefined);
+      } catch {
+        present = false;
+      }
+      checks.push(createCheck({
+        id: "previous-channel",
+        status: "ok",
+        detail: tx(present ? "commands.doctor.previousChannelTokenPresent" : "commands.doctor.previousChannel", { p0: binding.previousTransport }),
+      }));
+    }
     const report = buildReport(checks);
     if (json) {
       return { ...success(serializeReport(report)), exitCode: report.exitCode };

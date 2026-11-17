@@ -16,10 +16,12 @@ import path from "node:path";
 import { createStore } from "../lib/store.js";
 import { createAudit } from "../lib/audit.js";
 import { commandsFeature } from "../lib/features/commands.js";
+import { createRegistry } from "../lib/domain/registry.js";
 import { telegramFeature } from "../lib/features/telegram.js";
 import { answererFeature } from "../lib/features/answerer.js";
 import { RELAY_TOKEN_REF } from "../lib/transport/relay.js";
 import {
+  MAX_TOKEN_REF,
   PAIRING_TTL_MS,
   TELEGRAM_TOKEN_REF,
   createRemoteCommands,
@@ -370,6 +372,103 @@ test("connect: человек закрыл вопрос — ошибка тек�
   assert.equal(stand.store.read().bindings, null);
 });
 
+/** 053: фейковый живой канал для doctor. */
+function doctorChannel(id) {
+  return {
+    id,
+    lastUpdateId: 5,
+    lastError: null,
+    marker: 5,
+    polling: true,
+    healthCheck: async () => ({ ok: true, detail: "max ok" }),
+    start: async () => {},
+    stop: async () => {},
+    sendQuestion: async () => ({}),
+  };
+}
+
+function doctorRemote(stand, { config = {}, channel = null, fetch = null } = {}) {
+  return createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    config,
+    currentChannel: () => channel,
+    ...(fetch === null ? {} : { fetch }),
+  });
+}
+
+test("053: doctor на MAX-only зелёный и не требует telegram-токен", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "max", chatId: 42, userId: 7, botUsername: "max_bot" });
+  stand.credentials.values.set(MAX_TOKEN_REF, "max-token");
+  const remote = doctorRemote(stand, { channel: doctorChannel("max") });
+
+  const result = await remote.handler(invoke("doctor"));
+  assert.equal(result.exitCode, 0, result.text);
+  assert.equal(result.text.includes(`credentials:${TELEGRAM_TOKEN_REF}`), false);
+  assert.match(result.text, new RegExp(`credentials:${MAX_TOKEN_REF.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+});
+
+test("053: doctor показывает отключённый предыдущий канал информационной строкой", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "max", chatId: 42, userId: 7, botUsername: "max_bot" });
+  const state = JSON.parse(fs.readFileSync(stand.file, "utf8"));
+  state.bindings = {
+    transport: "max",
+    chatId: 42,
+    userId: 7,
+    botUsername: "max_bot",
+    createdAt: 1,
+    previousTransport: "telegram",
+  };
+  fs.writeFileSync(stand.file, JSON.stringify(state));
+  stand.credentials.values.set(MAX_TOKEN_REF, "max-token");
+  const remote = doctorRemote(stand, { channel: doctorChannel("max") });
+
+  const result = await remote.handler(invoke("doctor"));
+  assert.equal(result.exitCode, 0, result.text);
+  assert.match(result.text, /предыдущий канал: telegram \(токен удалён\)/);
+  assert.doesNotMatch(result.text, /\[fail\].*TELEGRAM_TOKEN/);
+});
+
+test("053: doctor на telegram-only зелёный и не требует MAX-токен", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  stand.credentials.values.set(TELEGRAM_TOKEN_REF, TOKEN);
+  const remote = doctorRemote(stand, {
+    channel: doctorChannel("telegram"),
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true, result: { username: "test_bot" } }) }),
+  });
+
+  const result = await remote.handler(invoke("doctor"));
+  assert.equal(result.exitCode, 0, result.text);
+  assert.equal(result.text.includes(`credentials:${MAX_TOKEN_REF}`), false);
+});
+
+test("053: привязка MAX без своего токена — fail про MAX", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "max", chatId: 42, userId: 7, botUsername: "max_bot" });
+  const remote = doctorRemote(stand, { channel: doctorChannel("max") });
+
+  const result = await remote.handler(invoke("doctor"));
+  assert.equal(result.exitCode, 2, result.text);
+  assert.match(result.text, new RegExp(`\\[fail\\].*${MAX_TOKEN_REF.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.equal(result.text.includes(`credentials:${TELEGRAM_TOKEN_REF}`), false);
+});
+
+test("053: без привязки doctor не требует чужих токенов", async (t) => {
+  const stand = harness(t);
+  const remote = doctorRemote(stand, { config: {} });
+
+  const result = await remote.handler(invoke("doctor"));
+  assert.equal(result.text.includes(`credentials:${TELEGRAM_TOKEN_REF}`), false);
+  assert.equal(result.text.includes(`credentials:${MAX_TOKEN_REF}`), false);
+  assert.doesNotMatch(result.text, /\[fail\] credentials:/);
+  assert.notEqual(result.exitCode, 2, "нет fail из-за отключённых каналов");
+});
+
 test("on/off: воркспейс по умолчанию, --all и --session", async (t) => {
   const stand = harness(t);
   stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
@@ -396,6 +495,88 @@ test("on/off: воркспейс по умолчанию, --all и --session", a
   const off = await remote.handler(invoke("off --all"));
   assert.equal(off.kind, "success");
   assert.equal(stand.store.read().enabled.global, false);
+});
+
+test("057: on --all снимает прежние проектные запреты, off --all — разрешения", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  const channel = { id: "telegram", start: async () => {}, stop: async () => {}, sendQuestion: async () => ({}) };
+  const logs = [];
+  const journalEvents = [];
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: (line) => logs.push(line),
+    journal: { record: (event, fields) => journalEvents.push({ event, ...fields }) },
+    now: () => stand.clock,
+    currentChannel: () => channel,
+  });
+
+  // Прежний точечный запрет + выключенный глобальный режим.
+  stand.store.setEnabled({ kind: "workspace", id: WORKSPACE }, false);
+  const on = await remote.handler(invoke("on --all"));
+  assert.equal(on.kind, "success");
+  let state = stand.store.read();
+  assert.equal(state.enabled.global, true);
+  assert.equal(Object.hasOwn(state.enabled.workspaces, WORKSPACE), false, "запрет снят");
+  assert.deepEqual(createRegistry({ readState: () => state.enabled }).resolve({ workspace: WORKSPACE }), { enabled: true, scope: "global" });
+  assert.match(logs.join("\n"), /сняты явные запреты/);
+  assert.equal(journalEvents.at(-1).event, "mode.all");
+
+  // Теперь точечное разрешение + off --all: разрешение тоже снимается.
+  stand.store.setEnabled({ kind: "workspace", id: WORKSPACE }, true);
+  const off = await remote.handler(invoke("off --all"));
+  assert.equal(off.kind, "success");
+  state = stand.store.read();
+  assert.equal(state.enabled.global, false);
+  assert.equal(Object.hasOwn(state.enabled.workspaces, WORKSPACE), false, "разрешение снято");
+  assert.deepEqual(createRegistry({ readState: () => state.enabled }).resolve({ workspace: WORKSPACE }), { enabled: false, scope: "global" });
+});
+
+test("057: после --all точечные on/off снова перекрывают глобальное", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  const channel = { id: "telegram", start: async () => {}, stop: async () => {}, sendQuestion: async () => ({}) };
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    currentChannel: () => channel,
+  });
+
+  await remote.handler(invoke("on --all"));
+  const offProject = await remote.handler(invoke("off"));
+  assert.equal(offProject.kind, "success");
+  assert.equal(stand.store.read().enabled.workspaces[WORKSPACE], false);
+  assert.deepEqual(createRegistry({ readState: () => stand.store.read().enabled }).resolve({ workspace: WORKSPACE }), { enabled: false, scope: "workspace" });
+
+  const onProject = await remote.handler(invoke("on"));
+  assert.equal(onProject.kind, "success");
+  assert.equal(stand.store.read().enabled.workspaces[WORKSPACE], true);
+  assert.deepEqual(createRegistry({ readState: () => stand.store.read().enabled }).resolve({ workspace: WORKSPACE }), { enabled: true, scope: "workspace" });
+});
+
+test("057: status показывает перекрытие проекта при включённом глобальном", async (t) => {
+  const stand = harness(t);
+  stand.store.setEnabled({ kind: "global" }, true);
+  stand.store.setEnabled({ kind: "workspace", id: WORKSPACE }, false);
+  const logs = [];
+  const journalEvents = [];
+  const remote = createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: (line) => logs.push(line),
+    journal: { record: (event, fields) => journalEvents.push({ event, ...fields }) },
+    now: () => stand.clock,
+  });
+
+  const result = await remote.handler(invoke("status"));
+  assert.equal(result.kind, "success");
+  assert.match(result.text, /scope: workspace/);
+  assert.match(result.text, /проект|workspace/);
+  assert.match(logs.join("\n"), /scope: workspace/);
+  assert.equal(journalEvents.some((entry) => entry.event === "mode.override"), true);
 });
 
 test("on без cwd: подсказка про --all и --session", async (t) => {

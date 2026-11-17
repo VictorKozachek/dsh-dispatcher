@@ -26,6 +26,7 @@
  * вопрос уходит в GUI, как и раньше; `/remote connect` заводит привязку.
  */
 import { commandsFeature } from "./features/commands.js";
+import { journalFeature } from "./features/journal.js";
 import { metricsFeature } from "./features/metrics.js";
 import { maxFeature } from "./features/max.js";
 import { telegramFeature } from "./features/telegram.js";
@@ -40,6 +41,7 @@ import { panelFeature } from "./features/panel.js";
 // кладёт транспорт в фасад (config-путь), reliability даёт ответчику deliver и
 // TTL-сторож, answerer подписывается последним.
 export const features = [
+  journalFeature,
   metricsFeature,
   commandsFeature,
   maxFeature,

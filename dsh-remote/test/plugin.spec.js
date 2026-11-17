@@ -131,7 +131,7 @@ test("каркас: имя плагина, пустой inject и фичи с к
   // подписываются после транспорта, panel (009) — рядом с ними.
   assert.deepEqual(
     features.map((feature) => feature.name),
-    ["metrics", "commands", "max", "telegram", "reliability", "answerer", "approvals", "relay", "notify", "panel"],
+    ["journal", "metrics", "commands", "max", "telegram", "reliability", "answerer", "approvals", "relay", "notify", "panel"],
   );
 });
 
@@ -265,7 +265,7 @@ test("package.json: поля, которые читает загрузчик п�
   const pkg = JSON.parse(readFileSync(path.join(packageDir, "package.json"), "utf8"));
 
   assert.equal(pkg.name, "dsh-remote");
-  assert.equal(pkg.version, "0.3.0");
+  assert.equal(pkg.version, "0.3.1");
   assert.equal(pkg.private, true);
   assert.equal(pkg.license, "MIT");
   assert.equal(pkg.type, "module");

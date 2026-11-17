@@ -183,6 +183,138 @@ test("нажатие кнопки: message_callback -> /answers и один от
   assert.equal(call.body.text, undefined, "плоского text в теле нет");
 });
 
+test("061: «Другой ответ» не удаляет вопрос и просит текст", async (t) => {
+  const updates = [
+    {
+      type: "message_callback",
+      timestamp: 1000,
+      callback: { callback_id: "cb-free", payload: "q:a1b2c3d4:free", user: { user_id: 7 }, chat: { chat_id: 42 } },
+    },
+    {
+      type: "message_created",
+      timestamp: 1001,
+      message: {
+        sender: { user_id: 7 },
+        chat: { chat_id: 42 },
+        body: { text: "свой ответ" },
+      },
+    },
+  ];
+  const { transport, calls } = setup(t, { routes: { updates } });
+
+  await transport.sendQuestion(question());
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.deepEqual(answers.map((answer) => ({ optionIds: answer.optionIds, text: answer.text })), [
+    { optionIds: ["free"], text: undefined },
+    { optionIds: [], text: "свой ответ" },
+  ]);
+  const callback = calls.find((item) => item.key === "POST /answers");
+  assert.ok(callback, "нажатие подтверждено");
+  assert.match(callback.body.message.text, /Напишите ответ текстом/);
+  const messages = calls.filter((item) => item.key === "POST /messages");
+  assert.equal(messages.length, 2, "вопрос + приглашение");
+  assert.match(messages[1].body.text, /Деплой/);
+  assert.match(messages[1].body.text, /Напишите ответ текстом/);
+  assert.equal(messages[1].body.attachments, undefined, "у приглашения нет кнопок");
+});
+
+test("061: «Показать ещё» сохраняет вопрос для следующего текста", async (t) => {
+  const updates = [
+    {
+      type: "message_callback",
+      timestamp: 1000,
+      callback: { callback_id: "cb-more", payload: "q:a1b2c3d4:more", user: { user_id: 7 }, chat: { chat_id: 42 } },
+    },
+    {
+      type: "message_created",
+      timestamp: 1001,
+      message: { sender: { user_id: 7 }, chat: { chat_id: 42 }, body: { text: "после раскрытия" } },
+    },
+  ];
+  const { transport, calls } = setup(t, { routes: { updates } });
+
+  await transport.sendQuestion(question());
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.equal(answers.length, 2, "more + текст");
+  assert.deepEqual(answers[1].text, "после раскрытия");
+  assert.equal(calls.filter((item) => item.key === "POST /answers").length, 0, "more не подтверждается как ответ");
+});
+
+test("061: реальный вариант по-прежнему удаляет запись вопроса", async (t) => {
+  const updates = [
+    {
+      type: "message_callback",
+      timestamp: 1000,
+      callback: { callback_id: "cb-o1", payload: "q:a1b2c3d4:o1", user: { user_id: 7 }, chat: { chat_id: 42 } },
+    },
+    {
+      type: "message_created",
+      timestamp: 1001,
+      message: { sender: { user_id: 7 }, chat: { chat_id: 42 }, body: { text: "лишний текст" } },
+    },
+  ];
+  const { transport } = setup(t, { routes: { updates } });
+
+  await transport.sendQuestion(question());
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.equal(answers.length, 1, "текст после варианта игнорируется");
+  assert.deepEqual(answers[0].optionIds, ["o1"]);
+});
+
+test("061: текст реплаем на приглашение находит вопрос", async (t) => {
+  let messageNumber = 0;
+  const updates = [
+    {
+      type: "message_callback",
+      timestamp: 1000,
+      callback: { callback_id: "cb-free2", payload: "q:a1b2c3d4:free", user: { user_id: 7 }, chat: { chat_id: 42 } },
+    },
+    {
+      type: "message_created",
+      timestamp: 1001,
+      message: {
+        sender: { user_id: 7 },
+        chat: { chat_id: 42 },
+        body: { text: "ответ на приглашение" },
+        link: { type: "reply", mid: "mid.2" },
+      },
+    },
+  ];
+  const { transport } = setup(t, {
+    routes: {
+      updates,
+      "POST /messages": () => {
+        messageNumber += 1;
+        return response({ ok: true, message: { body: { mid: `mid.${messageNumber}` } } });
+      },
+    },
+  });
+
+  await transport.sendQuestion(question());
+  const answers = [];
+  transport.onAnswer((answer) => answers.push(answer));
+  await transport.start();
+  await settle();
+  await transport.stop();
+
+  assert.deepEqual(answers.at(-1), { shortId: "a1b2c3d4", optionIds: [], text: "ответ на приглашение", answeredBy: "7" });
+});
+
 test("054 legacy: message_callback с update_type -> ответ и /answers", async (t) => {
   const updates = [{
     update_type: "message_callback",
@@ -1058,4 +1190,54 @@ test("050: таймаут запроса сохраняется в статис�
   });
   assert.equal(result, null);
   assert.equal(stats.lastError?.code, "MAX_TIMEOUT");
+});
+
+test("051: pairing пишет pairing.poll/code в журнал без текста", async () => {
+  const events = [];
+  const journal = { record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
+  const clock = fakeClock();
+  const result = await maxPollForCode({
+    token: TOKEN,
+    code: CODE,
+    deadline: clock.clock + 5_000,
+    pollTimeoutSec: 0,
+    apiBase: "https://platform-api2.max.ru",
+    fetch: async () => response({
+      updates: [{ type: "message_created", message: { sender: { user_id: 7 }, recipient: { chat_id: 42 }, body: { text: CODE } } }],
+    }),
+    now: clock.now,
+    sleep: clock.sleep,
+    journal,
+  });
+  assert.equal(result.chatId, 42);
+  assert.deepEqual(events.map((entry) => entry.event), ["pairing.poll", "pairing.code"]);
+  assert.equal(events[0].transport, "max");
+  assert.equal(JSON.stringify(events).includes(CODE), false, "код не в журнале");
+});
+
+// 055: серверный лимит MAX — 4000; регресс на границы и длинный <pre>.
+test("055: MAX не отправляет text длиннее 4000 на границах 3999/4000/4001", async (t) => {
+  for (const size of [3999, 4000, 4001]) {
+    const { transport, calls } = setup(t);
+    await transport.sendQuestion(question({ body: "x".repeat(size), options: [], allowFreeText: false }));
+    const call = calls.find((item) => item.key === "POST /messages");
+    assert.ok(call, `запрос для ${size}`);
+    assert.ok(call.body.text.length <= 4000, `вход ${size}: длина ${call.body.text.length}`);
+  }
+});
+
+test("055: вопрос 5700 символов режется по 4000 и не рвёт <pre>", async (t) => {
+  const { transport, calls } = setup(t);
+  const body = `\`\`\`js\n${"Z".repeat(5700)}\n\`\`\``;
+
+  await transport.sendQuestion(question({ body, options: [], allowFreeText: true }));
+
+  const call = calls.find((item) => item.key === "POST /messages");
+  const text = call.body.text;
+  assert.ok(text.length <= 4000, `длина ${text.length}`);
+  assert.equal((text.match(/<pre>/g) ?? []).length, (text.match(/<\/pre>/g) ?? []).length, "<pre> закрыт");
+  assert.equal((text.match(/<code>/g) ?? []).length, (text.match(/<\/code>/g) ?? []).length, "<code> закрыт");
+  assert.match(text, /…/, "маркер усечения на месте");
+  assert.match(text, /Ответьте текстом/i, "подсказка не обрезана");
+  assert.equal(text.includes("Z".repeat(5700)), false, "тело усечено");
 });

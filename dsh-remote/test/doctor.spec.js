@@ -37,6 +37,12 @@ function fakeServices(t, overrides = {}) {
     store: {
       paths: { file, dir: path.dirname(file), lock: path.join(path.dirname(file), "lock") },
       lockState: () => overrides.lock ?? { held: false, holder: null, mine: false },
+      // 053: токен проверяется по активной привязке, без неё — по config.
+      read: () => ({
+        bindings: overrides.state?.binding === false
+          ? null
+          : { transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot", createdAt: 1 },
+      }),
     },
     credentials: "credentials" in overrides ? overrides.credentials : {
       availableFor: () => true,
@@ -124,8 +130,12 @@ test("runDoctorChecks: свой lock — ok", async (t) => {
 });
 
 test("runDoctorChecks: нет транспорта — warn, есть ошибка канала — warn", async (t) => {
-  const withoutChannel = await runDoctorChecks(fakeServices(t, { transport: null }));
+  const withoutChannel = await runDoctorChecks(fakeServices(t, { transport: null, state: { binding: false } }));
   assert.equal(withoutChannel.find((check) => check.title === "канал").level, "warn");
+
+  // 053: привязка есть, а канала нет — это fail (токен есть, канал не поднят).
+  const boundWithoutChannel = await runDoctorChecks(fakeServices(t, { transport: null }));
+  assert.equal(boundWithoutChannel.find((check) => check.title === "канал").level, "fail");
 
   const withError = await runDoctorChecks(fakeServices(t, {
     transport: { lastUpdateId: -1, lastError: new Error("409 Conflict") },

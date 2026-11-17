@@ -744,6 +744,27 @@ approvals:
   — уход в GUI (`decision=gui`, поздний клик — `decision=late`). Второй таймер
   снимается, поэтому ровно один исход, один `next()` и одна запись решения.
 
+## Рабочий журнал `log.jsonl` (задача 051)
+
+Плагин пишет рабочий журнал в `~/.dsh/remote-control/log.jsonl` (рядом с
+`state.json`): одна JSON-строка на событие, поля
+`{ts, level, event, transport, shortId, detail}`. По нему виден путь вопроса:
+`question.send` → `question.sent`/`question.error` → `answer.received` или
+`answer.unmatched`; pairing MAX пишет `pairing.poll`/`pairing.code`/`pairing.error`.
+Токены и тексты ответов человека маскируются: в `answer.received` есть только
+`optionIds` и `customLength`, строки проходят `redact`.
+
+- включён по умолчанию; `logFile: false` в конфиге плагина выключает запись;
+- путь переопределяется `config.logFile` или `DSH_REMOTE_LOG_FILE`;
+- ротация по размеру (5 МиБ, хранится `.1`…`.5`), права `600`;
+- ошибка записи журнала не роняет плагин: одна строка в логгер и работа продолжается.
+
+Пример строки:
+
+```json
+{"ts":"2026-11-12T01:20:00.000Z","level":"info","event":"question.sent","transport":"max","shortId":"ab12cd34","detail":"{\"messageId\":\"mid.1\",\"keyboard\":true}"}
+```
+
 ## Метрики и `/remote stats`
 
 Плагин ведёт счётчики в памяти процесса (сброс при старте) и публикует их как

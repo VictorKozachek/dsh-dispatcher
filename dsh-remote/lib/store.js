@@ -678,8 +678,19 @@ export function createStore({
   function setEnabled(scope, value) {
     const enabled = Boolean(value);
     return update((state) => {
-      if (scope?.kind === "global") state.enabled.global = enabled;
-      else if (scope?.kind === "workspace" && typeof scope.id === "string" && scope.id !== "") {
+      if (scope?.kind === "global") {
+        state.enabled.global = enabled;
+        // 057: --all — режим везде. Явные исключения, спорящие с новым
+        // глобальным значением, снимаем (ключи удаляем, а не пишем true/false):
+        // иначе workspaces[x]=false при global=true молча выключает проект.
+        for (const group of ["workspaces", "sessions"]) {
+          const map = state.enabled[group];
+          if (map === null || typeof map !== "object") continue;
+          for (const [key, value] of Object.entries(map)) {
+            if (typeof value === "boolean" && value !== enabled) delete map[key];
+          }
+        }
+      } else if (scope?.kind === "workspace" && typeof scope.id === "string" && scope.id !== "") {
         state.enabled.workspaces[scope.id] = enabled;
       } else if (scope?.kind === "session" && typeof scope.id === "string" && scope.id !== "") {
         state.enabled.sessions[scope.id] = enabled;

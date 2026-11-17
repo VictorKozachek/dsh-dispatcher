@@ -559,9 +559,22 @@ export function createMaxTransport(options = {}) {
   /** Найти запись по mid сообщения (reply/несколько открытых). */
   function shortIdByMid(mid) {
     for (const [shortId, record] of sent.entries()) {
-      if (record.mid === mid) return shortId;
+      if (record.mid === mid || record.inviteMid === mid) return shortId;
     }
     return null;
+  }
+
+  /** 061: приглашение ввести текст после «Другой ответ». */
+  const FREE_TEXT_PROMPT = "✍️ Напишите ответ текстом одним сообщением — можно ответом на это сообщение.";
+
+  /** Отправить служебное сообщение в чат вопроса (без кнопок). */
+  async function sendNotice(targetChat, text) {
+    const query = targetChat !== null && targetChat !== undefined ? { chat_id: targetChat } : { user_id: userId };
+    const response = await sendQueue.push(() => request("POST", "/messages", {
+      query,
+      body: { text, format: "html" },
+    })).run().then((results) => results[0]);
+    return response?.message?.body?.mid ?? response?.message?.mid ?? null;
   }
 
   /** Разобрать одно обновление. */
@@ -598,11 +611,33 @@ export function createMaxTransport(options = {}) {
         return;
       }
       const label = record.labels.get(parsed.optionId) ?? parsed.optionId;
-      emit({
-        shortId: parsed.shortId,
-        optionIds: [parsed.optionId],
-        answeredBy: senderOf(update) === null ? undefined : String(senderOf(update)),
-      });
+      const answeredBy = senderOf(update) === null ? undefined : String(senderOf(update));
+
+      // 061: «Другой ответ» и «Показать ещё» — не ответ. Вопрос остаётся
+      // открытым, запись в sent нужна, чтобы следующий текст/клик нашёл его.
+      if (parsed.optionId === FREE_TEXT_OPTION) {
+        emit({ shortId: parsed.shortId, optionIds: [FREE_TEXT_OPTION], answeredBy });
+        try {
+          // Снимаем кнопки и просим текст в самом сообщении вопроса...
+          await answerCallback(update.callback.callback_id, escapeHtml(FREE_TEXT_PROMPT));
+          const head = typeof record.title === "string" && record.title !== ""
+            ? escapeHtml(record.title)
+            : String(record.text ?? "").split("\n\n")[0];
+          const invite = `${head === "" ? "Вопрос" : head}\n\n${FREE_TEXT_PROMPT}`;
+          const inviteMid = await sendNotice(record.chatId ?? chatId, invite);
+          if (inviteMid !== null) record.inviteMid = inviteMid;
+        } catch (error) {
+          log(`max: не удалось попросить текст (${describeError(error, token)})`);
+        }
+        return;
+      }
+      if (parsed.optionId === MORE_OPTION) {
+        emit({ shortId: parsed.shortId, optionIds: [MORE_OPTION], answeredBy });
+        // Запись не удаляем: после раскрытия вопрос снова answerable.
+        return;
+      }
+
+      emit({ shortId: parsed.shortId, optionIds: [parsed.optionId], answeredBy });
       try {
         await answerCallback(update.callback.callback_id, `✅ Отвечено: ${escapeHtml(label)}`);
       } catch (error) {
@@ -791,7 +826,14 @@ export function createMaxTransport(options = {}) {
       const response = await sendQueue.push(() => request("POST", "/messages", { query, body })).run().then((results) => results[0]);
       const mid = response?.message?.body?.mid ?? response?.message?.mid ?? null;
       if (mid !== null) {
-        sent.set(shortId, { chatId: targetChat, mid, text, labels, attachments });
+        sent.set(shortId, {
+          chatId: targetChat,
+          mid,
+          text,
+          title: typeof question.title === "string" && question.title !== "" ? question.title : null,
+          labels,
+          attachments,
+        });
       }
       return { messageId: mid };
     },
@@ -1071,10 +1113,19 @@ export async function maxPollForCode({
   sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   signal,
   log = () => {},
+  /** 051: рабочий журнал (log.jsonl). */
+  journal = null,
   /** 050: сюда складывается диагностика для текста ошибки (`polls/updates/types/host`). */
   stats = null,
   timeoutMs = 15_000,
 } = {}) {
+  const journalEvent = (event, fields) => {
+    try {
+      journal?.record?.(event, fields);
+    } catch {
+      /* журнал не должен ронять pairing */
+    }
+  };
   let marker = null;
   // 048: как только один из хостов ответил, дальше опрашиваем именно его —
   // иначе каждый long polling начинался бы с падения на TLS у api2.
@@ -1117,6 +1168,10 @@ export async function maxPollForCode({
       // 401/403 — токен/активация бота: повторять бессмысленно, пусть человек чинит.
       if (status === 401 || status === 403) throw error;
       attempt += 1;
+      journalEvent("pairing.error", {
+        transport: "max",
+        detail: { status, code: error?.code ?? "", retryAfterMs: error?.retryAfterMs ?? null },
+      });
       counts.lastError = { status, code: error?.code ?? null, retryAfterMs: error?.retryAfterMs ?? null, message: describeError(error, token) };
       let pause = waitMs;
       if (status === 429) {
@@ -1144,7 +1199,17 @@ export async function maxPollForCode({
     const found = findPairingUpdate(updates, code);
     if (found.codeSeen) counts.codeSeen += 1;
     log(`max pairing: poll host=${counts.host ?? workingBase ?? "?"} updates=${updates.length} types=${types} code=${found.codeSeen ? "yes" : "no"}`);
-    if (found.match !== null) return { ...found.match, marker, stats: counts };
+    journalEvent("pairing.poll", {
+      transport: "max",
+      detail: { host: counts.host ?? workingBase ?? null, updates: updates.length, types: [...counts.types], code: found.codeSeen },
+    });
+    if (found.match !== null) {
+      journalEvent("pairing.code", {
+        transport: "max",
+        detail: { host: counts.host ?? workingBase ?? null, updates: updates.length, chatId: found.match.chatId, userId: found.match.userId },
+      });
+      return { ...found.match, marker, stats: counts };
+    }
     // Long polling уже ждал ответ `pollTimeoutSec`; короткий опрос (0) — пауза 1 с.
     await sleep(pollTimeoutSec > 0 ? 200 : 1000);
   }
