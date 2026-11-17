@@ -1082,3 +1082,30 @@ test("051: pairing пишет pairing.poll/code в журнал без текс�
   assert.equal(events[0].transport, "max");
   assert.equal(JSON.stringify(events).includes(CODE), false, "код не в журнале");
 });
+
+// 055: серверный лимит MAX — 4000; регресс на границы и длинный <pre>.
+test("055: MAX не отправляет text длиннее 4000 на границах 3999/4000/4001", async (t) => {
+  for (const size of [3999, 4000, 4001]) {
+    const { transport, calls } = setup(t);
+    await transport.sendQuestion(question({ body: "x".repeat(size), options: [], allowFreeText: false }));
+    const call = calls.find((item) => item.key === "POST /messages");
+    assert.ok(call, `запрос для ${size}`);
+    assert.ok(call.body.text.length <= 4000, `вход ${size}: длина ${call.body.text.length}`);
+  }
+});
+
+test("055: вопрос 5700 символов режется по 4000 и не рвёт <pre>", async (t) => {
+  const { transport, calls } = setup(t);
+  const body = `\`\`\`js\n${"Z".repeat(5700)}\n\`\`\``;
+
+  await transport.sendQuestion(question({ body, options: [], allowFreeText: true }));
+
+  const call = calls.find((item) => item.key === "POST /messages");
+  const text = call.body.text;
+  assert.ok(text.length <= 4000, `длина ${text.length}`);
+  assert.equal((text.match(/<pre>/g) ?? []).length, (text.match(/<\/pre>/g) ?? []).length, "<pre> закрыт");
+  assert.equal((text.match(/<code>/g) ?? []).length, (text.match(/<\/code>/g) ?? []).length, "<code> закрыт");
+  assert.match(text, /…/, "маркер усечения на месте");
+  assert.match(text, /Ответьте текстом/i, "подсказка не обрезана");
+  assert.equal(text.includes("Z".repeat(5700)), false, "тело усечено");
+});
