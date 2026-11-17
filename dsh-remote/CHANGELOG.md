@@ -4,12 +4,14 @@
 
 ## 0.3.1 — 2026-11-17
 
-- **Журнал в файл (051, 056).** Рабочий `~/.dsh/remote-control/log.jsonl` с
+- **Журнал в файл (051).** Рабочий `~/.dsh/remote-control/log.jsonl` с
   событиями `question.send/sent/error`, `answer.received/unmatched`,
   `pairing.*`: путь, `shortId`, транспорт, HTTP-код; токены и тексты ответов
   маскируются (`customLength` вместо текста), ротация 5 МиБ × 5, `logFile: false`
-  и `DSH_REMOTE_LOG_FILE`. Журнал виден ответчику через `deps.expose`, так что
-  файл действительно пишется, а `status`/`doctor` показывают путь.
+  и `DSH_REMOTE_LOG_FILE`.
+- **Журнал виден ответчику (056).** Сервис публикуется через `deps.expose`, а не
+  только `ctx.get`: файл действительно пишется, `status`/`doctor` показывают
+  путь журнала.
 - **MAX после `/remote connect` (052).** Убран ранний `return` для «не
   telegram»: ветка `max` в `ensureTransport` достижима, канал создаётся и
   стартует, вопрос уходит в MAX. При смене привязки/токена транспорт
