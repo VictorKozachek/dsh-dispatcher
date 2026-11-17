@@ -21,6 +21,7 @@ import { telegramFeature } from "../lib/features/telegram.js";
 import { answererFeature } from "../lib/features/answerer.js";
 import { RELAY_TOKEN_REF } from "../lib/transport/relay.js";
 import {
+  MAX_TOKEN_REF,
   PAIRING_TTL_MS,
   TELEGRAM_TOKEN_REF,
   createRemoteCommands,
@@ -369,6 +370,103 @@ test("connect: человек закрыл вопрос — ошибка тек�
   assert.equal(result.kind, "error");
   assert.match(result.text, /подключение не удалось: вопрос закрыт/);
   assert.equal(stand.store.read().bindings, null);
+});
+
+/** 053: фейковый живой канал для doctor. */
+function doctorChannel(id) {
+  return {
+    id,
+    lastUpdateId: 5,
+    lastError: null,
+    marker: 5,
+    polling: true,
+    healthCheck: async () => ({ ok: true, detail: "max ok" }),
+    start: async () => {},
+    stop: async () => {},
+    sendQuestion: async () => ({}),
+  };
+}
+
+function doctorRemote(stand, { config = {}, channel = null, fetch = null } = {}) {
+  return createRemoteCommands({
+    ctx: stand.ctx,
+    store: stand.store,
+    log: () => {},
+    now: () => stand.clock,
+    config,
+    currentChannel: () => channel,
+    ...(fetch === null ? {} : { fetch }),
+  });
+}
+
+test("053: doctor на MAX-only зелёный и не требует telegram-токен", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "max", chatId: 42, userId: 7, botUsername: "max_bot" });
+  stand.credentials.values.set(MAX_TOKEN_REF, "max-token");
+  const remote = doctorRemote(stand, { channel: doctorChannel("max") });
+
+  const result = await remote.handler(invoke("doctor"));
+  assert.equal(result.exitCode, 0, result.text);
+  assert.equal(result.text.includes(`credentials:${TELEGRAM_TOKEN_REF}`), false);
+  assert.match(result.text, new RegExp(`credentials:${MAX_TOKEN_REF.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+});
+
+test("053: doctor показывает отключённый предыдущий канал информационной строкой", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "max", chatId: 42, userId: 7, botUsername: "max_bot" });
+  const state = JSON.parse(fs.readFileSync(stand.file, "utf8"));
+  state.bindings = {
+    transport: "max",
+    chatId: 42,
+    userId: 7,
+    botUsername: "max_bot",
+    createdAt: 1,
+    previousTransport: "telegram",
+  };
+  fs.writeFileSync(stand.file, JSON.stringify(state));
+  stand.credentials.values.set(MAX_TOKEN_REF, "max-token");
+  const remote = doctorRemote(stand, { channel: doctorChannel("max") });
+
+  const result = await remote.handler(invoke("doctor"));
+  assert.equal(result.exitCode, 0, result.text);
+  assert.match(result.text, /предыдущий канал: telegram \(токен удалён\)/);
+  assert.doesNotMatch(result.text, /\[fail\].*TELEGRAM_TOKEN/);
+});
+
+test("053: doctor на telegram-only зелёный и не требует MAX-токен", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "telegram", chatId: 42, userId: 7, botUsername: "test_bot" });
+  stand.credentials.values.set(TELEGRAM_TOKEN_REF, TOKEN);
+  const remote = doctorRemote(stand, {
+    channel: doctorChannel("telegram"),
+    fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true, result: { username: "test_bot" } }) }),
+  });
+
+  const result = await remote.handler(invoke("doctor"));
+  assert.equal(result.exitCode, 0, result.text);
+  assert.equal(result.text.includes(`credentials:${MAX_TOKEN_REF}`), false);
+});
+
+test("053: привязка MAX без своего токена — fail про MAX", async (t) => {
+  const stand = harness(t);
+  stand.store.setBinding({ transport: "max", chatId: 42, userId: 7, botUsername: "max_bot" });
+  const remote = doctorRemote(stand, { channel: doctorChannel("max") });
+
+  const result = await remote.handler(invoke("doctor"));
+  assert.equal(result.exitCode, 2, result.text);
+  assert.match(result.text, new RegExp(`\\[fail\\].*${MAX_TOKEN_REF.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.equal(result.text.includes(`credentials:${TELEGRAM_TOKEN_REF}`), false);
+});
+
+test("053: без привязки doctor не требует чужих токенов", async (t) => {
+  const stand = harness(t);
+  const remote = doctorRemote(stand, { config: {} });
+
+  const result = await remote.handler(invoke("doctor"));
+  assert.equal(result.text.includes(`credentials:${TELEGRAM_TOKEN_REF}`), false);
+  assert.equal(result.text.includes(`credentials:${MAX_TOKEN_REF}`), false);
+  assert.doesNotMatch(result.text, /\[fail\] credentials:/);
+  assert.notEqual(result.exitCode, 2, "нет fail из-за отключённых каналов");
 });
 
 test("on/off: воркспейс по умолчанию, --all и --session", async (t) => {

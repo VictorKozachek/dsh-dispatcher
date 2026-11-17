@@ -417,6 +417,7 @@ export const commandsFeature = {
       log,
       ensureTransport: ensure,
       currentChannel,
+      config,
       // 056: журнал публикует journalFeature через deps.expose; ctx.get в cordis
       // обычный объект не видит, поэтому передаём сервис явно.
       journal: deps.get("remoteJournal") ?? null,
