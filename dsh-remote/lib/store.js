@@ -348,6 +348,7 @@ export function defaultState() {
     enabled: { global: false, workspaces: {}, sessions: {} },
     /** Гибридный режим: мессенджер → GUI через `waitMs` (задача 013). */
     hybrid: { enabled: false, waitMs: DEFAULT_HYBRID_WAIT_MS },
+    mirror: { enabled: false },
     /** 046: язык пользовательских сообщений (`/remote lang`). */
     lang: DEFAULT_LANG,
     recent: [],
@@ -705,6 +706,14 @@ export function createStore({
    * Гибридный режим (013): включить/выключить и при желании поменять ожидание.
    * Поле отдельное от `enabled`: это не scope, а «показать вопрос ещё и в GUI».
    */
+  /** 063: режим mirror (вопрос и в GUI, и в канале). */
+  function setMirror(enabled) {
+    return update((state) => {
+      state.mirror = { enabled: enabled === true };
+      return state;
+    });
+  }
+
   function setHybrid(patch = {}) {
     return update((state) => {
       state.hybrid = {
@@ -856,6 +865,7 @@ export function createStore({
     setChannel,
     removeChannel,
     setHybrid,
+    setMirror,
     setBinding,
     addRecent,
     setPending,
@@ -907,6 +917,7 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT, pendi
         ? Math.floor(value.hybrid.waitMs)
         : DEFAULT_HYBRID_WAIT_MS,
     },
+    mirror: { enabled: value.mirror?.enabled === true },
     recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
     pending: Array.isArray(value.pending) ? value.pending.slice(-Math.max(0, pendingLimit)) : [],
     notify: {
