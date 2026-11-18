@@ -424,11 +424,16 @@ export function createAnswerer({
       });
       return;
     }
-    journalEvent("answer.received", {
-      transport: sourceTransport?.id ?? null,
-      shortId: normalized.shortId,
-      detail: { optionIds: normalized.optionIds, customLength: normalized.text.length },
-    });
+    // 066: повторный ответ на уже отвеченный вопрос — duplicate, и это не
+    // second answer.received. Первое событие по-прежнему received.
+    const knownBefore = known.get(normalized.shortId);
+    if (knownBefore?.status !== "answered") {
+      journalEvent("answer.received", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { optionIds: normalized.optionIds, customLength: normalized.text.length },
+      });
+    }
     const entry = pending.get(normalized.shortId);
     if (entry !== undefined && (entry.mirrorGui === true || entry.mirrorNotify === true)) {
       journalEvent("answer.dropped", {
@@ -476,18 +481,23 @@ export function createAnswerer({
         });
         return;
       }
-      journalEvent("answer.unmatched", {
-        transport: sourceTransport?.id ?? null,
-        shortId: normalized.shortId,
-        detail: { reason: "shortId", optionIds: normalized.optionIds },
-      });
       const knownQuestion = known.get(normalized.shortId);
       if (knownQuestion !== undefined && knownQuestion.status === "answered") {
-        // Ответ из канала, который проиграл гонку: решение уже принято.
+        // 066: повтор/второй проход того же события — duplicate, не unmatched.
+        journalEvent("answer.duplicate", {
+          transport: sourceTransport?.id ?? null,
+          shortId: normalized.shortId,
+          detail: { reason: "duplicate", answeredVia: knownQuestion.answeredVia ?? null },
+        });
         log(`ответ на ${normalized.shortId} из канала ${sourceTransport?.id ?? "?"} проигнорирован:`
           + ` вопрос уже отвечен в ${knownQuestion.answeredVia ?? "другом канале"}`);
         return;
       }
+      journalEvent("answer.unmatched", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { reason: knownQuestion === undefined ? "shortId" : "closed", optionIds: normalized.optionIds },
+      });
       // Поздний ответ: вопрос уже снят (TTL/аборт/перезапуск). Это не игнор —
       // карточка требует, чтобы ответ дошёл до сессии через `steer`.
       const closedQuestion = recentlyClosed.get(normalized.shortId);
