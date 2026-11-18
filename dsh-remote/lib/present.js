@@ -21,6 +21,7 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { DEFAULT_CAPS } from "./transport/base.js";
@@ -343,6 +344,48 @@ export function findOwnedTask(cwd, sessionId, { log = noop } = {}) {
 }
 
 /**
+ * 068: имя сессии из кэша проекций DSH (`storages/session_projcache/sessions/*.json`).
+ *
+ * Только чтение и только фолбэк: файла/поля/прав нет — null, ошибка разбора — null.
+ * Путь берётся из `DSH_HOME` (по умолчанию `~/.dsh`), имена — с префиксом
+ * `session-` и без него. Полный id сессии наружу не печатается.
+ */
+export function sessionTitleFromProjection(sessionId, { env = process.env, log = noop } = {}) {
+  if (typeof sessionId !== "string" || sessionId === "") return null;
+  const home = typeof env?.DSH_HOME === "string" && env.DSH_HOME !== ""
+    ? env.DSH_HOME
+    : path.join(os.homedir(), ".dsh");
+  const dir = path.join(home, "storages", "session_projcache", "sessions");
+  for (const name of [`session-${sessionId}.json`, `${sessionId}.json`]) {
+    let text;
+    try {
+      text = fs.readFileSync(path.join(dir, name), "utf8");
+    } catch (error) {
+      if (error?.code !== "ENOENT") log(`session title: ${name} could not be read (${error?.message ?? error})`);
+      continue;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      log(`session title: ${name} — invalid JSON (${error?.message ?? error})`);
+      continue;
+    }
+    const title = parsed?.record?.rows?.title?.val;
+    if (typeof title === "string" && title.trim() !== "") return title.trim();
+  }
+  return null;
+}
+
+/** Имя сессии из публичного API (если хост его отдаёт). */
+function sessionTitleOf(session) {
+  for (const value of [session?.title, session?.header?.title, session?.header?.name, session?.name]) {
+    if (typeof value === "string" && value.trim() !== "") return value.trim();
+  }
+  return null;
+}
+
+/**
  * Контекст сессии для шапки.
  *
  * `workspace` — имя каталога (`basename(cwd)`), `role` — `agentPreset` шапки,
@@ -356,6 +399,7 @@ export function resolveContext({ sessionId, ctx, log = noop } = {}) {
     workspace: null,
     cwd: null,
     role: null,
+    sessionTitle: null,
     taskId: null,
     branch: null,
     worktree: null,
@@ -377,6 +421,10 @@ export function resolveContext({ sessionId, ctx, log = noop } = {}) {
   context.role = typeof header?.agentPreset === "string" && header.agentPreset !== ""
     ? header.agentPreset
     : null;
+  // 068: предпочитаем штатное имя сессии из API, затем кэш проекций; без имени
+  // в шапке остаётся agentPreset (обратная совместимость).
+  context.sessionTitle = sessionTitleOf(session)
+    ?? sessionTitleFromProjection(context.sessionId, { log });
   const card = findOwnedTaskCard(cwd, context.sessionId, { log });
   context.taskId = card === null ? null : card.id;
   context.branch = card === null ? null : card.branch;
@@ -407,8 +455,12 @@ export function renderHeader(context = {}) {
   const tail = [];
   if (taskId !== "") tail.push(t("present.task", { id: taskId }, lang));
   if (shortBranch !== null && shortBranch !== taskId) tail.push(truncateWord(shortBranch, BRANCH_LIMIT));
-  const role = typeof context.role === "string" && context.role !== ""
-    ? truncateWord(context.role, WORKSPACE_LIMIT)
+  // 068: в шапке — имя сессии, иначе пресет (обратная совместимость).
+  const displayRole = typeof context.sessionTitle === "string" && context.sessionTitle !== ""
+    ? context.sessionTitle
+    : context.role;
+  const role = typeof displayRole === "string" && displayRole !== ""
+    ? truncateWord(displayRole, WORKSPACE_LIMIT)
     : null;
   if (role !== null) tail.push(role);
   // Номер вопроса в пачке: в мессенджере вопросы идут отдельными сообщениями.
@@ -481,6 +533,7 @@ export function renderBody(question = {}, caps = {}) {
     taskId: question.taskId ?? null,
     branch: question.branch ?? null,
     role: question.role ?? null,
+    sessionTitle: question.sessionTitle ?? null,
     index: question.index ?? null,
     total: question.total ?? null,
     now,

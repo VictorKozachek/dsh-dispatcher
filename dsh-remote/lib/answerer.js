@@ -583,11 +583,12 @@ export function createAnswerer({
     const workspace = workspaceOf(sessionId);
     // Маркировка (006): роль и задача, которую ведёт эта сессия. Ошибки чтения
     // контекста не должны мешать вопросу — тогда просто без задачи.
-    let questionContext = { role: null, taskId: null, branch: null, worktree: null };
+    let questionContext = { role: null, sessionTitle: null, taskId: null, branch: null, worktree: null };
     try {
       const resolved = resolveContext({ sessionId, ctx: context, log });
       questionContext = {
         role: resolved.role ?? null,
+        sessionTitle: resolved.sessionTitle ?? null,
         taskId: resolved.taskId ?? null,
         branch: resolved.branch ?? null,
         worktree: resolved.worktree ?? null,
