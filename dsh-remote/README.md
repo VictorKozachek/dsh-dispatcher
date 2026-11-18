@@ -380,21 +380,28 @@ telegram-чат не должен уезжать в MAX. По умолчанию
 [user-guide, §5.1](../docs/user-guide.md#51-зеркальный-режим-mirror).
 
 `/remote mirror on` включает зеркало: вопрос публикуется в канал и **одновременно**
-отдаётся в GUI через `next()`. Возможности хоста определяются при старте:
+отдаётся в GUI через `next()`. Режим определяется при старте по
+`detectMirrorMode` (задача 063), а не по наличию `ctx.on` (cordis даёт его
+всегда):
 
-- хост даёт `userQuestions.settle` **и** событие (`ctx.on`) → `full`: первый ответ
-  побеждает; ответ из канала вызывает `settle(agent, callId, answer)`, ответ GUI
-  гасит сообщение в канале, поздний ответ канала пишется в журнал как
+- **`full`** — только если у сервиса есть **и** `settle`, **и** `cancel`, **и**
+  подтверждено событие `resolved` (`userQuestions.capabilities.resolvedEvent ===
+  true`, либо флаг `resolvedEvent`/`supportsResolvedEvent`). Тогда первый ответ
+  побеждает: ответ из канала вызывает `settle(agent, callId, answer)`, ответ GUI
+  гасит сообщение в канале, поздний ответ проигравшего пишется в журнал как
   `answer.dropped` без `steer`;
-- хоста без `settle` → `notify` (деградация B): GUI — источник истины, клик в
-  канале не завершает tool-call, а просит ответить в GUI; сообщение закрывается
-  подсказкой;
-- `/remote mirror off` и обычный `remote-only` — `none`.
+- **`notify`** — во всех остальных случаях, в том числе если есть `settle`, но нет
+  `cancel` или подтверждённого события, и на текущем DSH 0.2.1-rc.5. GUI —
+  источник истины: клик в канале не завершает tool-call, а просит ответить в GUI;
+  сообщение закрывается подсказкой;
+- **`none`** — `/remote mirror off` и обычный `remote-only`.
 
 `/remote mirror` и `/remote status` показывают `mirror: full|notify|none` и
 причину («хост не даёт settle»). События журнала: `question.mirror.published`,
 `answer.from_gui`, `answer.from_transport`, `answer.settled`, `answer.dropped`.
-Аборт/TTL снимают сообщение в канале и отменяют GUI-вопрос (`cancel`).
+Аборт/TTL в `full` снимают сообщение в канале **и** отменяют вопрос в GUI
+(`cancel`); в `notify` закрывается только сообщение канала, карточка GUI живёт по
+правилам DSH (ответ/аборт запроса).
 
 ## Транспорт relay (свой сервер)
 
