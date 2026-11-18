@@ -585,7 +585,7 @@ export function createAnswerer({
     // контекста не должны мешать вопросу — тогда просто без задачи.
     let questionContext = { role: null, sessionTitle: null, taskId: null, branch: null, worktree: null };
     try {
-      const resolved = resolveContext({ sessionId, ctx: context, log });
+      const resolved = resolveContext({ sessionId, ctx: context, log, journal });
       questionContext = {
         role: resolved.role ?? null,
         sessionTitle: resolved.sessionTitle ?? null,
