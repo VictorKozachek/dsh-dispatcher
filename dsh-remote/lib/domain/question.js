@@ -103,6 +103,8 @@ export class RemoteQuestion {
     this.sessionId = context.sessionId ?? null;
     this.workspace = context.workspace ?? null;
     this.role = context.role ?? null;
+    /** 068: человекочитаемое имя сессии для шапки (не пресет). */
+    this.sessionTitle = typeof context.sessionTitle === "string" && context.sessionTitle !== "" ? context.sessionTitle : null;
     this.taskId = context.taskId ?? null;
     /** 047: короткая ссылка на ветку/рабочее дерево задачи (для подсказки). */
     this.branch = typeof context.branch === "string" && context.branch !== "" ? context.branch : null;
@@ -268,6 +270,7 @@ export class RemoteQuestion {
       sessionId: this.sessionId,
       workspace: this.workspace,
       role: this.role,
+      sessionTitle: this.sessionTitle,
       taskId: this.taskId,
       branch: this.branch,
       worktree: this.worktree,

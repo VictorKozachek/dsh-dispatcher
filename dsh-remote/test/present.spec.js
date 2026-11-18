@@ -28,6 +28,7 @@ import {
   renderHtml,
   renderRows,
   resolveContext,
+  sessionTitleFromProjection,
   taskLinkHint,
   truncate,
   truncateLines,
@@ -107,7 +108,7 @@ test("resolveContext: нет каталога .kanban — тихо, без taskI
 test("resolveContext: чужой/пропавший/бросающий sessions.get не роняет", () => {
   const missing = resolveContext({ sessionId: SESSION_ID, ctx: fakeCtx({ get: () => undefined }) });
   assert.deepEqual(missing, {
-    sessionId: SESSION_ID, workspace: null, cwd: null, role: null, taskId: null, branch: null, worktree: null,
+    sessionId: SESSION_ID, workspace: null, cwd: null, role: null, sessionTitle: null, taskId: null, branch: null, worktree: null,
   });
 
   const throwing = resolveContext({
@@ -125,7 +126,7 @@ test("resolveContext: чужой/пропавший/бросающий sessions.
 
   const noSession = resolveContext({ sessionId: null, ctx: fakeCtx({ get: () => session(CWD) }) });
   assert.deepEqual(noSession, {
-    sessionId: null, workspace: null, cwd: null, role: null, taskId: null, branch: null, worktree: null,
+    sessionId: null, workspace: null, cwd: null, role: null, sessionTitle: null, taskId: null, branch: null, worktree: null,
   });
 });
 
@@ -780,4 +781,98 @@ test("HTML: спецсимволы экранируются, одиночные 
   const html = renderHtml("a < b & c > d `code <x>`");
   assert.equal(html, "a &lt; b &amp; c &gt; d <code>code &lt;x&gt;</code>");
   assert.equal(html.includes("<script>"), false);
+});
+
+
+function projectionHome(t, sessionId, title) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-title-home-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, "storages", "session_projcache", "sessions");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${sessionId}.json`), JSON.stringify({ record: { rows: { title: { val: title } } } }));
+  return home;
+}
+
+test("068: имя сессии из кэша проекций попадает в шапку вместо пресета", (t) => {
+  const home = projectionHome(t, SESSION_ID, "Оркестратор");
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const dir = tempWorkspace(t);
+    const context = resolveContext({
+      sessionId: SESSION_ID,
+      ctx: fakeCtx({ get: () => session(dir, "standard") }),
+    });
+    assert.equal(context.role, "standard");
+    assert.equal(context.sessionTitle, "Оркестратор");
+    const body = renderBody({
+      workspace: dir, role: context.role, sessionTitle: context.sessionTitle,
+      body: "Продолжать?", createdAt: 0,
+    }, { maxText: 4096 });
+    assert.match(body.split("\n")[0], /Оркестратор/);
+    assert.equal(body.split("\n")[0].includes("standard"), false);
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  }
+});
+
+test("068: API title предпочтительнее файла; без имени — пресет", (t) => {
+  const home = projectionHome(t, SESSION_ID, "Из файла");
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const dir = tempWorkspace(t);
+    const apiSession = { header: { cwd: dir, agentPreset: "standard", title: "Из API" } };
+    const context = resolveContext({ sessionId: SESSION_ID, ctx: fakeCtx({ get: () => apiSession }) });
+    assert.equal(context.sessionTitle, "Из API");
+    assert.match(renderHeader({ workspace: "p", role: "standard", sessionTitle: context.sessionTitle }), /Из API/);
+    assert.equal(renderHeader({ workspace: "p", role: "standard" }).includes("standard"), true, "без имени — пресет");
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  }
+});
+
+test("068: битый кэш/нет файла — пресет и debug-лог, без падения", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-title-broken-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, "storages", "session_projcache", "sessions");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `session-${SESSION_ID}.json`), "{не json");
+  const logs = [];
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const workspace = tempWorkspace(t);
+    const context = resolveContext({
+      sessionId: SESSION_ID,
+      ctx: fakeCtx({ get: () => session(workspace, "standard") }),
+      log: (line) => logs.push(line),
+    });
+    assert.equal(context.sessionTitle, null);
+    assert.match(renderHeader({ workspace: "p", role: context.role }), /standard/);
+    assert.ok(logs.some((line) => /invalid JSON/.test(line)));
+    assert.equal(sessionTitleFromProjection("no-such-session", { env: { DSH_HOME: home } }), null);
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  }
+});
+
+test("068: длинное имя усечено, HEADER_LIMIT соблюдён", (t) => {
+  const long = "Очень длинное имя сессии оркестратора проекта";
+  const home = projectionHome(t, SESSION_ID, long);
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const workspace = tempWorkspace(t);
+    const context = resolveContext({ sessionId: SESSION_ID, ctx: fakeCtx({ get: () => session(workspace, "standard") }) });
+    const header = renderHeader({ workspace: "very-long-project-name", role: context.role, sessionTitle: context.sessionTitle, now: 0 });
+    assert.ok(header.length <= HEADER_LIMIT, `длина ${header.length}`);
+    assert.equal(header.includes("…"), true);
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  }
 });
