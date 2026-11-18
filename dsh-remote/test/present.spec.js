@@ -945,3 +945,19 @@ test("069: без обоих id имени нет — пресет и foundTitle
   assert.equal(entry.detail.foundTitle, false);
   assert.equal(entry.detail.sameId, null);
 });
+
+test("069: context.resolve пишется и при исключении sessions.get (без id)", () => {
+  const events = [];
+  const journal = { record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
+  const context = resolveContext({
+    sessionId: SESSION_ID,
+    ctx: { get: () => ({ get: () => { throw new Error("sessions недоступны"); } }) },
+    journal,
+  });
+  assert.equal(context.sessionTitle, null);
+  const entry = events.find((item) => item.event === "context.resolve");
+  assert.ok(entry);
+  assert.equal(entry.detail.foundTitle, false);
+  assert.equal(entry.detail.sameId, null);
+  assert.match(entry.detail.sessionId, /…$/);
+});
