@@ -323,7 +323,14 @@ test("056: каркас journalFeature → deps → answerer пишет question
 
   await runFeatureQuestion(stand);
 
-  const entries = lines(file).filter((entry) => entry.event !== "context.resolve");
+  const allEntries = lines(file);
+  const contextEntry = allEntries.find((entry) => entry.event === "context.resolve");
+  assert.ok(contextEntry, "context.resolve дошёл до файла через answerer");
+  const contextDetail = typeof contextEntry.detail === "string" ? JSON.parse(contextEntry.detail) : contextEntry.detail;
+  for (const field of ["sessionId", "sessionObjectId", "sameId", "foundTitle", "preset"]) {
+    assert.ok(Object.hasOwn(contextDetail, field), `context.resolve.${field}`);
+  }
+  const entries = allEntries.filter((entry) => entry.event !== "context.resolve");
   const names = entries.map((entry) => entry.event);
   assert.deepEqual(names, ["question.send", "question.sent"], "обе записи через общий реестр");
   assert.equal(entries[0].transport, "max");

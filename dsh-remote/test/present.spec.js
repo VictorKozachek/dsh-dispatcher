@@ -877,6 +877,9 @@ test("068: длинное имя усечено, HEADER_LIMIT соблюдён",
   }
 });
 
+// Fallback: по типам DSH Agent.id — это SessionId, и на обычном хосте
+// session.id совпадает с request.agent.id; тест оставлен как защита для хостов,
+// где sessions.get вернул объект с другим id, а не как покрытие живого случая.
 test("069: имя находится по session.id, если request.agent.id — id агента", (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-title-session-id-"));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
@@ -920,6 +923,11 @@ test("069: context.resolve пишет безопасные факты foundTitle
     assert.equal(entry.detail.foundTitle, true);
     assert.equal(entry.detail.preset, "standard");
     assert.equal(entry.detail.sameId, false);
+    assert.equal(entry.detail.titleSource, "agent-id");
+    assert.equal(entry.detail.homeSource, "env");
+    assert.equal(entry.detail.cacheDirExists, true);
+    assert.equal(entry.detail.fileFoundByAgentId, true);
+    assert.equal(entry.detail.hasTitleByAgentId, true);
     assert.equal(entry.detail.sessionId.includes(SESSION_ID), false, "полный id не пишется");
     assert.equal(entry.detail.sessionObjectId.includes("session-other-9999"), false);
     assert.match(entry.detail.sessionId, /…$/);
@@ -960,4 +968,17 @@ test("069: context.resolve пишется и при исключении session
   assert.equal(entry.detail.foundTitle, false);
   assert.equal(entry.detail.sameId, null);
   assert.match(entry.detail.sessionId, /…$/);
+});
+
+
+test("069: маска разных session id различается (уникальная часть, не префикс)", (t) => {
+  const events = [];
+  const journal = { record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
+  const ctx = fakeCtx({ get: () => ({ header: { cwd: "/p", agentPreset: "standard" } }) });
+  resolveContext({ sessionId: "session-8aac9774-1111", ctx, journal });
+  resolveContext({ sessionId: "session-25c353d8-2222", ctx, journal });
+  const masks = events.filter((entry) => entry.event === "context.resolve").map((entry) => entry.detail.sessionId);
+  assert.equal(masks.length, 2);
+  assert.notEqual(masks[0], masks[1], "метки должны различаться");
+  assert.equal(masks[0].startsWith("session-"), false, "префикс не маскирует уникальную часть");
 });
