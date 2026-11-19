@@ -578,6 +578,15 @@ test("071: closeQuestion answered-in-gui даёт ровно «✅ Отвече�
   assert.deepEqual(put.body.attachments, []);
 });
 
+test("073: closeQuestion answered-in-messenger даёт «✅ Отвечено (передано в сессию)»", async (t) => {
+  const { transport, calls } = setup(t);
+  await transport.sendQuestion(question());
+  await transport.closeQuestion(question(), "answered-in-messenger");
+  const put = calls.filter((item) => item.key === "PUT /messages").at(-1);
+  assert.equal(put.body.text, "✅ Отвечено (передано в сессию)");
+  assert.deepEqual(put.body.attachments, []);
+});
+
 test("фича max: webhook в конфиге даёт ошибку в лог, транспорт не поднимается", async () => {
   const { maxFeature } = await import("../lib/features/max.js");
   const errors = [];

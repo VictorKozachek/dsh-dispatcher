@@ -153,18 +153,61 @@ test("071 notify: ответ GUI закрывает сообщение и сни
 
   assert.deepEqual(result, guiAnswer, "GUI — источник истины");
   assert.equal(stand.settles.length, 0);
-  assert.equal(stand.transport.closed.length, 1, "сообщение закрыто после next(), не после клика");
+  assert.equal(stand.transport.closed.length, 1, "сообщение закрыто после next()");
   assert.match(String(stand.transport.closed[0].summary), /GUI|answered-in-gui/);
   const fromGui = stand.journal.events.find((entry) => entry.event === "answer.from_gui");
   assert.ok(fromGui, "answer.from_gui в журнале");
   assert.equal(fromGui.detail.mode, "notify");
   assert.deepEqual(fromGui.detail.targets, ["max"]);
+});
 
+test("073 notify: ответ канала завершает tool-call и закрывает сообщение", async () => {
+  const stand = mirrorHarness({ mode: "notify", next: () => new Promise(() => {}) });
+  const pending = stand.answerer.handler(stand.request(), stand.next);
+  await new Promise((resolve) => setImmediate(resolve));
   stand.transport.answer({ shortId: stand.transport.sent[0].shortId, optionId: "o1" });
+
+  const result = await pending;
+  assert.deepEqual(result.answers, [{ id: "q1", selected: ["Да"] }], "ответ канала стал результатом");
+  assert.equal(stand.transport.closed.length, 1);
+  assert.match(String(stand.transport.closed[0].summary), /answered-in-messenger/);
+  const fromTransport = stand.journal.events.find((entry) => entry.event === "answer.from_transport");
+  assert.ok(fromTransport);
+  assert.equal(fromTransport.detail.mode, "notify");
+  assert.equal(fromTransport.detail.delivered, "tool-result");
+  assert.equal(stand.journal.events.some((entry) => entry.event === "question.closed" && entry.detail.reason === "answered-in-messenger"), true);
+
+  stand.transport.answer({ shortId: stand.transport.sent[0].shortId, optionId: "o2" });
   const dropped = stand.journal.events.find((entry) => entry.event === "answer.dropped");
-  assert.ok(dropped);
-  assert.equal(dropped.detail.reason, "gui");
-  assert.equal(stand.journal.events.some((entry) => entry.event === "answer.unmatched"), false);
+  assert.equal(dropped.detail.reason, "already-answered");
+});
+
+test("073 notify: GUI первым — его ответ и закрытие канала", async () => {
+  const guiAnswer = { answers: [{ id: "q1", selected: ["GUI"] }] };
+  const stand = mirrorHarness({ mode: "notify", next: async () => guiAnswer });
+  const result = await stand.answerer.handler(stand.request(), stand.next);
+
+  assert.deepEqual(result, guiAnswer);
+  assert.equal(stand.transport.closed.length, 1);
+  assert.match(String(stand.transport.closed[0].summary), /answered-in-gui/);
+  assert.equal(stand.journal.events.some((entry) => entry.event === "answer.from_gui"), true);
+});
+
+test("073 notify: поздний GUI после ответа канала — dropped already-answered", async () => {
+  let resolveGui;
+  const guiAnswer = { answers: [{ id: "q1", selected: ["GUI"] }] };
+  const next = () => new Promise((resolve) => { resolveGui = resolve; });
+  const stand = mirrorHarness({ mode: "notify", next });
+  const pending = stand.answerer.handler(stand.request(), stand.next);
+  await new Promise((resolve) => setImmediate(resolve));
+  stand.transport.answer({ shortId: stand.transport.sent[0].shortId, optionId: "o1" });
+  await pending;
+  resolveGui(guiAnswer);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const dropped = stand.journal.events.find((entry) => entry.event === "answer.dropped" && entry.detail.reason === "already-answered");
+  assert.ok(dropped, "поздний GUI отброшен");
+  assert.equal(dropped.detail.source, "gui");
 });
 
 test("071 notify: ошибка закрытия не мешает ответу и пишется в журнал", async () => {

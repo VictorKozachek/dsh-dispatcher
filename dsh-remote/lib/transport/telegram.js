@@ -429,14 +429,19 @@ export function createTelegramTransport(options = {}) {
     // Пустая строка или служебная причина — не ответ: снимаем кнопки, но текст
     // не переписываем, иначе человек увидит «Ответ: aborted».
     const inGui = text === "answered-in-gui";
-    const silent = !inGui && (text === "" || CLOSE_REASONS.has(text.toLowerCase()));
+    const inMessenger = text === "answered-in-messenger";
+    const silent = !inGui && !inMessenger && (text === "" || CLOSE_REASONS.has(text.toLowerCase()));
     const payload = silent
       ? { chat_id: record.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }
       : {
         chat_id: record.chatId,
         message_id: messageId,
         parse_mode: "HTML",
-        text: inGui ? "✅ <b>Отвечено в GUI</b>" : `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
+        text: inGui
+          ? "✅ <b>Отвечено в GUI</b>"
+          : inMessenger
+            ? "✅ <b>Отвечено (передано в сессию)</b>"
+            : `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
         reply_markup: { inline_keyboard: [] },
       };
     try {

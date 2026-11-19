@@ -908,11 +908,15 @@ export function createMaxTransport(options = {}) {
         const messageId = question?.messageId;
         if (messageId !== undefined && messageId !== null) {
           // clearButtons сам экранирует текст — здесь не экранируем, иначе двойное.
-          const text = summary === "answered-elsewhere"
-            ? "Отвечено в другом канале"
-            : QUIET_REASONS.has(summary)
-              ? "⌛ ждёт ответа"
-              : `✅ Отвечено: ${summary}`;
+          const text = summary === "answered-in-gui"
+            ? "✅ Отвечено в GUI"
+            : summary === "answered-in-messenger"
+              ? "✅ Отвечено (передано в сессию)"
+              : summary === "answered-elsewhere"
+                ? "Отвечено в другом канале"
+                : QUIET_REASONS.has(summary)
+                  ? "⌛ ждёт ответа"
+                  : `✅ Отвечено: ${summary}`;
           await transport.clearButtons({ messageId }, text);
         }
         return;
@@ -920,6 +924,8 @@ export function createMaxTransport(options = {}) {
       const quiet = QUIET_REASONS.has(summary);
       const text = summary === "answered-in-gui"
         ? "✅ Отвечено в GUI"
+        : summary === "answered-in-messenger"
+          ? "✅ Отвечено (передано в сессию)"
         : summary === "answered-elsewhere"
           ? "Отвечено в другом канале"
           : quiet
