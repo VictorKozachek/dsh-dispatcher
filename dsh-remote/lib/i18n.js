@@ -31,6 +31,7 @@ const dictionariesBase = Object.freeze({
   ru: Object.freeze({
     "present.freeTextLabel": "Другой ответ…",
     "present.freeTextHint": "↩︎ Ответьте текстом на это сообщение.",
+    "present.mirrorNotifyHint": "🪞 Ответьте в GUI (или нажмите кнопку) — это сообщение-уведомление.",
     "present.quickReplyHint": "↩︎ Или ответьте текстом на это сообщение.",
     "present.moreLabel": "Показать ещё",
     "present.multiselectHint": "Можно выбрать несколько вариантов.",
@@ -96,6 +97,7 @@ const dictionariesBase = Object.freeze({
   en: Object.freeze({
     "present.freeTextLabel": "Other answer…",
     "present.freeTextHint": "↩︎ Reply to this message with text.",
+    "present.mirrorNotifyHint": "🪞 Answer in the GUI (or tap a button) — this message is a notification.",
     "present.quickReplyHint": "↩︎ Or reply with text to this message.",
     "present.moreLabel": "Show more",
     "present.multiselectHint": "You can select multiple options.",

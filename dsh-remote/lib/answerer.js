@@ -846,6 +846,11 @@ export function createAnswerer({
       if (waitingEntry !== undefined) waitingEntry.hybridTimer = timer;
     }
 
+    // 072: режим известен до публикации — представление должно сразу знать,
+    // что это notify-уведомление (без приглашения печатать текст).
+    if (mirrorNotify) {
+      for (const question of questions) question.mirrorNotify = true;
+    }
     let currentQuestion = null;
     try {
       try {

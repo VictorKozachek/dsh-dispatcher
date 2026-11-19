@@ -168,6 +168,7 @@ test("073 notify: ответ канала завершает tool-call и зак
   stand.transport.answer({ shortId: stand.transport.sent[0].shortId, optionId: "o1" });
 
   const result = await pending;
+  assert.equal(stand.transport.sent[0].mirrorNotify, true, "транспорт видит notify до отправки");
   assert.deepEqual(result.answers, [{ id: "q1", selected: ["Да"] }], "ответ канала стал результатом");
   assert.equal(stand.transport.closed.length, 1);
   assert.match(String(stand.transport.closed[0].summary), /answered-in-messenger/);
@@ -296,4 +297,16 @@ test("063: mirror в status — none, если режим не включён", 
   const result = await stand.remote.handler({ commandId: "6", agent: { id: "s1", session: { id: "s1" } }, rawInput: "status", signal: new AbortController().signal });
   assert.equal(result.kind, "success");
   assert.match(result.text, /mirror: none/);
+});
+
+test("072/073 notify: текст из канала принимается как ответ и не приглашается", async () => {
+  const stand = mirrorHarness({ mode: "notify", next: () => new Promise(() => {}) });
+  const pending = stand.answerer.handler(stand.request(), stand.next);
+  await new Promise((resolve) => setImmediate(resolve));
+  stand.transport.answer({ shortId: stand.transport.sent[0].shortId, optionIds: [], text: "свой ответ" });
+
+  const result = await pending;
+  assert.deepEqual(result.answers, [{ id: "q1", selected: [], custom: "свой ответ" }]);
+  assert.equal(stand.journal.events.some((entry) => entry.event === "answer.dropped"), false);
+  assert.equal(stand.transport.closed[0].summary, "answered-in-messenger");
 });
