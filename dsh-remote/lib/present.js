@@ -344,22 +344,35 @@ export function findOwnedTask(cwd, sessionId, { log = noop } = {}) {
 }
 
 /**
- * 068: имя сессии из кэша проекций DSH (`storages/session_projcache/sessions/*.json`).
+ * 068/069: осмотр кэша проекций DSH (только чтение).
  *
- * Только чтение и только фолбэк: файла/поля/прав нет — null, ошибка разбора — null.
- * Путь берётся из `DSH_HOME` (по умолчанию `~/.dsh`), имена — с префиксом
- * `session-` и без него. Полный id сессии наружу не печатается.
+ * Возвращает не только title, но и диагностику для живого разбора: откуда
+ * DSH_HOME, существует ли каталог, найден ли файл, есть ли в нём поле title.
+ * Полные пути/id наружу не отдаются — только booleans и source.
  */
-export function sessionTitleFromProjection(sessionId, { env = process.env, log = noop } = {}) {
-  if (typeof sessionId !== "string" || sessionId === "") return null;
-  const home = typeof env?.DSH_HOME === "string" && env.DSH_HOME !== ""
-    ? env.DSH_HOME
-    : path.join(os.homedir(), ".dsh");
+export function inspectSessionTitle(sessionId, { env = process.env, log = noop } = {}) {
+  const result = {
+    title: null,
+    homeSource: null,
+    cacheDirExists: false,
+    fileFound: false,
+    hasTitleField: false,
+  };
+  if (typeof sessionId !== "string" || sessionId === "") return result;
+  const fromEnv = typeof env?.DSH_HOME === "string" && env.DSH_HOME !== "";
+  result.homeSource = fromEnv ? "env" : "homedir";
+  const home = fromEnv ? env.DSH_HOME : path.join(os.homedir(), ".dsh");
   const dir = path.join(home, "storages", "session_projcache", "sessions");
+  try {
+    result.cacheDirExists = fs.statSync(dir).isDirectory();
+  } catch {
+    result.cacheDirExists = false;
+  }
   for (const name of [`session-${sessionId}.json`, `${sessionId}.json`]) {
     let text;
     try {
       text = fs.readFileSync(path.join(dir, name), "utf8");
+      result.fileFound = true;
     } catch (error) {
       if (error?.code !== "ENOENT") log(`session title: ${name} could not be read (${error?.message ?? error})`);
       continue;
@@ -372,9 +385,27 @@ export function sessionTitleFromProjection(sessionId, { env = process.env, log =
       continue;
     }
     const title = parsed?.record?.rows?.title?.val;
-    if (typeof title === "string" && title.trim() !== "") return title.trim();
+    if (typeof title === "string") {
+      result.hasTitleField = true;
+      if (title.trim() !== "") {
+        result.title = title.trim();
+        return result;
+      }
+    }
   }
-  return null;
+  return result;
+}
+
+/** 068: имя из кэша проекций; совместимая обёртка над inspectSessionTitle. */
+export function sessionTitleFromProjection(sessionId, options = {}) {
+  return inspectSessionTitle(sessionId, options).title;
+}
+
+/** 069: маска уникальной части id (префикс session-/agent- не информативен). */
+function maskSessionId(value) {
+  if (typeof value !== "string" || value === "") return null;
+  const unique = value.replace(/^(?:session|agent|sess)-/, "");
+  return `${unique.slice(0, 8)}…`;
 }
 
 /** Имя сессии из публичного API (если хост его отдаёт). */
@@ -393,7 +424,7 @@ function sessionTitleOf(session) {
  *
  * @returns {{sessionId: string|null, workspace: string|null, cwd: string|null, role: string|null, taskId: string|null}}
  */
-export function resolveContext({ sessionId, ctx, log = noop } = {}) {
+export function resolveContext({ sessionId, ctx, log = noop, journal = null } = {}) {
   const context = {
     sessionId: typeof sessionId === "string" && sessionId !== "" ? sessionId : null,
     workspace: null,
@@ -411,6 +442,27 @@ export function resolveContext({ sessionId, ctx, log = noop } = {}) {
     session = ctx?.get?.("sessions")?.get?.(context.sessionId) ?? null;
   } catch (error) {
     log(`sessions.get(${context.sessionId}): ${error?.message ?? error}`);
+    try {
+      journal?.record?.("context.resolve", {
+        detail: {
+          sessionId: maskSessionId(context.sessionId),
+          sessionObjectId: null,
+          sameId: null,
+          foundTitle: false,
+          preset: null,
+          titleSource: null,
+          homeSource: null,
+          cacheDirExists: false,
+          fileFoundByAgentId: false,
+          fileFoundBySessionId: false,
+          hasTitleByAgentId: false,
+          hasTitleBySessionId: false,
+          sessionsError: true,
+        },
+      });
+    } catch {
+      /* журнал не должен ронять контекст */
+    }
     return context;
   }
 
@@ -421,10 +473,45 @@ export function resolveContext({ sessionId, ctx, log = noop } = {}) {
   context.role = typeof header?.agentPreset === "string" && header.agentPreset !== ""
     ? header.agentPreset
     : null;
-  // 068: предпочитаем штатное имя сессии из API, затем кэш проекций; без имени
-  // в шапке остаётся agentPreset (обратная совместимость).
-  context.sessionTitle = sessionTitleOf(session)
-    ?? sessionTitleFromProjection(context.sessionId, { log });
+  // 068/069: предпочитаем штатное имя из API, затем кэш проекций по id агента
+  // и по id сессии (в живом запросе request.agent.id может быть id агента).
+  const sessionObjectId = typeof session?.id === "string" && session.id !== ""
+    ? session.id
+    : (typeof session?.sessionId === "string" && session.sessionId !== "" ? session.sessionId : null);
+  const apiTitle = sessionTitleOf(session);
+  const agentInspect = apiTitle === null ? inspectSessionTitle(context.sessionId, { log }) : null;
+  const sessionInspect = apiTitle === null && agentInspect?.title === null
+    && sessionObjectId !== null && sessionObjectId !== context.sessionId
+    ? inspectSessionTitle(sessionObjectId, { log })
+    : null;
+  context.sessionTitle = apiTitle ?? agentInspect?.title ?? sessionInspect?.title ?? null;
+  const titleSource = apiTitle !== null
+    ? "api"
+    : agentInspect?.title !== null && agentInspect?.title !== undefined
+      ? "agent-id"
+      : sessionInspect?.title !== null && sessionInspect?.title !== undefined ? "session-id" : null;
+  // 069: только безопасные факты/диагностика для живого разбора (без полных id,
+  // путей и имён).
+  try {
+    journal?.record?.("context.resolve", {
+      detail: {
+        sessionId: maskSessionId(context.sessionId),
+        sessionObjectId: maskSessionId(sessionObjectId),
+        sameId: sessionObjectId === null ? null : sessionObjectId === context.sessionId,
+        foundTitle: context.sessionTitle !== null,
+        preset: context.role,
+        titleSource,
+        homeSource: agentInspect?.homeSource ?? null,
+        cacheDirExists: agentInspect?.cacheDirExists === true,
+        fileFoundByAgentId: agentInspect?.fileFound === true,
+        fileFoundBySessionId: sessionInspect?.fileFound === true,
+        hasTitleByAgentId: agentInspect?.hasTitleField === true,
+        hasTitleBySessionId: sessionInspect?.hasTitleField === true,
+      },
+    });
+  } catch {
+    /* журнал не должен ронять контекст */
+  }
   const card = findOwnedTaskCard(cwd, context.sessionId, { log });
   context.taskId = card === null ? null : card.id;
   context.branch = card === null ? null : card.branch;

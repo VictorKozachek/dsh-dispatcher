@@ -153,12 +153,13 @@ function addressAnswererTests() {
     transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1", text: "секретный текст" });
     await pending;
 
-    const names = journal.events.map((entry) => entry.event);
+    const events = journal.events.filter((entry) => entry.event !== "context.resolve");
+    const names = events.map((entry) => entry.event);
     assert.deepEqual(names, ["question.send", "question.sent", "answer.received"]);
-    assert.equal(journal.events[0].transport, "max");
-    assert.equal(journal.events[1].detail.messageId, "m-1");
-    assert.equal(journal.events[1].detail.keyboard, true);
-    assert.equal(journal.events[2].detail.customLength, "секретный текст".length);
+    assert.equal(events[0].transport, "max");
+    assert.equal(events[1].detail.messageId, "m-1");
+    assert.equal(events[1].detail.keyboard, true);
+    assert.equal(events[2].detail.customLength, "секретный текст".length);
     assert.equal(JSON.stringify(journal.events).includes("секретный текст"), false, "текст ответа не пишется");
   });
 
@@ -322,7 +323,14 @@ test("056: каркас journalFeature → deps → answerer пишет question
 
   await runFeatureQuestion(stand);
 
-  const entries = lines(file);
+  const allEntries = lines(file);
+  const contextEntry = allEntries.find((entry) => entry.event === "context.resolve");
+  assert.ok(contextEntry, "context.resolve дошёл до файла через answerer");
+  const contextDetail = typeof contextEntry.detail === "string" ? JSON.parse(contextEntry.detail) : contextEntry.detail;
+  for (const field of ["sessionId", "sessionObjectId", "sameId", "foundTitle", "preset"]) {
+    assert.ok(Object.hasOwn(contextDetail, field), `context.resolve.${field}`);
+  }
+  const entries = allEntries.filter((entry) => entry.event !== "context.resolve");
   const names = entries.map((entry) => entry.event);
   assert.deepEqual(names, ["question.send", "question.sent"], "обе записи через общий реестр");
   assert.equal(entries[0].transport, "max");
@@ -337,7 +345,7 @@ test("056: answerer берёт журнал через ctx.get, если deps.ge
 
   await runFeatureQuestion(stand);
 
-  const names = lines(file).map((entry) => entry.event);
+  const names = lines(file).filter((entry) => entry.event !== "context.resolve").map((entry) => entry.event);
   assert.deepEqual(names, ["question.send", "question.sent"], "страховочный путь ctx.get");
 });
 

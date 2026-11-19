@@ -876,3 +876,109 @@ test("068: длинное имя усечено, HEADER_LIMIT соблюдён",
     else process.env.DSH_HOME = previous;
   }
 });
+
+// Fallback: по типам DSH Agent.id — это SessionId, и на обычном хосте
+// session.id совпадает с request.agent.id; тест оставлен как защита для хостов,
+// где sessions.get вернул объект с другим id, а не как покрытие живого случая.
+test("069: имя находится по session.id, если request.agent.id — id агента", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-title-session-id-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, "storages", "session_projcache", "sessions");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "session-real-1234.json"), JSON.stringify({
+    record: { rows: { title: { val: "Оркестратор" } } },
+  }));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const workspace = tempWorkspace(t);
+    const ctx = fakeCtx({
+      get: () => ({ id: "session-real-1234", header: { cwd: workspace, agentPreset: "standard" } }),
+    });
+    const context = resolveContext({ sessionId: "agent-abc", ctx });
+    assert.equal(context.sessionTitle, "Оркестратор");
+    assert.match(renderBody({ workspace, role: context.role, sessionTitle: context.sessionTitle, body: "x", createdAt: 0 }, { maxText: 4096 }).split("\n")[0], /Оркестратор/);
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  }
+});
+
+test("069: context.resolve пишет безопасные факты foundTitle/preset", (t) => {
+  const home = projectionHome(t, SESSION_ID, "Оркестратор");
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const workspace = tempWorkspace(t);
+    const events = [];
+    const journal = { record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
+    const context = resolveContext({
+      sessionId: SESSION_ID,
+      ctx: fakeCtx({ get: () => ({ id: "session-other-9999", header: { cwd: workspace, agentPreset: "standard" } }) }),
+      journal,
+    });
+    assert.equal(context.sessionTitle, "Оркестратор");
+    const entry = events.find((item) => item.event === "context.resolve");
+    assert.ok(entry, "context.resolve записан");
+    assert.equal(entry.detail.foundTitle, true);
+    assert.equal(entry.detail.preset, "standard");
+    assert.equal(entry.detail.sameId, false);
+    assert.equal(entry.detail.titleSource, "agent-id");
+    assert.equal(entry.detail.homeSource, "env");
+    assert.equal(entry.detail.cacheDirExists, true);
+    assert.equal(entry.detail.fileFoundByAgentId, true);
+    assert.equal(entry.detail.hasTitleByAgentId, true);
+    assert.equal(entry.detail.sessionId.includes(SESSION_ID), false, "полный id не пишется");
+    assert.equal(entry.detail.sessionObjectId.includes("session-other-9999"), false);
+    assert.match(entry.detail.sessionId, /…$/);
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  }
+});
+
+test("069: без обоих id имени нет — пресет и foundTitle:false", (t) => {
+  const events = [];
+  const journal = { record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
+  const workspace = tempWorkspace(t);
+  const context = resolveContext({
+    sessionId: SESSION_ID,
+    ctx: fakeCtx({ get: () => ({ header: { cwd: workspace, agentPreset: "reviewer" } }) }),
+    journal,
+  });
+  assert.equal(context.sessionTitle, null);
+  assert.equal(context.role, "reviewer");
+  assert.match(renderHeader({ workspace: "p", role: context.role }), /reviewer/);
+  const entry = events.find((item) => item.event === "context.resolve");
+  assert.equal(entry.detail.foundTitle, false);
+  assert.equal(entry.detail.sameId, null);
+});
+
+test("069: context.resolve пишется и при исключении sessions.get (без id)", () => {
+  const events = [];
+  const journal = { record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
+  const context = resolveContext({
+    sessionId: SESSION_ID,
+    ctx: { get: () => ({ get: () => { throw new Error("sessions недоступны"); } }) },
+    journal,
+  });
+  assert.equal(context.sessionTitle, null);
+  const entry = events.find((item) => item.event === "context.resolve");
+  assert.ok(entry);
+  assert.equal(entry.detail.foundTitle, false);
+  assert.equal(entry.detail.sameId, null);
+  assert.match(entry.detail.sessionId, /…$/);
+});
+
+
+test("069: маска разных session id различается (уникальная часть, не префикс)", (t) => {
+  const events = [];
+  const journal = { record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
+  const ctx = fakeCtx({ get: () => ({ header: { cwd: "/p", agentPreset: "standard" } }) });
+  resolveContext({ sessionId: "session-8aac9774-1111", ctx, journal });
+  resolveContext({ sessionId: "session-25c353d8-2222", ctx, journal });
+  const masks = events.filter((entry) => entry.event === "context.resolve").map((entry) => entry.detail.sessionId);
+  assert.equal(masks.length, 2);
+  assert.notEqual(masks[0], masks[1], "метки должны различаться");
+  assert.equal(masks[0].startsWith("session-"), false, "префикс не маскирует уникальную часть");
+});
