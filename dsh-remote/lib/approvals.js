@@ -480,7 +480,7 @@ export function createApprovals({
    * кнопкой, `gui` — отдали GUI (доставка не удалась), `timeout` — снято без
    * ответа (аборт запроса; TTL-политика — задача 025).
    */
-  function record(approval, { outcome, decision, channel = null, chatId = null, answeredBy = null }) {
+  function record(approval, { outcome, decision, channel = null, chatId = null, answeredBy = null, reason = null }) {
     if (audit === null) return;
     audit.append({
       kind: "approval",
@@ -495,6 +495,7 @@ export function createApprovals({
       workspace: approval.workspace ?? undefined,
       waitedMs: Math.max(0, now() - approval.createdAt),
       decision,
+      ...(reason === null ? {} : { reason }),
     });
   }
 
@@ -581,7 +582,7 @@ export function createApprovals({
           /* метрики не должны ронять решение */
         }
         statsFor(APPROVAL_OUTCOME.unavailable);
-        record(approval, { outcome: APPROVAL_OUTCOME.unavailable, decision: "gui" });
+        record(approval, { outcome: APPROVAL_OUTCOME.unavailable, decision: "gui", reason: resolution.reason });
         const legacy = recordPolicyDecision(request, toolName, resolution);
         log(`подтверждение ${toolName}: отдано GUI по политике (${resolution.reason}: ${resolution.message}; audit ${legacy.type})`);
         return next();

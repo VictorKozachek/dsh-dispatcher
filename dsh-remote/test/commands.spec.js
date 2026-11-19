@@ -1892,3 +1892,80 @@ test("052: пропал MAX-токен — прежний поллер оста�
   assert.equal(first.polling, false, "старый поллер остановлен, а не продолжает работать без токена");
   assert.match(stand.logs.join("\n"), /привязка на MAX, а секрета .* нет — канал не поднят/);
 });
+
+test("074: /remote approvals показывает политику и последнюю причину", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-approvals-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json"), now: () => START_MS });
+  const policy = {
+    last: { toolName: "bash", reason: "deny-remote", decision: "gui" },
+    describe: () => ["tools=[read_file]", "denyRemote=[bash]", "onTimeout=cancelled (отказ), ttl=30 мин"],
+    snapshot() { return { lines: this.describe(), last: this.last }; },
+    allow() { throw new Error("not called"); },
+    deny() { throw new Error("not called"); },
+  };
+  const ctx = {
+    get(name) {
+      if (name === "sessions") return { get: () => ({ header: { cwd: WORKSPACE } }) };
+      if (name === "remoteApprovalPolicy") return policy;
+      return null;
+    },
+  };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => START_MS });
+  const res = await remote.handler({ rawInput: "approvals" });
+  assert.equal(res.kind, "success");
+  assert.match(res.text, /tools=\[read_file\]/);
+  assert.match(res.text, /bash/);
+  assert.match(res.text, /deny-remote/);
+
+  const status = await remote.handler({ rawInput: "status" });
+  assert.equal(status.kind, "success");
+  assert.match(status.text, /последнее решение bash → deny-remote/);
+});
+
+test("074: allow bash требует --force, изменяет политику и статус", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-approvals-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json"), now: () => START_MS });
+  const calls = [];
+  const policy = {
+    last: null,
+    describe: () => ["tools=[read_file]", "denyRemote=[bash]"],
+    snapshot() { return { lines: this.describe(), last: this.last }; },
+    allow(tool) { calls.push(["allow", tool]); this.last = { toolName: tool, reason: "allowed", decision: "remote" }; },
+    deny(tool) { calls.push(["deny", tool]); },
+  };
+  const ctx = {
+    get(name) {
+      if (name === "sessions") return { get: () => ({ header: { cwd: WORKSPACE } }) };
+      if (name === "remoteApprovalPolicy") return policy;
+      return null;
+    },
+  };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => START_MS });
+
+  const withoutForce = await remote.handler({ rawInput: "approvals allow bash" });
+  assert.equal(withoutForce.kind, "error");
+  assert.match(withoutForce.text, /--force/);
+  assert.deepEqual(calls, []);
+
+  const allowed = await remote.handler({ rawInput: "approvals allow bash --force" });
+  assert.equal(allowed.kind, "success");
+  assert.deepEqual(calls, [["allow", "bash"]]);
+  assert.match(allowed.text, /теперь можно подтвердить с телефона/);
+
+  const denied = await remote.handler({ rawInput: "approvals deny bash" });
+  assert.equal(denied.kind, "success");
+  assert.deepEqual(calls.at(-1), ["deny", "bash"]);
+});
+
+test("074: store сохраняет переопределения политики в state.json", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-approvals-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "state.json");
+  const store = createStore({ file, now: () => START_MS });
+  store.setApprovals({ tools: ["read_file", "bash"], denyRemote: ["bash", "rm"] });
+  const saved = store.read();
+  assert.deepEqual(saved.approvals, { tools: ["read_file", "bash"], denyRemote: ["bash", "rm"] });
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).approvals.tools.includes("bash"), true);
+});

@@ -28,6 +28,7 @@ import { fileURLToPath } from "node:url";
 
 import { createRegistry } from "./domain/registry.js";
 import { detectMirrorMode } from "./answerer.js";
+import { DEFAULT_DENY_REMOTE } from "./approvals/policy.js";
 import { STATE_VERSION, credentialRef, createCredentialAccess } from "./store.js";
 import {
   buildReport,
@@ -146,6 +147,7 @@ function helpText(lang = DEFAULT_LANG) {
     t("commands.helpStats", {}, code),
     t("commands.helpVacuum", {}, code),
     t("commands.helpLang", {}, code),
+    t("commands.helpApprovals", {}, code),
     t("commands.helpChannel", {}, code),
     t("commands.helpForce", {}, code),
     t("commands.helpTransport", {}, code),
@@ -1254,6 +1256,47 @@ export function createRemoteCommands({
     return success(tx("commands.mirror.off"));
   }
 
+  /** 074: показать/изменить политику подтверждений из чата (state.json). */
+  function approvalsCommand(rest, flags) {
+    const policy = ctx?.get?.("remoteApprovalPolicy") ?? null;
+    if (policy === null || typeof policy?.describe !== "function") {
+      return failure(tx("commands.approvals.unavailable"));
+    }
+    const lang = currentLang();
+    const action = Array.isArray(rest) && rest.length > 0 ? String(rest[0]).toLowerCase() : "";
+    const show = () => {
+      const snapshot = typeof policy.snapshot === "function" ? policy.snapshot(lang) : null;
+      const lines = [tx("commands.approvals.title"), ...(snapshot?.lines ?? policy.describe(lang))];
+      const last = snapshot?.last ?? policy.last ?? null;
+      if (last === null) lines.push(tx("commands.approvals.none"));
+      else lines.push(tx("commands.approvals.last", { p0: last.toolName ?? "?", p1: last.reason ?? "?", p2: last.decision ?? "?" }));
+      return lines.join("\n");
+    };
+    if (action === "" || action === "show" || action === "list") {
+      return success(show());
+    }
+    if (action !== "allow" && action !== "deny") {
+      return failure(tx("commands.approvals.usage") + "\n" + tx("commands.approvals.unknown", { p0: action }));
+    }
+    const tool = Array.isArray(rest) && rest.length > 1 ? String(rest[1]).trim() : "";
+    if (tool === "") return failure(tx("commands.approvals.usage"));
+    if (action === "allow" && DEFAULT_DENY_REMOTE.includes(tool) && !flags?.has?.("force")) {
+      return failure(tx("commands.approvals.force", { p0: tool }));
+    }
+    try {
+      if (action === "allow") policy.allow(tool);
+      else policy.deny(tool);
+    } catch (error) {
+      return failure(`/remote approvals ${action} ${tool}: ${humanError(error)}`);
+    }
+    const lines = [show()];
+    lines.push(tx(action === "allow" ? "commands.approvals.allowed" : "commands.approvals.denied", { p0: tool }));
+    if (action === "allow" && DEFAULT_DENY_REMOTE.includes(tool)) {
+      lines.push(tx("commands.approvals.warnDanger", { p0: tool }));
+    }
+    return success(lines.join("\n"));
+  }
+
   async function status(invocation) {
     const state = store.read();
     const lang = currentLang();
@@ -1367,6 +1410,10 @@ export function createRemoteCommands({
       const policy = ctx?.get?.("remoteApprovalPolicy") ?? null;
       if (policy !== null && typeof policy?.describe === "function") {
         for (const line of policy.describe(currentLang())) lines.push(line);
+        const last = policy.last ?? null;
+        if (last !== null) {
+          lines.push(t("commands.status.approvalsLast", { tool: last.toolName ?? "?", reason: last.reason ?? "?", decision: last.decision ?? "?" }, lang));
+        }
       } else {
         lines.push(t("commands.status.approvals", {}, lang));
       }
@@ -1807,6 +1854,8 @@ export function createRemoteCommands({
           return await status(invocation);
         case "mirror":
           return await mirrorCommand(rest);
+        case "approvals":
+          return approvalsCommand(rest, flags);
         case "lang":
           return await langCommand(rest);
         case "audit":
@@ -1841,7 +1890,7 @@ export function createRemoteCommands({
   const definition = {
     name: "remote",
     description: tx("commands.help.1"),
-    input: { hint: "connect|on|off|mirror|status|test|who|disconnect" },
+    input: { hint: "connect|on|off|mirror|approvals|status|test|who|disconnect" },
     recordInput: false,
     handler,
   };

@@ -714,6 +714,18 @@ export function createStore({
     });
   }
 
+  /** 074: сохранить переопределения политики подтверждений (не конфиг профиля). */
+  function setApprovals(patch = {}) {
+    return update((state) => {
+      const current = state.approvals !== null && typeof state.approvals === "object" ? state.approvals : {};
+      state.approvals = {
+        tools: patch.tools === undefined ? (current.tools ?? null) : (Array.isArray(patch.tools) ? [...patch.tools] : null),
+        denyRemote: patch.denyRemote === undefined ? (current.denyRemote ?? null) : (Array.isArray(patch.denyRemote) ? [...patch.denyRemote] : null),
+      };
+      return state;
+    });
+  }
+
   function setHybrid(patch = {}) {
     return update((state) => {
       state.hybrid = {
@@ -866,6 +878,7 @@ export function createStore({
     removeChannel,
     setHybrid,
     setMirror,
+    setApprovals,
     setBinding,
     addRecent,
     setPending,
@@ -918,6 +931,14 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT, pendi
         : DEFAULT_HYBRID_WAIT_MS,
     },
     mirror: { enabled: value.mirror?.enabled === true },
+    approvals: {
+      tools: Array.isArray(value.approvals?.tools)
+        ? [...new Set(value.approvals.tools.filter((item) => typeof item === "string" && item.trim() !== "").map((item) => item.trim()))]
+        : null,
+      denyRemote: Array.isArray(value.approvals?.denyRemote)
+        ? [...new Set(value.approvals.denyRemote.filter((item) => typeof item === "string" && item.trim() !== "").map((item) => item.trim()))]
+        : null,
+    },
     recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
     pending: Array.isArray(value.pending) ? value.pending.slice(-Math.max(0, pendingLimit)) : [],
     notify: {
