@@ -419,6 +419,14 @@ test("071: closeQuestion answered-in-gui даёт ровно «✅ Отвече�
   assert.doesNotMatch(edit.payload.text, /answered-in-gui/);
 });
 
+test("073: closeQuestion answered-in-messenger даёт текст «передано в сессию»", async () => {
+  const { transport, calls } = setup();
+  await transport.sendQuestion(question());
+  await transport.closeQuestion(question(), "answered-in-messenger");
+  const edit = calls.find((call) => call.method === "editMessageText");
+  assert.match(edit.payload.text, /✅ <b>Отвечено \(передано в сессию\)<\/b>/);
+});
+
 test("closeQuestion без текста — editMessageReplyMarkup", async () => {
   const { transport, calls } = setup();
   await transport.sendQuestion(question());

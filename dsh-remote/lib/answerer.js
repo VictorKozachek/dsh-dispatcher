@@ -440,19 +440,12 @@ export function createAnswerer({
       });
     }
     const entry = pending.get(normalized.shortId);
-    if (entry !== undefined && (entry.mirrorGui === true || entry.mirrorNotify === true)) {
+    if (entry !== undefined && entry.mirrorGui === true) {
       journalEvent("answer.dropped", {
         transport: sourceTransport?.id ?? null,
         shortId: normalized.shortId,
-        detail: { reason: entry.mirrorNotify === true ? "notify" : "gui" },
+        detail: { reason: "gui" },
       });
-      if (entry.mirrorNotify === true) {
-        try {
-          void Promise.resolve(primary?.closeQuestion?.(entry.question, "ответьте в GUI")).catch(() => {});
-        } catch {
-          /* подсказка не должна ронять ответчик */
-        }
-      }
       return;
     }
     if (entry !== undefined && entry.hybridGui === true) {
@@ -497,6 +490,15 @@ export function createAnswerer({
       }
       const knownQuestion = known.get(normalized.shortId);
       if (knownQuestion !== undefined && knownQuestion.status === "answered") {
+        if (knownQuestion.mirrorNotify === true) {
+          // 073: повторный клик после ответа канала — dropped, не duplicate.
+          journalEvent("answer.dropped", {
+            transport: sourceTransport?.id ?? null,
+            shortId: normalized.shortId,
+            detail: { reason: "already-answered" },
+          });
+          return;
+        }
         // 066: повтор/второй проход того же события — duplicate, не unmatched.
         journalEvent("answer.duplicate", {
           transport: sourceTransport?.id ?? null,
@@ -574,7 +576,25 @@ export function createAnswerer({
       entry.hybridTimer = null;
     }
     entry.resolve(entry.question);
-    void closeMessage(entry.question);
+    if (entry.question.mirrorNotify === true) {
+      journalEvent("answer.from_transport", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { mode: "notify", delivered: "tool-result" },
+      });
+      journalEvent("question.closed", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { reason: "answered-in-messenger" },
+      });
+      try {
+        void Promise.resolve(primary?.closeQuestion?.(entry.question, "answered-in-messenger")).catch(() => {});
+      } catch {
+        /* закрытие не должно ронять ответ */
+      }
+    } else {
+      void closeMessage(entry.question);
+    }
   }
 
   /**
@@ -922,37 +942,54 @@ export function createAnswerer({
           // (next()); notify — GUI источник истины, канал лишь уведомление.
           if (mirrorNotify) {
             for (const item of questions) {
+              item.mirrorNotify = true;
               const itemEntry = pending.get(item.shortId);
               if (itemEntry !== undefined) itemEntry.mirrorNotify = true;
             }
             journalEvent("question.mirror.published", { detail: { mode: "notify", targets: [primary?.id ?? null] } });
             cleanupHybrid();
-            // 071: дождаться ответа GUI и только потом закрыть сообщения канала.
-            let guiResult;
+            // 073: гонка «ответ GUI» vs «ответ канала» — первый завершает tool-call.
+            const guiPromise = Promise.resolve().then(() => next()).catch((error) => {
+              log(`mirror notify: next() не ответил (${error?.message ?? error})`);
+              return undefined;
+            });
+            let winner;
             try {
-              guiResult = await next();
+              winner = await Promise.race([waited, guiPromise, aborted]);
             } catch (error) {
               for (const item of questions) item.mirrorGui = true;
-              await closeQuestions(questions, "answered-in-gui", attempted, (question, closeError) => {
+              await closeQuestions(questions, "answered-in-gui", attempted, (item, closeError) => {
                 journalEvent("question.error", {
-                  shortId: question.shortId,
+                  shortId: item.shortId,
                   detail: { status: "close-failed", message: String(closeError?.message ?? closeError) },
                 });
               });
-              for (const item of questions) item.mirrorGuiNotified = true;
               throw error;
             }
+            if (winner === question) {
+              // Ответ канала уже принят и закрыт в onTransportAnswer; поздний
+              // GUI-ответ — безвредный дубль.
+              guiPromise.then(() => {
+                journalEvent("answer.dropped", {
+                  shortId: question.shortId,
+                  detail: { reason: "already-answered", source: "gui" },
+                });
+              }).catch(() => {});
+              const answer = expiredAnswers.get(question.shortId) ?? question.toAnswer();
+              return { answers: [answer] };
+            }
+            // GUI ответил первым: закрыть сообщения канала.
             for (const item of questions) item.mirrorGui = true;
-            await closeQuestions(questions, "answered-in-gui", attempted, (question, closeError) => {
+            await closeQuestions(questions, "answered-in-gui", attempted, (item, closeError) => {
               journalEvent("question.error", {
-                shortId: question.shortId,
+                shortId: item.shortId,
                 detail: { status: "close-failed", message: String(closeError?.message ?? closeError) },
               });
             });
-            for (const item of questions) item.mirrorGuiNotified = true;
             const targets = [...new Set(questions.flatMap((item) => (item.deliveries ?? []).map((delivery) => delivery.transport)).filter((id) => typeof id === "string" && id !== ""))];
             journalEvent("answer.from_gui", { detail: { mode: "notify", targets: targets.length === 0 ? [primary?.id ?? null] : targets } });
-            return guiResult;
+            return winner;
+
           }
           if (mirrorFull && mirrorGuiPromise === null && typeof next === "function") {
             mirrorGuiPromise = Promise.resolve()
