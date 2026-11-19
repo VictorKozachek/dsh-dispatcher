@@ -410,6 +410,15 @@ test("closeQuestion: правка текста, кнопки сняты", async 
   assert.deepEqual(edit.payload.reply_markup, { inline_keyboard: [] });
 });
 
+test("071: closeQuestion answered-in-gui даёт ровно «✅ Отвечено в GUI»", async () => {
+  const { transport, calls } = setup();
+  await transport.sendQuestion(question());
+  await transport.closeQuestion(question(), "answered-in-gui");
+  const edit = calls.find((call) => call.method === "editMessageText");
+  assert.match(edit.payload.text, /✅ <b>Отвечено в GUI<\/b>/);
+  assert.doesNotMatch(edit.payload.text, /answered-in-gui/);
+});
+
 test("closeQuestion без текста — editMessageReplyMarkup", async () => {
   const { transport, calls } = setup();
   await transport.sendQuestion(question());

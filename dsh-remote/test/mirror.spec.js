@@ -146,17 +146,38 @@ test("063 full: GUI выиграл — сообщение закрыто, поз
   assert.equal(stand.transport.closed.length, 1, "второй раз сообщение не закрывается");
 });
 
-test("063 notify: клик не завершает tool-call, отправляется подсказка", async () => {
+test("071 notify: ответ GUI закрывает сообщение и снимает кнопки сразу", async () => {
   const guiAnswer = { answers: [{ id: "q1", selected: ["GUI"] }] };
   const stand = mirrorHarness({ mode: "notify", next: async () => guiAnswer });
   const result = await stand.answerer.handler(stand.request(), stand.next);
 
   assert.deepEqual(result, guiAnswer, "GUI — источник истины");
   assert.equal(stand.settles.length, 0);
+  assert.equal(stand.transport.closed.length, 1, "сообщение закрыто после next(), не после клика");
+  assert.match(String(stand.transport.closed[0].summary), /GUI|answered-in-gui/);
+  const fromGui = stand.journal.events.find((entry) => entry.event === "answer.from_gui");
+  assert.ok(fromGui, "answer.from_gui в журнале");
+  assert.equal(fromGui.detail.mode, "notify");
+  assert.deepEqual(fromGui.detail.targets, ["max"]);
+
   stand.transport.answer({ shortId: stand.transport.sent[0].shortId, optionId: "o1" });
-  assert.equal(stand.transport.closed.length, 1, "подсказка ответить в GUI");
-  assert.match(String(stand.transport.closed[0].summary), /GUI/);
-  assert.equal(stand.journal.events.some((entry) => entry.event === "answer.dropped"), true);
+  const dropped = stand.journal.events.find((entry) => entry.event === "answer.dropped");
+  assert.ok(dropped);
+  assert.equal(dropped.detail.reason, "gui");
+  assert.equal(stand.journal.events.some((entry) => entry.event === "answer.unmatched"), false);
+});
+
+test("071 notify: ошибка закрытия не мешает ответу и пишется в журнал", async () => {
+  const guiAnswer = { answers: [{ id: "q1", selected: ["GUI"] }] };
+  const stand = mirrorHarness({ mode: "notify", next: async () => guiAnswer });
+  stand.transport.closeQuestion = async () => { throw new Error("MAX 500"); };
+  const result = await stand.answerer.handler(stand.request(), stand.next);
+
+  assert.deepEqual(result, guiAnswer, "ответ дошёл до сессии");
+  const error = stand.journal.events.find((entry) => entry.event === "question.error");
+  assert.ok(error);
+  assert.equal(error.detail.status, "close-failed");
+  assert.match(String(error.detail.message), /MAX 500/);
 });
 
 test("063 full: аборт снимает сообщение и отменяет GUI", async () => {

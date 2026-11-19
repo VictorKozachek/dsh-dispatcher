@@ -343,7 +343,7 @@ export function createAnswerer({
     }
   };
 
-  async function closeQuestions(questions, reason, attempted = null) {
+  async function closeQuestions(questions, reason, attempted = null, onCloseError = null) {
     for (const question of questions) {
       pending.delete(question.shortId);
       rememberClosed(question);
@@ -362,6 +362,11 @@ export function createAnswerer({
         }
       } catch (error) {
         log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
+        try {
+          onCloseError?.(question, error);
+        } catch {
+          /* диагностика не должна ломать закрытие */
+        }
       }
     }
   }
@@ -474,11 +479,20 @@ export function createAnswerer({
       // 063: ответ канала после mirror-settle/GUI — dropped, не unmatched.
       const closedMirror = recentlyClosed.get(normalized.shortId);
       if (closedMirror?.mirrorSettled === true || closedMirror?.mirrorGui === true) {
+        const reason = closedMirror.mirrorSettled === true ? "settled" : "gui";
         journalEvent("answer.dropped", {
           transport: sourceTransport?.id ?? null,
           shortId: normalized.shortId,
-          detail: { reason: closedMirror.mirrorSettled === true ? "settled" : "gui" },
+          detail: { reason },
         });
+        if (reason === "gui" && closedMirror.mirrorGuiNotified !== true) {
+          try {
+            closedMirror.mirrorGuiNotified = true;
+            void Promise.resolve(primary?.closeQuestion?.(closedMirror, "answered-in-gui")).catch(() => {});
+          } catch {
+            /* подсказка не должна ронять ответчик */
+          }
+        }
         return;
       }
       const knownQuestion = known.get(normalized.shortId);
@@ -913,7 +927,32 @@ export function createAnswerer({
             }
             journalEvent("question.mirror.published", { detail: { mode: "notify", targets: [primary?.id ?? null] } });
             cleanupHybrid();
-            return next();
+            // 071: дождаться ответа GUI и только потом закрыть сообщения канала.
+            let guiResult;
+            try {
+              guiResult = await next();
+            } catch (error) {
+              for (const item of questions) item.mirrorGui = true;
+              await closeQuestions(questions, "answered-in-gui", attempted, (question, closeError) => {
+                journalEvent("question.error", {
+                  shortId: question.shortId,
+                  detail: { status: "close-failed", message: String(closeError?.message ?? closeError) },
+                });
+              });
+              for (const item of questions) item.mirrorGuiNotified = true;
+              throw error;
+            }
+            for (const item of questions) item.mirrorGui = true;
+            await closeQuestions(questions, "answered-in-gui", attempted, (question, closeError) => {
+              journalEvent("question.error", {
+                shortId: question.shortId,
+                detail: { status: "close-failed", message: String(closeError?.message ?? closeError) },
+              });
+            });
+            for (const item of questions) item.mirrorGuiNotified = true;
+            const targets = [...new Set(questions.flatMap((item) => (item.deliveries ?? []).map((delivery) => delivery.transport)).filter((id) => typeof id === "string" && id !== ""))];
+            journalEvent("answer.from_gui", { detail: { mode: "notify", targets: targets.length === 0 ? [primary?.id ?? null] : targets } });
+            return guiResult;
           }
           if (mirrorFull && mirrorGuiPromise === null && typeof next === "function") {
             mirrorGuiPromise = Promise.resolve()
@@ -942,6 +981,7 @@ export function createAnswerer({
             }
             cleanupHybrid();
             await closeQuestions(questions, "answered-in-gui", attempted);
+            for (const item of questions) item.mirrorGuiNotified = true;
             journalEvent("answer.from_gui", { detail: { mode: "full", targets: [primary?.id ?? null] } });
             return answered;
           }

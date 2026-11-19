@@ -918,11 +918,13 @@ export function createMaxTransport(options = {}) {
         return;
       }
       const quiet = QUIET_REASONS.has(summary);
-      const text = summary === "answered-elsewhere"
-        ? "Отвечено в другом канале"
-        : quiet
-          ? "⌛ ждёт ответа"
-          : `✅ Отвечено: ${escapeHtml(summary)}`;
+      const text = summary === "answered-in-gui"
+        ? "✅ Отвечено в GUI"
+        : summary === "answered-elsewhere"
+          ? "Отвечено в другом канале"
+          : quiet
+            ? "⌛ ждёт ответа"
+            : `✅ Отвечено: ${escapeHtml(summary)}`;
       try {
         await editQueue.push(() => request("PUT", "/messages", {
           query: { message_id: record.mid },
