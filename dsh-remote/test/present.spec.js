@@ -982,3 +982,32 @@ test("069: маска разных session id различается (уника
   assert.notEqual(masks[0], masks[1], "метки должны различаться");
   assert.equal(masks[0].startsWith("session-"), false, "префикс не маскирует уникальную часть");
 });
+
+test("072: notify не предлагает «Другой ответ…», подсказка ведёт в GUI", () => {
+  const question = {
+    workspace: "/tmp/project",
+    body: "Продолжать?",
+    options: [{ id: "o1", label: "Да" }, { id: "o2", label: "Нет" }],
+    allowFreeText: true,
+    mirrorNotify: true,
+  };
+  const rows = renderRows(question, { maxOptions: 4, maxText: 4096 });
+  assert.equal(rows.flat().some((row) => row.kind === "free"), false, "нет кнопки свободного текста");
+  assert.equal(rows.flat().some((row) => row.kind === "option"), true, "варианты остаются");
+  const body = renderBody(question, { maxText: 4096 });
+  assert.match(body, /Ответьте в GUI/);
+  assert.doesNotMatch(body, /Ответьте текстом/);
+});
+
+test("072: full/remote-only сохраняют «Другой ответ…» и текстовую подсказку", () => {
+  const question = {
+    workspace: "/tmp/project",
+    body: "Продолжать?",
+    options: [{ id: "o1", label: "Да" }],
+    allowFreeText: true,
+  };
+  const rows = renderRows(question, { maxOptions: 4, maxText: 4096 });
+  assert.equal(rows.flat().some((row) => row.kind === "free"), true);
+  const body = renderBody(question, { maxText: 4096 });
+  assert.match(body, /Нажмите кнопку/);
+});

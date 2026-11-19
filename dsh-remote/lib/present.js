@@ -645,7 +645,10 @@ export function renderBody(question = {}, caps = {}) {
   const hasOptions = Array.isArray(question.options) && question.options.length > 0;
   const buttonsUsable = caps.inlineButtons !== false;
   let answerHint = null;
-  if (hasOptions) {
+  if (question.mirrorNotify === true) {
+    // 072: в notify не приглашаем печатать текст — ответ в GUI/кнопкой.
+    answerHint = t("present.mirrorNotifyHint", {}, lang);
+  } else if (hasOptions) {
     answerHint = buttonsUsable ? t("present.buttonHint", {}, lang) : t("present.freeTextHint", {}, lang);
   } else if (question.allowFreeText !== false) {
     const quick = normalizeQuickReplies(question.quickReplies, lang);
@@ -718,7 +721,8 @@ export function renderRows(question = {}, caps = {}) {
   // Раскладка по приоритету: варианты → «Показать ещё» (если не всё влезло) →
   // «Другой ответ…». При одном свободном ряде (maxOptions=1) жертвуем раскрытием:
   // одна кнопка «Показать ещё» без вариантов бессмысленна.
-  let freeSlots = question.allowFreeText === false ? 0 : 1;
+  // 072: в notify не предлагаем «Другой ответ…» — текст не приглашается.
+  let freeSlots = question.allowFreeText === false || question.mirrorNotify === true ? 0 : 1;
   // Карточка: «Показать ещё» появляется, когда вариантов больше, чем maxOptions-1
   // (один ряд всегда оставляем под служебную кнопку).
   let showMore = options.length > Math.max(1, maxOptions - 1);
