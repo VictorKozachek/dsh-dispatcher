@@ -15,6 +15,7 @@ import path from "node:path";
 
 import { apply } from "../lib/index.js";
 import { createAnswerer } from "../lib/answerer.js";
+import { renderBody } from "../lib/present.js";
 import { createRegistry } from "../lib/domain/registry.js";
 import { QUESTION_STATUS } from "../lib/domain/question.js";
 
@@ -986,4 +987,40 @@ test("076: события журнала несут sessionId/workspace/preset �
   const received = journal.events.find((entry) => entry.event === "answer.received");
   assert.equal(received.sessionId, "8aac9774…");
   assert.equal(received.workspace, "project");
+});
+
+
+test("078: sessionTitle доходит до payload вопроса (шапка — имя, не пресет)", async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-answerer-title-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, "storages", "session_projcache", "sessions");
+  fs.mkdirSync(dir, { recursive: true });
+  const agentId = "session-8aac9774-1111";
+  fs.writeFileSync(path.join(dir, `${agentId}.json`), JSON.stringify({
+    record: { rows: { title: { val: "Оркестратор" } } },
+  }));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const transport = fakeTransport();
+    const ctx = fakeContext({ services: { sessions: { get: () => ({ header: { cwd: "/p/project", agentPreset: "standard" } }) } } });
+    const answerer = createAnswerer({
+      transport,
+      registry: createRegistry({ readState: () => ({ global: true }) }),
+      log: () => {},
+      now: () => 1_000,
+    });
+    answerer.attach(ctx);
+    const pending = runWaterfall(ctx, EVENT, request({ agent: { id: agentId } }), () => assert.fail("next() не должен вызываться"));
+    await tick();
+    assert.equal(transport.sent.length, 1, "вопрос ушёл в канал");
+    const payload = renderBody(transport.sent[0], { maxText: 4096 });
+    assert.match(payload, /Оркестратор/, "в шапке имя сессии");
+    assert.doesNotMatch(payload, /· standard ·/, "пресет не подменяет имя");
+    transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+    await pending;
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  }
 });
