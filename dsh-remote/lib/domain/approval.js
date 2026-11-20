@@ -114,7 +114,11 @@ export class RemoteApproval {
     this.sessionId = context.sessionId ?? null;
     this.workspace = context.workspace ?? null;
     this.role = context.role ?? null;
+    /** 080: имя сессии для шапки; без него renderHeader берёт role (пресет). */
+    this.sessionTitle = context.sessionTitle ?? null;
     this.taskId = context.taskId ?? null;
+    this.branch = context.branch ?? null;
+    this.worktree = context.worktree ?? null;
     /** 015: канал проекта (`chatId` + опциональный `threadId` топика). */
     this.chatId = context.chatId ?? null;
     this.threadId = context.threadId ?? null;
