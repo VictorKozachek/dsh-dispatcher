@@ -27,6 +27,8 @@ export const panelFeature = {
       settings: config ?? {},
       logger: log,
       channelPresent: () => liveTransport() !== null,
+      // 074: политика подтверждений в панели (могут не успеть подняться — null).
+      approvalPolicy: () => deps.get("remoteApprovalPolicy") ?? null,
       transport: liveTransport,
       reliability: () => deps.get("remoteReliability"),
       // 045: показываем доску текущего проекта и явные корни из конфига.

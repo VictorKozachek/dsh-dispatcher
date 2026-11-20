@@ -507,3 +507,87 @@ test("PanelService.test: без клика подписка снимается �
   timerCallback();
   assert.equal(offCalls, 1, "таймаут снял подписку");
 });
+
+test("074: панель показывает политику подтверждений и последнее решение", (t) => {
+  const state = {
+    approvals: { tools: ["bash"], denyRemote: [] },
+  };
+  const status = describeStatus({ state });
+  assert.deepEqual(status.approvals.tools, ["bash"]);
+  assert.deepEqual(status.approvals.denyRemote, []);
+  assert.equal(status.approvals.onTimeout, "cancelled");
+  assert.equal(Number.isFinite(status.approvals.ttlMs), true);
+
+  const withPolicy = describeStatus({
+    state: { approvals: { tools: null, denyRemote: null } },
+    policy: {
+      snapshot: () => ({
+        tools: ["read_file"], denyRemote: ["bash"], onTimeout: "unavailable", ttlMs: 120000,
+        last: { toolName: "bash", reason: "deny-remote", decision: "gui" },
+      }),
+    },
+  });
+  assert.deepEqual(withPolicy.approvals.tools, ["read_file"]);
+  assert.deepEqual(withPolicy.approvals.denyRemote, ["bash"]);
+  assert.equal(withPolicy.approvals.last.reason, "deny-remote");
+
+  const dir = tempDir(t);
+  const stateFile = path.join(dir, "state.json");
+  const logFile = path.join(dir, "log.jsonl");
+  fs.writeFileSync(stateFile, JSON.stringify({ approvals: { tools: ["bash"], denyRemote: ["write_file"] } }));
+  fs.writeFileSync(logFile, "");
+  const snapshot = panelSnapshot({ stateFile, logFile, now: () => 1000 });
+  assert.deepEqual(snapshot.status.approvals.tools, ["bash"]);
+  assert.deepEqual(snapshot.status.approvals.denyRemote, ["write_file"]);
+});
+
+test("074: statusLines панели выводит approvals и последнее решение", () => {
+  const { statusLines } = loadClientInternals().__internals;
+  const t = (key) => key;
+  const lines = statusLines({
+    status: {
+      approvals: {
+        tools: ["read_file"],
+        denyRemote: ["bash"],
+        onTimeout: "cancelled",
+        ttlMs: 30 * 60 * 1000,
+        last: { toolName: "bash", reason: "deny-remote", decision: "gui" },
+      },
+    },
+  }, t);
+  const byKey = new Map(lines.map((line) => [line.key, line]));
+  assert.equal(byKey.get("approvalTools").value, "read_file");
+  assert.equal(byKey.get("approvalDeny").value, "bash");
+  assert.equal(byKey.get("approvalTimeout").value, "cancelled, 30 min");
+  assert.equal(byKey.get("approvalLast").value, "bash → deny-remote (gui)");
+});
+
+test("074: PanelService прокидывает policy в снимок", async (t) => {
+  const dir = tempDir(t);
+  const stateFile = path.join(dir, "state.json");
+  const logFile = path.join(dir, "log.jsonl");
+  fs.writeFileSync(stateFile, "{}");
+  fs.writeFileSync(logFile, "");
+  const service = new PanelService({
+    stateFile,
+    logFile,
+    settings: {},
+    channelPresent: false,
+    now: () => 1000,
+    logger: () => {},
+    approvalPolicy: () => ({
+      snapshot: () => ({
+        tools: ["bash"],
+        denyRemote: [],
+        onTimeout: "cancelled",
+        ttlMs: 60_000,
+        last: { toolName: "bash", reason: "allowed", decision: "remote" },
+      }),
+    }),
+  });
+  const snapshot = await service.snapshot({});
+  assert.equal(snapshot.ok, true);
+  assert.deepEqual(snapshot.status.approvals.tools, ["bash"]);
+  assert.equal(snapshot.status.approvals.last.reason, "allowed");
+  assert.equal(snapshot.status.approvals.ttlMs, 60_000);
+});

@@ -46,6 +46,10 @@ window.__ModuleLoader__.load({
       bindingNone: "not connected",
       enabled: "enabled",
       enabledNone: "off",
+      approvalTools: "approval tools",
+      approvalDeny: "approval denyRemote",
+      approvalTimeout: "approval timeout",
+      approvalLast: "last approval",
       questions: "open questions",
       questionsNone: "no open questions",
       journal: "journal",
@@ -81,6 +85,10 @@ window.__ModuleLoader__.load({
       bindingNone: "не привязан",
       enabled: "включено",
       enabledNone: "выключено",
+      approvalTools: "подтверждения: tools",
+      approvalDeny: "подтверждения: denyRemote",
+      approvalTimeout: "подтверждения: таймаут",
+      approvalLast: "последнее подтверждение",
       questions: "открытые вопросы",
       questionsNone: "открытых вопросов нет",
       journal: "журнал",
@@ -145,6 +153,31 @@ window.__ModuleLoader__.load({
         });
       } else {
         lines.push({ key: "binding", label: "binding", value: "bindingNone" });
+      }
+      if (status.approvals) {
+        const approvals = status.approvals;
+        lines.push({
+          key: "approvalTools",
+          label: "approvalTools",
+          value: Array.isArray(approvals.tools) && approvals.tools.length > 0 ? approvals.tools.join(", ") : "—"
+        });
+        lines.push({
+          key: "approvalDeny",
+          label: "approvalDeny",
+          value: Array.isArray(approvals.denyRemote) && approvals.denyRemote.length > 0 ? approvals.denyRemote.join(", ") : "—"
+        });
+        lines.push({
+          key: "approvalTimeout",
+          label: "approvalTimeout",
+          value: String(approvals.onTimeout || "?") + ", " + String(Math.round((Number(approvals.ttlMs) || 0) / 60000)) + " min"
+        });
+        if (approvals.last) {
+          lines.push({
+            key: "approvalLast",
+            label: "approvalLast",
+            value: String(approvals.last.toolName || "?") + " → " + String(approvals.last.reason || "?") + " (" + String(approvals.last.decision || "?") + ")"
+          });
+        }
       }
       const enabled = status.enabled || {};
       const scopes = [];
