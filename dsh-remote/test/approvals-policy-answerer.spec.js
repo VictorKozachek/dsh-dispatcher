@@ -382,6 +382,7 @@ test("фича approvals пишет policy-GUI в реальный audit.jsonl (
   assert.equal(last.kind, "approval");
   assert.equal(last.toolName, "bash");
   assert.equal(last.decision, "gui");
+  assert.equal(last.reason, "deny-remote", "аудит объясняет, почему не ушло в канал");
   assert.equal(last.outcome, "unavailable", "policy-GUI — это unavailable для DSH");
 
   const { rmSync } = await import("node:fs");
@@ -492,4 +493,45 @@ test("policy-GUI не оставляет запись, если ответ пр�
 
   assert.equal(audit.entries.length, 1, "policy-GUI не писался: ответили удалённо");
   assert.equal(audit.entries[0].decision, "remote");
+});
+
+test("074: allow из политики снимает denyRemote и подтверждение идёт в канал", async () => {
+  const transport = fakeTransport();
+  const ctx = fakeContext();
+  const provided = new Map();
+  ctx.provide = (name, service) => provided.set(name, service);
+  const saved = { approvals: { tools: null, denyRemote: null } };
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => {
+      if (name === "remoteTransport") return transport;
+      if (name === "remoteStore") {
+        return {
+          read: () => ({ enabled: { global: true, workspaces: {}, sessions: {} }, bindings: null, channels: {}, ...saved }),
+          setApprovals: (patch) => { saved.approvals = { ...saved.approvals, ...patch }; },
+        };
+      }
+      return null;
+    },
+    onDispose: (fn) => ctx.onDispose(fn),
+  };
+  approvalsFeature.apply(ctx, { approvals: { tools: ["read_file"], denyRemote: ["bash"] } }, deps);
+  const policy = provided.get("remoteApprovalPolicy");
+  const handler = ctx.subscriptions.find((item) => item.name === APPROVAL_REQUEST_EVENT)?.handler;
+
+  assert.equal(await handler(request({ toolName: "bash" }), async () => "gui"), "gui", "по умолчанию bash в GUI");
+  assert.equal(transport.sent.length, 0);
+
+  policy.allow("bash");
+  assert.equal(policy.decide(request({ toolName: "bash" })).remote, true);
+  const pending = handler(request({ toolName: "bash" }), async () => "gui");
+  await tick();
+  assert.equal(transport.sent.length, 1, "после allow bash ушёл в канал");
+  transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+  assert.equal(policy.last.reason, "allowed", "последнее решение — удалённое allowed");
+  assert.equal(policy.last.decision, "remote");
+
+  policy.deny("bash");
+  assert.equal(policy.decide(request({ toolName: "bash" })).remote, false);
 });

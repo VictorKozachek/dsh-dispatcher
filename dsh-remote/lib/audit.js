@@ -11,7 +11,8 @@
  *
  * Приватность: в журнал попадают только метаданные решения. **Тел команд и
  * причин там нет** — их и нет в `ApprovalRequestEvent` (DSH не передаёт аргументы
- * инструмента), а `reason`/`displayReason` мы сознательно не пишем. Дополнительно
+ * инструмента). 074: пишем только **код** причины политики (`deny-remote`,
+ * `tool-not-allowed`, `unknown-tool`), а не свободный `displayReason`. Дополнительно
  * все строки проходят `redactSecrets`: если вызывающий положит в поле токен или
  * ключ, он не окажется в файле. Список полей — белый (`ALLOWED_KEYS`), лишние
  * ключи отбрасываются.
@@ -55,6 +56,7 @@ export const ALLOWED_KEYS = Object.freeze([
   "workspace",
   "waitedMs",
   "decision",
+  "reason",
 ]);
 
 /** Пределы длины строковых полей: журнал не место для простыней. */
@@ -68,7 +70,11 @@ const LIMITS = Object.freeze({
   answeredBy: 128,
   sessionId: 128,
   workspace: 512,
+  reason: 64,
 });
+
+/** 074: причина политики — только код, не свободный текст. */
+export const POLICY_REASONS = Object.freeze(["allowed", "deny-remote", "tool-not-allowed", "unknown-tool"]);
 
 /** Секреты, которые не должны попасть в журнал даже по ошибке вызывающего. */
 const SECRET_PATTERNS = Object.freeze([
@@ -99,8 +105,13 @@ export function sanitizeEntry(entry) {
   if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return null;
   const record = {};
   for (const [key, raw] of Object.entries(entry)) {
-    if (!ALLOWED_KEYS.includes(key)) continue; // `reason`, `command`, … — не пишем
+    if (!ALLOWED_KEYS.includes(key)) continue; // свободные `command`, `displayReason` — не пишем
     if (raw === undefined || raw === null) continue;
+    if (key === "reason") {
+      if (!POLICY_REASONS.includes(raw)) continue;
+      record[key] = raw;
+      continue;
+    }
     if (key === "waitedMs") {
       const number = Number(raw);
       if (!Number.isFinite(number) || number < 0) continue;

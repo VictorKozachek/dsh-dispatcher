@@ -130,6 +130,15 @@ export class PanelService {
         stateFile: this.options.stateFile,
         logFile: this.options.logFile,
         settings: this.options.settings,
+        ...(typeof this.options.approvalPolicy === "function"
+          ? (() => {
+            try {
+              return { policy: this.options.approvalPolicy() ?? null };
+            } catch {
+              return {};
+            }
+          })()
+          : (this.options.approvalPolicy === undefined ? {} : { policy: this.options.approvalPolicy })),
         channelPresent,
         now: this.options.now,
         logger: this.options.logger,
@@ -251,6 +260,7 @@ export function registerPanelService(ctx, options = {}) {
     stateFile: options.stateFile ?? paths.stateFile,
     logFile: options.logFile ?? paths.logFile,
     settings: options.settings ?? {},
+    ...(options.approvalPolicy === undefined ? {} : { approvalPolicy: options.approvalPolicy }),
     now: options.now ?? (() => Date.now()),
     logger: options.logger ?? (() => {}),
     // Функцию храним как есть: снимок спросит её каждый раз заново.
