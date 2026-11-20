@@ -63,6 +63,7 @@ const dictionariesBase = Object.freeze({
     "commands.helpVacuum": "  /remote vacuum [--dry-run] — очистить старые ротированные журналы",
     "commands.helpLang": "  /remote lang ru|en — язык сообщений (без аргумента — текущий)",
     "commands.helpApprovals": "  /remote approvals [allow|deny <tool>] [--force] — политика подтверждений",
+    "commands.helpReload": "  /remote reload — перечитать present/i18n без перезапуска",
     "commands.helpFooter": "  /remote help       — эта справка",
 
     "commands.lang.current": "язык: {lang}",
@@ -75,6 +76,7 @@ const dictionariesBase = Object.freeze({
     "commands.approvals.modeSet": "режим подтверждений: {p0}",
     "commands.approvals.modeWarning": "ВНИМАНИЕ: режим all разрешает подтверждать запуск команд и запись файлов с телефона.",
     "commands.approvals.modeUsage": "usage: /remote approvals mode safe|all|gui-only",
+    "commands.reload.ok": "present/i18n перечитаны из диска",
     "commands.approvals.usage": "usage: /remote approvals [allow|deny <tool>] [--force]",
     "commands.approvals.title": "Политика подтверждений (state.json, действует сразу):",
     "commands.approvals.last": "Последнее решение: {p0} → {p1} (decision: {p2})",
@@ -148,6 +150,7 @@ const dictionariesBase = Object.freeze({
     "commands.helpVacuum": "  /remote vacuum [--dry-run] — remove old rotated journals",
     "commands.helpLang": "  /remote lang ru|en — message language (no argument — current)",
     "commands.helpApprovals": "  /remote approvals [allow|deny <tool>] [--force] — approval policy",
+    "commands.helpReload": "  /remote reload — reload present/i18n without restart",
     "commands.helpFooter": "  /remote help       — this help",
 
     "commands.lang.current": "language: {lang}",
@@ -160,6 +163,7 @@ const dictionariesBase = Object.freeze({
     "commands.approvals.modeSet": "approval mode: {p0}",
     "commands.approvals.modeWarning": "WARNING: mode all allows approving command execution and file writes from the phone.",
     "commands.approvals.modeUsage": "usage: /remote approvals mode safe|all|gui-only",
+    "commands.reload.ok": "present/i18n reloaded from disk",
     "commands.approvals.usage": "usage: /remote approvals [allow|deny <tool>] [--force]",
     "commands.approvals.title": "Approval policy (state.json, effective immediately):",
     "commands.approvals.last": "Last decision: {p0} → {p1} (decision: {p2})",
@@ -271,3 +275,8 @@ export function translator(lang = DEFAULT_LANG) {
   const code = normalizeLang(lang) ?? DEFAULT_LANG;
   return (key, params) => t(key, params, code);
 }
+
+
+// 079: активный словарь для горячего present.js. /remote reload перезагружает
+// этот модуль, и свежий present читает новые тексты через globalThis.
+globalThis.__dshRemoteI18n = { t, translator, resolveLanguage, formatTemplate };

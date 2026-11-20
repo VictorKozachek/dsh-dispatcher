@@ -34,6 +34,7 @@ import {
   parseCallbackData,
 } from "./base.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderHtml, renderRows } from "../present.js";
+import { hotLoad } from "../hot.js";
 
 /** Базовый адрес Bot API: тот же формат, что в доке (`/bot<token>/<method>`). */
 const API_BASE = "https://api.telegram.org";
@@ -510,12 +511,16 @@ export function createTelegramTransport(options = {}) {
       // Текст собирает слой представления (006): шапка «откуда», тело, подсказка
       // multiSelect, усечение под caps.maxText. Отправляем parse_mode HTML,
       // поэтому экранируем ВЕСЬ простой текст целиком — сущности не рвутся.
-      const text = renderHtml(renderBody(question, caps));
+      const present = await hotLoad("present.js").catch(() => null);
+      const renderBodyFn = typeof present?.renderBody === "function" ? present.renderBody : renderBody;
+      const renderHtmlFn = typeof present?.renderHtml === "function" ? present.renderHtml : renderHtml;
+      const renderRowsFn = typeof present?.renderRows === "function" ? present.renderRows : renderRows;
+      const text = renderHtmlFn(renderBodyFn(question, caps));
 
       // Кнопки — тоже из представления: варианты по одной в ряд, «Показать ещё»
       // при переполнении, «Другой ответ…» последним.
       const buttons = caps.inlineButtons
-        ? renderRows(question, caps)
+        ? renderRowsFn(question, caps)
           .map((row) => row
             .map((button) => {
               const optionId = button.optionId

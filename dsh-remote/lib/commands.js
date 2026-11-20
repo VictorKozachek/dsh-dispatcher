@@ -47,7 +47,14 @@ import {
 import { createAudit } from "./audit.js";
 import { DEFAULT_KEEP, vacuum } from "./rotate.js";
 import { formatStats } from "./metrics.js";
-import { DEFAULT_LANG, LANGS, normalizeLang, resolveLanguage, t } from "./i18n.js";
+import { DEFAULT_LANG, LANGS, normalizeLang, resolveLanguage, t as baseT } from "./i18n.js";
+import { configureHotReload, hotLoad, hotReload } from "./hot.js";
+
+/** 079: команды читают горячий словарь; /remote reload обновляет его. */
+function t(key, params = {}, lang = DEFAULT_LANG) {
+  const active = globalThis.__dshRemoteI18n;
+  return (typeof active?.t === "function" ? active.t : baseT)(key, params, lang);
+}
 
 /** Язык текущего вызова команд: `t()` для строк, вынесенных в словарь (049). */
 let commandLang = DEFAULT_LANG;
@@ -148,6 +155,7 @@ function helpText(lang = DEFAULT_LANG) {
     t("commands.helpVacuum", {}, code),
     t("commands.helpLang", {}, code),
     t("commands.helpApprovals", {}, code),
+    t("commands.helpReload", {}, code),
     t("commands.helpChannel", {}, code),
     t("commands.helpForce", {}, code),
     t("commands.helpTransport", {}, code),
@@ -494,6 +502,12 @@ export function createRemoteCommands({
   const credentials = createCredentialAccess(ctx, { log });
   /** 056: журнал: явный сервис из deps.expose важнее ctx.get (cordis его не видит). */
   const journalService = () => journal ?? ctx?.get?.("remoteJournal") ?? null;
+  // 079: горячая перезагрузка презентационных модулей; config.hotReload=false
+  // выключает перечитывание, /remote reload всё равно сбрасывает кэш.
+  configureHotReload(config?.hotReload !== false, {
+    ...(typeof config?.hotLibDir === "string" && config.hotLibDir !== "" ? { libDir: config.hotLibDir } : {}),
+    journal: { record: (event, fields) => journalService()?.record?.(event, fields) },
+  });
 
   /** Журнал решений (026): читаем тот же `audit.jsonl`, куда пишет ответчик. */
   const audit = createAudit({
@@ -1884,6 +1898,21 @@ export function createRemoteCommands({
     ].join("\n"));
   }
 
+  /** 079: сбросить кэш горячих модулей — следующий рендер перечитает файлы. */
+  async function reloadCommand() {
+    hotReload("manual");
+    // 079: сначала словарь (present читает его через globalThis), затем present.
+    for (const module of ["i18n.js", "present.js"]) {
+      try {
+        await hotLoad(module);
+      } catch (error) {
+        log(`hot: ${module} reload failed (${error?.message ?? error})`);
+      }
+    }
+    journalService()?.record?.("hot.reload", { detail: { module: null, reason: "command" } });
+    return success(tx("commands.reload.ok"));
+  }
+
   /** Обработчик `/remote`: разбор и диспетчеризация. */
   async function handler(invocation) {
     commandLang = currentLang();
@@ -1900,6 +1929,8 @@ export function createRemoteCommands({
           return await status(invocation);
         case "mirror":
           return await mirrorCommand(rest);
+        case "reload":
+          return await reloadCommand();
         case "approvals":
           return approvalsCommand(rest, flags);
         case "lang":
@@ -1936,7 +1967,7 @@ export function createRemoteCommands({
   const definition = {
     name: "remote",
     description: tx("commands.help.1"),
-    input: { hint: "connect|on|off|mirror|approvals|status|test|who|disconnect" },
+    input: { hint: "connect|on|off|mirror|approvals|reload|status|test|who|disconnect" },
     recordInput: false,
     handler,
   };
