@@ -444,6 +444,9 @@ export function resolveContext({ sessionId, ctx, log = noop, journal = null } = 
     log(`sessions.get(${context.sessionId}): ${error?.message ?? error}`);
     try {
       journal?.record?.("context.resolve", {
+        sessionId: maskSessionId(context.sessionId),
+        workspace: null,
+        preset: null,
         detail: {
           sessionId: maskSessionId(context.sessionId),
           sessionObjectId: null,
@@ -495,6 +498,9 @@ export function resolveContext({ sessionId, ctx, log = noop, journal = null } = 
   // путей и имён).
   try {
     journal?.record?.("context.resolve", {
+      sessionId: maskSessionId(context.sessionId),
+      workspace: context.workspace,
+      preset: context.role,
       detail: {
         sessionId: maskSessionId(context.sessionId),
         sessionObjectId: maskSessionId(sessionObjectId),

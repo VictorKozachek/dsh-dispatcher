@@ -650,6 +650,9 @@ export function createAnswerer({
         && decision.scope === "global"
         && decision.global === true;
       journalEvent("question.skipped", {
+        sessionId: maskJournalSession(sessionId),
+        workspace: journalWorkspace(workspace),
+        preset,
         detail: {
           reason,
           scope: decision?.scope ?? null,

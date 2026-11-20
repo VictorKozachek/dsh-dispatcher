@@ -923,6 +923,8 @@ test("075: mode-disabled журналируется с scope, маской id и
   assert.ok(entry);
   assert.equal(entry.detail.reason, "mode-disabled");
   assert.equal(entry.detail.scope, "global");
+  assert.equal(entry.sessionId, "8aac9774…", "контекст продублирован на верхнем уровне");
+  assert.equal(entry.workspace, "project");
   assert.equal(entry.detail.sessionId, "8aac9774…");
   assert.equal(entry.detail.workspace, "project", "только basename, без пути");
   assert.equal(entry.detail.preset, "worker");
@@ -965,4 +967,23 @@ test("075: пачка из трёх вопросов даёт одно question.
   const questions = [item(), item(), item()];
   await runWaterfall(ctx, EVENT, { questions, agent: { id: "s1" } }, () => "gui");
   assert.equal(journal.events.filter((item) => item.event === "question.skipped").length, 1);
+});
+
+test("076: события журнала несут sessionId/workspace/preset из запроса", async () => {
+  const journal = fakeJournal();
+  const { ctx, transport } = skipSetup({ journal });
+  const pending = runWaterfall(ctx, EVENT, request({ agent: { id: "session-8aac9774-1111" } }), () => assert.fail("next() не должен вызываться"));
+  await tick();
+  const send = journal.events.find((entry) => entry.event === "question.send");
+  assert.ok(send, "question.send записан");
+  assert.equal(send.sessionId, "8aac9774…", "маска уникальной части");
+  assert.equal(send.workspace, "project", "только basename");
+  assert.equal(send.preset, "worker");
+  const resolved = journal.events.find((entry) => entry.event === "context.resolve");
+  assert.equal(resolved.detail.workspace, "project");
+  transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+  await pending;
+  const received = journal.events.find((entry) => entry.event === "answer.received");
+  assert.equal(received.sessionId, "8aac9774…");
+  assert.equal(received.workspace, "project");
 });

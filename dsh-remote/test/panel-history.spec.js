@@ -607,3 +607,25 @@ test("070: блок истории показывает пометку к стр
   text = flatText(client.render({ history, t }));
   assert.match(text, /note: был повторный клик/, "и в деталях");
 });
+
+test("076: фильтр истории по проекту отбирает реальные workspace", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-history-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const logFile = path.join(dir, "log.jsonl");
+  const now = 1_700_000_000_000;
+  const lines = [
+    { ts: new Date(now).toISOString(), event: "question.sent", shortId: "aa000001", workspace: "alpha", transport: "max", detail: JSON.stringify({ messageId: "1" }) },
+    { ts: new Date(now + 1).toISOString(), event: "answer.received", shortId: "aa000001", workspace: "alpha", transport: "max", detail: JSON.stringify({ optionIds: ["o1"] }) },
+    { ts: new Date(now + 2).toISOString(), event: "question.sent", shortId: "bb000002", workspace: "beta", transport: "max", detail: JSON.stringify({ messageId: "2" }) },
+  ];
+  fs.writeFileSync(logFile, lines.map((line) => JSON.stringify(line)).join("\n"));
+
+  const all = readQuestionHistory(logFile, { now: now + 10 });
+  assert.equal(all.total, 2);
+  const alpha = readQuestionHistory(logFile, { now: now + 10, workspace: "alpha" });
+  assert.equal(alpha.total, 1);
+  assert.deepEqual(alpha.rows.map((row) => row.shortId), ["aa000001"]);
+  assert.equal(alpha.rows[0].project, "alpha");
+  const beta = buildQuestionHistory(readJournalEntries(logFile, { now: now + 10 }).entries, { workspace: "beta" });
+  assert.deepEqual(beta.rows.map((row) => row.shortId), ["bb000002"]);
+});

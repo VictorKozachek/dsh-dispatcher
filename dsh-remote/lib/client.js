@@ -56,6 +56,7 @@ window.__ModuleLoader__.load({
       journalNone: "journal is empty",
       history: "question history",
       historyNone: "no events yet",
+      historyAllProjects: "all projects",
       historySkipped: "skipped lines",
       historyStatusQueued: "sending",
       historyStatusDelivered: "delivered",
@@ -109,6 +110,7 @@ window.__ModuleLoader__.load({
       journalNone: "журнал пуст",
       history: "история вопросов",
       historyNone: "пока нет событий",
+      historyAllProjects: "все проекты",
       historySkipped: "пропущено строк",
       historyStatusQueued: "отправляется",
       historyStatusDelivered: "доставлен",
@@ -485,11 +487,28 @@ window.__ModuleLoader__.load({
     function HistoryBlock(props) {
       const history = props.history;
       const t = props.t;
-      const rows = history && Array.isArray(history.rows) ? history.rows : [];
+      const allRows = history && Array.isArray(history.rows) ? history.rows : [];
+      const projects = [];
+      for (const row of allRows) {
+        if (typeof row.project === "string" && row.project !== "" && !projects.includes(row.project)) projects.push(row.project);
+      }
+      const [project, setProject] = React.useState("");
+      const rows = project === "" ? allRows : allRows.filter((row) => row.project === project);
       const [expanded, setExpanded] = React.useState("");
       const children = [
         h("div", { key: "history-title", style: { marginTop: 12, fontSize: 12, color: "#64748b" } }, t("history")),
       ];
+      if (projects.length > 0) {
+        children.push(h("select", {
+          key: "history-project",
+          value: project,
+          onChange: (event) => setProject(event.target.value),
+          style: { fontSize: 12, marginBottom: 4 },
+        },
+          h("option", { value: "" }, t("historyAllProjects")),
+          projects.map((name) => h("option", { key: name, value: name }, name))
+        ));
+      }
       if (rows.length === 0) {
         children.push(h("div", { key: "history-none", style: { fontSize: 12, color: "#94a3b8" } }, t("historyNone")));
       } else {
