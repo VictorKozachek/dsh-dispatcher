@@ -93,7 +93,9 @@ function scriptedAsk(answers) {
   const ask = async (request) => {
     const item = request.questions[0];
     asked.push(item);
-    const answer = answers[item.id];
+    const answer = answers[item.id] ?? (item.id === "remote-connect-approvals"
+      ? { selected: ["Только безопасные (по умолчанию)"] }
+      : undefined);
     if (answer === undefined) throw new Error(`нет сценария для ${item.id}`);
     if (answer instanceof Error) throw answer;
     return {
@@ -244,6 +246,7 @@ test("connect: шаги, привязка, режим, токен не утек�
   assert.equal(state.bindings.userId, 7);
   assert.equal(state.bindings.botUsername, "test_bot");
   assert.equal(state.enabled.workspaces[WORKSPACE], true, "режим включён для текущего проекта");
+  assert.equal(state.approvals.mode, "safe", "онбординг по умолчанию — safe");
 
   assert.deepEqual(stand.credentials.calls[0].slice(0, 2), ["set", TELEGRAM_TOKEN_REF]);
   assert.equal(fs.readFileSync(stand.file, "utf8").includes(TOKEN), false, "токен не попал на диск");
@@ -252,7 +255,7 @@ test("connect: шаги, привязка, режим, токен не утек�
 
   const poll = telegram.calls.find((call) => call.method === "getUpdates");
   assert.deepEqual(poll.payload.allowed_updates, ["message"]);
-  assert.equal(stand.asked.length, 4, "четыре шага: транспорт, токен, код, режим");
+  assert.equal(stand.asked.length, 5, "пять шагов: транспорт, токен, код, режим, подтверждения");
 });
 
 test("connect: после привязки просит транспорт начать поллинг", async (t) => {
@@ -1974,6 +1977,61 @@ test("074: store сохраняет переопределения полити�
   const store = createStore({ file, now: () => START_MS });
   store.setApprovals({ tools: ["read_file", "bash"], denyRemote: ["bash", "rm"] });
   const saved = store.read();
-  assert.deepEqual(saved.approvals, { tools: ["read_file", "bash"], denyRemote: ["bash", "rm"] });
+  assert.deepEqual(saved.approvals, { mode: "safe", tools: ["read_file", "bash"], denyRemote: ["bash", "rm"], denied: [] });
   assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).approvals.tools.includes("bash"), true);
+});
+
+test("077: онбординг connect спрашивает режим и сохраняет all", async (t) => {
+  const telegram = telegramFetch();
+  const stand = harness(t, {
+    answers: { ...CONNECT_ANSWERS, "remote-connect-approvals": { selected: ["Да, всё"] } },
+    fetchImpl: telegram.fetch,
+  });
+  const result = await stand.remote.handler(invoke("connect"));
+  assert.equal(result.kind, "success", result.text);
+  assert.equal(stand.asked.some((item) => item.id === "remote-connect-approvals"), true);
+  assert.equal(stand.store.read().approvals.mode, "all");
+});
+
+test("077: онбординг connect сохраняет gui-only", async (t) => {
+  const telegram = telegramFetch();
+  const stand = harness(t, {
+    answers: { ...CONNECT_ANSWERS, "remote-connect-approvals": { selected: ["Всё только в GUI"] } },
+    fetchImpl: telegram.fetch,
+  });
+  const result = await stand.remote.handler(invoke("connect"));
+  assert.equal(result.kind, "success", result.text);
+  assert.equal(stand.store.read().approvals.mode, "gui-only");
+});
+
+test("077: approvals mode переключает, пишет журнал и предупреждает для all", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-approvals-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json"), now: () => START_MS });
+  const calls = [];
+  const journal = { events: [], record: (event, fields = {}) => { journal.events.push({ event, ...fields }); return true; } };
+  const policy = {
+    last: null,
+    describe: () => ["approvals: режим=safe"],
+    snapshot() { return { lines: this.describe(), last: this.last }; },
+    setMode(mode) { calls.push(mode); this.last = null; },
+  };
+  const ctx = {
+    get(name) {
+      if (name === "sessions") return { get: () => ({ header: { cwd: WORKSPACE } }) };
+      if (name === "remoteApprovalPolicy") return policy;
+      if (name === "remoteJournal") return journal;
+      return null;
+    },
+  };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => START_MS });
+  const res = await remote.handler({ rawInput: "approvals mode all" });
+  assert.equal(res.kind, "success", res.text);
+  assert.deepEqual(calls, ["all"]);
+  assert.match(res.text, /режим подтверждений: all/);
+  assert.match(res.text, /ВНИМАНИЕ/);
+  assert.equal(journal.events.some((entry) => entry.event === "approvals.mode" && entry.detail.mode === "all"), true);
+
+  const bad = await remote.handler({ rawInput: "approvals mode nonsense" });
+  assert.equal(bad.kind, "error");
 });

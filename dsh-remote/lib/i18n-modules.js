@@ -132,11 +132,15 @@ export const METRICS_MESSAGES_EN = Object.freeze({
   });
 
 export const POLICY_MESSAGES_RU = Object.freeze({
+    "policy.mode": "approvals: режим={p0}{p1}",
+    "policy.allWarning": " (ВНИМАНИЕ: всё можно подтвердить с телефона)",
     "policy.tools": "approvals: tools=[{p0}]",
     "policy.denyRemote": "approvals: denyRemote=[{p0}]",
     "policy.timeout": "approvals: onTimeout={p0} (отказ), ttl={p1} мин",
   });
 export const POLICY_MESSAGES_EN = Object.freeze({
+    "policy.mode": "approvals: mode={p0}{p1}",
+    "policy.allWarning": " (WARNING: everything can be approved from the phone)",
     "policy.tools": "approvals: tools=[{p0}]",
     "policy.denyRemote": "approvals: denyRemote=[{p0}]",
     "policy.timeout": "approvals: onTimeout={p0} (refusal), ttl={p1} min",

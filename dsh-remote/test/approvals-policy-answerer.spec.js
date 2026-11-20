@@ -534,4 +534,29 @@ test("074: allow из политики снимает denyRemote и подтве
 
   policy.deny("bash");
   assert.equal(policy.decide(request({ toolName: "bash" })).remote, false);
+
+  policy.setMode("all");
+  assert.equal(policy.mode, "all");
+  assert.equal(policy.decide(request({ toolName: "shell" })).remote, true, "all разрешает default deny");
+  policy.deny("bash");
+  assert.equal(policy.decide(request({ toolName: "bash" })).remote, false, "явный deny сильнее all");
+});
+
+test("077: mode all отправляет bash, gui-only не отправляет даже read_file", async () => {
+  const all = setup({ policyConfig: { mode: "all" } });
+  const pending = all.ctx.subscriptions[0].handler(request({ toolName: "bash" }), all.next);
+  await tick();
+  assert.equal(all.transport.sent.length, 1, "mode all: bash ушёл в канал");
+  all.transport.answer({ shortId: all.transport.sent[0].shortId, optionIds: ["o1"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+
+  const gui = setup({ policyConfig: { mode: "gui-only" } });
+  const nextCalls = [];
+  const result = await gui.ctx.subscriptions[0].handler(request({ toolName: "read_file" }), async () => {
+    nextCalls.push(true);
+    return "gui";
+  });
+  assert.equal(result, "gui");
+  assert.equal(gui.transport.sent.length, 0, "gui-only ничего не отправляет");
+  assert.equal(nextCalls.length, 1);
 });

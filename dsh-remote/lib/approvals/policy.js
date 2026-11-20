@@ -52,6 +52,10 @@ export const DEFAULT_ON_TIMEOUT = "cancelled";
 /** Исходы, допустимые для `onTimeout` (оба — отказ). */
 export const ON_TIMEOUT_VALUES = Object.freeze(["cancelled", "unavailable"]);
 
+/** 077: глобальный режим подтверждений. */
+export const APPROVAL_MODES = Object.freeze(["safe", "all", "gui-only"]);
+export const DEFAULT_APPROVAL_MODE = "safe";
+
 const noopLog = () => {};
 
 function stringList(value) {
@@ -80,6 +84,13 @@ export function normalizePolicy(config, { log = noopLog } = {}) {
   const section = config !== null && typeof config === "object" ? config : {};
   const tools = stringList(section.tools);
   const denyRemote = stringList(section.denyRemote);
+  const denied = stringList(section.denied);
+
+  let mode = DEFAULT_APPROVAL_MODE;
+  if (section.mode !== undefined) {
+    if (APPROVAL_MODES.includes(section.mode)) mode = section.mode;
+    else log(`политика подтверждений: mode=${JSON.stringify(section.mode)} не поддерживается — остаётся safe`);
+  }
 
   let onTimeout = DEFAULT_ON_TIMEOUT;
   if (section.onTimeout !== undefined) {
@@ -101,8 +112,13 @@ export function normalizePolicy(config, { log = noopLog } = {}) {
   }
 
   return {
+    mode,
     tools: tools ?? [...DEFAULT_TOOLS],
     denyRemote: denyRemote ?? [...DEFAULT_DENY_REMOTE],
+    denied: denied ?? [],
+    // 077: отличать явный denyRemote (state 074/конфиг) от дефолтного: в mode
+    // all игнорируется только дефолт, явный запрет сильнее all.
+    denyRemoteExplicit: section.denyRemote !== undefined,
     onTimeout,
     ttlMs,
   };
@@ -135,12 +151,32 @@ export function decide(policy, request) {
       message: "инструмент не указан — подтверждение только в GUI",
     };
   }
-  if ((policy?.denyRemote ?? []).includes(toolName)) {
+  if (policy?.mode === "gui-only") {
+    return {
+      remote: false,
+      reason: "mode-gui-only",
+      toolName,
+      message: "режим gui-only — подтверждение только в GUI",
+    };
+  }
+  const denyRemote = policy?.denyRemote ?? [];
+  const explicitDeny = (policy?.denied ?? []).includes(toolName)
+    || (policy?.denyRemoteExplicit === true && denyRemote.includes(toolName));
+  const defaultDeny = policy?.mode === "all" ? false : denyRemote.includes(toolName);
+  if (explicitDeny || defaultDeny) {
     return {
       remote: false,
       reason: "deny-remote",
       toolName,
       message: `${toolName} в denyRemote — подтверждение только в GUI`,
+    };
+  }
+  if (policy?.mode === "all") {
+    return {
+      remote: true,
+      reason: "allowed",
+      toolName,
+      message: `${toolName} разрешён режимом all — можно спросить удалённо`,
     };
   }
   if (!(policy?.tools ?? []).includes(toolName)) {
@@ -170,6 +206,7 @@ export function describePolicy(policy, lang = DEFAULT_LANG) {
   const tools = policy?.tools ?? [];
   const deny = policy?.denyRemote ?? [];
   return [
+    t("policy.mode", { p0: policy?.mode ?? DEFAULT_APPROVAL_MODE, p1: policy?.mode === "all" ? t("policy.allWarning", {}, code) : "" }, code),
     t("policy.tools", { p0: tools.join(", ") || "—" }, code),
     t("policy.denyRemote", { p0: deny.join(", ") || "—" }, code),
     t("policy.timeout", {
