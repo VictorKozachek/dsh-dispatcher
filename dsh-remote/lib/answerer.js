@@ -597,6 +597,21 @@ export function createAnswerer({
     }
   }
 
+  /** 075: маска id как в context.resolve — уникальная часть, 8 символов. */
+  function maskSessionId(value) {
+    if (typeof value !== "string" || value === "") return null;
+    const unique = value.replace(/^(?:session|agent|sess)-/, "");
+    return `${unique.slice(0, 8)}…`;
+  }
+
+  /** 075: basename воркспейса без полного пути. */
+  function workspaceBasename(value) {
+    if (typeof value !== "string" || value === "") return null;
+    const trimmed = value.replace(/[\\/]+$/, "");
+    const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+    return index >= 0 ? trimmed.slice(index + 1) : trimmed;
+  }
+
   /**
    * Слушатель waterfall'а.
    *
@@ -607,15 +622,32 @@ export function createAnswerer({
   async function handler(request, next) {
     const items = Array.isArray(request?.questions) ? request.questions : [];
     if (items.length === 0) return next(); // пустой запрос — ошибка ядра, не наша
-    if (request?.signal?.aborted) throw abortError();
-
-    if (useBroker && channels.some((item) => typeof item.sendQuestion !== "function" && typeof deliverFor !== "function")) {
-      log("ответчик: не все каналы умеют sendQuestion — отдаю GUI");
-      return next();
-    }
     const sessionId = typeof request?.agent?.id === "string" ? request.agent.id : null;
     const workspace = workspaceOf(sessionId);
-    // Маркировка (006): роль и задача, которую ведёт эта сессия. Ошибки чтения
+    // 075: ранние выходы ответчика не должны быть слепым пятном. Одно событие
+    // на запрос (не на вопрос пачки), только факты и маскированные id.
+    const skipped = (reason, decision = null, preset = null) => {
+      const contradiction = decision !== null
+        && decision.enabled !== true
+        && decision.scope === "global"
+        && decision.global === true;
+      journalEvent("question.skipped", {
+        detail: {
+          reason,
+          scope: decision?.scope ?? null,
+          sessionId: maskSessionId(sessionId),
+          workspace: workspaceBasename(workspace),
+          preset,
+          ...(contradiction ? { level: "warn", contradiction: "global-enabled-but-mode-disabled" } : {}),
+        },
+      });
+    };
+    if (request?.signal?.aborted) {
+      skipped("aborted");
+      throw abortError();
+    }
+
+    // Маркировка (006): роль и задачу, которую ведёт эта сессия. Ошибки чтения
     // контекста не должны мешать вопросу — тогда просто без задачи.
     let questionContext = { role: null, sessionTitle: null, taskId: null, branch: null, worktree: null };
     try {
@@ -636,12 +668,19 @@ export function createAnswerer({
     } catch (error) {
       log(`реестр режима: ${error?.message ?? error} — считаю режим выключенным`);
     }
+    if (useBroker && channels.some((item) => typeof item.sendQuestion !== "function" && typeof deliverFor !== "function")) {
+      log("ответчик: не все каналы умеют sendQuestion — отдаю GUI");
+      skipped("broker-unsupported", decision, questionContext.role);
+      return next();
+    }
     if (!decision.enabled) {
       log(`вопрос ${sessionId ?? "(без агента)"}: режим выключен — отдаю GUI (next)`);
+      skipped("mode-disabled", decision, questionContext.role);
       return next();
     }
     if (typeof deliver !== "function" && !useBroker && typeof primary?.sendQuestion !== "function") {
       log("вопрос: транспорт не умеет sendQuestion — отдаю GUI (next)");
+      skipped("no-transport", decision, questionContext.role);
       return next();
     }
     const mirrorState = mirrorConfig();
