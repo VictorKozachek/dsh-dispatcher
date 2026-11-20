@@ -148,6 +148,9 @@ export class PanelService {
         ...(Number.isFinite(this.options.historyLimit) ? { historyLimit: this.options.historyLimit } : {}),
         ...(Array.isArray(this.options.workspaces) ? { workspaces: this.options.workspaces } : {}),
         ...(Number.isFinite(this.options.staleMinutes) ? { staleMinutes: this.options.staleMinutes } : {}),
+        ...(typeof this.options.historyWorkspace === "string" && this.options.historyWorkspace !== ""
+          ? { historyWorkspace: this.options.historyWorkspace }
+          : {}),
         ...(typeof this.options.metrics === "function"
           ? (() => {
             try {
@@ -263,6 +266,7 @@ export function registerPanelService(ctx, options = {}) {
     logFile: options.logFile ?? paths.logFile,
     settings: options.settings ?? {},
     ...(options.approvalPolicy === undefined ? {} : { approvalPolicy: options.approvalPolicy }),
+    ...(options.historyWorkspace === undefined ? {} : { historyWorkspace: options.historyWorkspace }),
     now: options.now ?? (() => Date.now()),
     logger: options.logger ?? (() => {}),
     // Функцию храним как есть: снимок спросит её каждый раз заново.

@@ -220,10 +220,10 @@ function droppedNote(reason) {
  * ограничиваются `limit`.
  *
  * @param entries - результат `readJournalEntries().entries` или свой список.
- * @param options - `{limit}`.
+ * @param options - `{limit, workspace}`; `workspace` — basename проекта (076).
  * @returns `{rows, total}`.
  */
-export function buildQuestionHistory(entries, { limit = HISTORY_LIMIT } = {}) {
+export function buildQuestionHistory(entries, { limit = HISTORY_LIMIT, workspace = null } = {}) {
   const byShort = new Map();
   const pairingRows = [];
   for (const entry of Array.isArray(entries) ? entries : []) {
@@ -353,9 +353,16 @@ export function buildQuestionHistory(entries, { limit = HISTORY_LIMIT } = {}) {
   }
 
   const all = [...byShort.values(), ...pairingRows]
-    .sort((left, right) => right.time - left.time)
-    .slice(0, Math.max(0, limit));
-  return { rows: all, total: byShort.size + pairingRows.length };
+    .sort((left, right) => right.time - left.time);
+  // 076: фильтр по проекту — реальные данные, событие несёт `workspace`
+  // (basename). Строки без проекта при фильтре не угадываем.
+  const filtered = workspace === null || workspace === ""
+    ? all
+    : all.filter((row) => row.project === workspace);
+  return {
+    rows: filtered.slice(0, Math.max(0, limit)),
+    total: filtered.length,
+  };
 }
 
 /**
@@ -371,9 +378,10 @@ export function readQuestionHistory(logFile, {
   limit = HISTORY_LIMIT,
   rotated = HISTORY_ROTATED,
   logger = () => {},
+  workspace = null,
 } = {}) {
   const read = readJournalEntries(logFile, { now, hours, rotated, logger });
-  const history = buildQuestionHistory(read.entries, { limit });
+  const history = buildQuestionHistory(read.entries, { limit, workspace });
   return {
     rows: history.rows,
     total: history.total,

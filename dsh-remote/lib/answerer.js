@@ -185,10 +185,28 @@ export function createAnswerer({
   /** Счётчики гибрида для журнала и `/remote status`. */
   const stats = { hybridHanded: 0, hybridPhoneAnswers: 0 };
 
+  /** 076: контекст выполнения, один на запрос, для аддитивных полей журнала. */
+  const journalContexts = new Map();
+  function maskJournalSession(value) {
+    if (typeof value !== "string" || value === "") return null;
+    return `${value.replace(/^(?:session|agent|sess)-/, "").slice(0, 8)}…`;
+  }
+  function journalWorkspace(value) {
+    if (typeof value !== "string" || value === "") return null;
+    const trimmed = value.replace(/[\\/]+$/, "");
+    const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+    return index >= 0 ? trimmed.slice(index + 1) : trimmed;
+  }
+  function journalContextFor(shortId) {
+    return typeof shortId === "string" ? journalContexts.get(shortId) ?? null : null;
+  }
+
   /** 051: запись в журнал; ошибка журнала не должна ронять вопрос. */
-  function journalEvent(event, fields) {
+  function journalEvent(event, fields = {}) {
+    const base = journalContextFor(fields?.shortId);
+    const enriched = base === null ? fields : { ...base, ...fields };
     try {
-      journal?.record?.(event, fields);
+      journal?.record?.(event, enriched);
     } catch {
       /* журнал не должен ронять плагин */
     }
@@ -632,11 +650,14 @@ export function createAnswerer({
         && decision.scope === "global"
         && decision.global === true;
       journalEvent("question.skipped", {
+        sessionId: maskJournalSession(sessionId),
+        workspace: journalWorkspace(workspace),
+        preset,
         detail: {
           reason,
           scope: decision?.scope ?? null,
-          sessionId: maskSessionId(sessionId),
-          workspace: workspaceBasename(workspace),
+          sessionId: maskJournalSession(sessionId),
+          workspace: journalWorkspace(workspace),
           preset,
           ...(contradiction ? { level: "warn", contradiction: "global-enabled-but-mode-disabled" } : {}),
         },
@@ -662,6 +683,13 @@ export function createAnswerer({
     } catch (error) {
       log(`вопрос: контекст сессии не прочитан (${error?.message ?? error})`);
     }
+    // 076: контекст выполнения считается один раз на запрос; события пачки
+    // получают его через shortId, а не пересчитывают путь/id каждый раз.
+    const requestJournalContext = {
+      sessionId: maskJournalSession(sessionId),
+      workspace: journalWorkspace(workspace),
+      preset: questionContext.role,
+    };
     let decision = { enabled: false, scope: null };
     try {
       decision = registry?.resolve?.({ sessionId, workspace }) ?? decision;
@@ -728,6 +756,8 @@ export function createAnswerer({
         known.set(created.shortId, created);
         if (known.size > 200) known.delete(known.keys().next().value);
         questions.push(created);
+        journalContexts.set(created.shortId, requestJournalContext);
+        if (journalContexts.size > 200) journalContexts.delete(journalContexts.keys().next().value);
         try {
           metrics?.inc?.("questions.asked");
         } catch {
@@ -990,7 +1020,7 @@ export function createAnswerer({
               const itemEntry = pending.get(item.shortId);
               if (itemEntry !== undefined) itemEntry.mirrorNotify = true;
             }
-            journalEvent("question.mirror.published", { detail: { mode: "notify", targets: [primary?.id ?? null] } });
+            journalEvent("question.mirror.published", { shortId: question.shortId, detail: { mode: "notify", targets: [primary?.id ?? null] } });
             cleanupHybrid();
             // 073: гонка «ответ GUI» vs «ответ канала» — первый завершает tool-call.
             const guiPromise = Promise.resolve().then(() => next()).catch((error) => {
@@ -1031,7 +1061,7 @@ export function createAnswerer({
               });
             });
             const targets = [...new Set(questions.flatMap((item) => (item.deliveries ?? []).map((delivery) => delivery.transport)).filter((id) => typeof id === "string" && id !== ""))];
-            journalEvent("answer.from_gui", { detail: { mode: "notify", targets: targets.length === 0 ? [primary?.id ?? null] : targets } });
+            journalEvent("answer.from_gui", { shortId: question.shortId, detail: { mode: "notify", targets: targets.length === 0 ? [primary?.id ?? null] : targets } });
             return winner;
 
           }
@@ -1042,7 +1072,7 @@ export function createAnswerer({
                 log(`mirror: next() не ответил (${error?.message ?? error})`);
                 return undefined;
               });
-            journalEvent("question.mirror.published", { detail: { mode: "full", targets: [primary?.id ?? null] } });
+            journalEvent("question.mirror.published", { shortId: question.shortId, detail: { mode: "full", targets: [primary?.id ?? null] } });
           }
 
           // 037: дождались ответа на текущий — только теперь публикуем следующий.
@@ -1063,7 +1093,7 @@ export function createAnswerer({
             cleanupHybrid();
             await closeQuestions(questions, "answered-in-gui", attempted);
             for (const item of questions) item.mirrorGuiNotified = true;
-            journalEvent("answer.from_gui", { detail: { mode: "full", targets: [primary?.id ?? null] } });
+            journalEvent("answer.from_gui", { shortId: questions[0]?.shortId, detail: { mode: "full", targets: [primary?.id ?? null] } });
             return answered;
           }
           if (answered === HYBRID_GUI || guiRequested) {
@@ -1123,7 +1153,7 @@ export function createAnswerer({
     };
     if (mirrorFull && mirrorGuiWon !== true) {
       try {
-        journalEvent("answer.from_transport", { detail: { mode: "full", targets: [primary?.id ?? null] } });
+        journalEvent("answer.from_transport", { shortId: questions[0]?.shortId, detail: { mode: "full", targets: [primary?.id ?? null] } });
         await mirrorState.settle?.(request?.agent ?? { id: sessionId }, callId, result);
         for (const question of questions) {
           question.mirrorSettled = true;
