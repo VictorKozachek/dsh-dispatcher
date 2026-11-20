@@ -882,3 +882,87 @@ test("037: три вопроса — каждый получает свой TTL 
   assert.equal(result.answers.length, 3, "все три части в результате");
   assert.equal(answerer.pending.size, 0, "висящих ожиданий нет");
 });
+
+/** 075: журнал ранних выходов ответчика. */
+function fakeJournal() {
+  const events = [];
+  return { events, record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
+}
+
+function skipSetup({ enabled = true, registry = null, transport = fakeTransport(), journal = fakeJournal(), transports = null } = {}) {
+  const ctx = fakeContext({ services: { sessions: { get: () => ({ header: { cwd: "/p/project", agentPreset: "worker" } }) } } });
+  const resolvedRegistry = registry ?? createRegistry({ readState: () => (enabled ? { global: true } : {}) });
+  const answerer = createAnswerer({
+    transport,
+    ...(transports === null ? {} : { transports }),
+    registry: resolvedRegistry,
+    journal,
+    log: () => {},
+    now: () => 1_000,
+  });
+  answerer.attach(ctx);
+  return { ctx, answerer, journal, transport };
+}
+
+test("075: no-questions не журналируется", async () => {
+  const { journal, ctx } = skipSetup();
+  let fallback = 0;
+  await runWaterfall(ctx, EVENT, { questions: [], agent: { id: "s1" } }, () => { fallback += 1; return "gui"; });
+  assert.equal(fallback, 1);
+  assert.equal(journal.events.some((entry) => entry.event === "question.skipped"), false);
+});
+
+test("075: mode-disabled журналируется с scope, маской id и preset", async () => {
+  const journal = fakeJournal();
+  const { ctx } = skipSetup({
+    registry: { resolve: () => ({ enabled: false, scope: "global", global: true }) },
+    journal,
+  });
+  await runWaterfall(ctx, EVENT, request({ agent: { id: "session-8aac9774-1111" } }), () => "gui");
+  const entry = journal.events.find((item) => item.event === "question.skipped");
+  assert.ok(entry);
+  assert.equal(entry.detail.reason, "mode-disabled");
+  assert.equal(entry.detail.scope, "global");
+  assert.equal(entry.detail.sessionId, "8aac9774…");
+  assert.equal(entry.detail.workspace, "project", "только basename, без пути");
+  assert.equal(entry.detail.preset, "worker");
+  assert.equal(entry.detail.level, "warn", "global=true, а режим выключен — противоречие");
+});
+
+test("075: no-transport журналируется", async () => {
+  const journal = fakeJournal();
+  const transport = { id: "no-send", onAnswer: () => () => {} };
+  const { ctx } = skipSetup({ transport, journal });
+  await runWaterfall(ctx, EVENT, request(), () => "gui");
+  const entry = journal.events.find((item) => item.event === "question.skipped");
+  assert.equal(entry.detail.reason, "no-transport");
+});
+
+test("075: broker-unsupported журналируется", async () => {
+  const journal = fakeJournal();
+  const { ctx } = skipSetup({ transports: [fakeTransport(), { id: "bad" }], journal });
+  await runWaterfall(ctx, EVENT, request(), () => "gui");
+  const entry = journal.events.find((item) => item.event === "question.skipped");
+  assert.equal(entry.detail.reason, "broker-unsupported");
+});
+
+test("075: aborted журналируется и промис отклоняется", async () => {
+  const journal = fakeJournal();
+  const { ctx } = skipSetup({ journal });
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    runWaterfall(ctx, EVENT, request({ signal: controller.signal }), () => "gui"),
+    (error) => error?.name === "AbortError",
+  );
+  const entry = journal.events.find((item) => item.event === "question.skipped");
+  assert.equal(entry.detail.reason, "aborted");
+});
+
+test("075: пачка из трёх вопросов даёт одно question.skipped", async () => {
+  const journal = fakeJournal();
+  const { ctx } = skipSetup({ enabled: false, journal });
+  const questions = [item(), item(), item()];
+  await runWaterfall(ctx, EVENT, { questions, agent: { id: "s1" } }, () => "gui");
+  assert.equal(journal.events.filter((item) => item.event === "question.skipped").length, 1);
+});
