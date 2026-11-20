@@ -65,3 +65,47 @@ test("079: reload сбрасывает кэш, enabled=false остаётся в
   loader.setEnabled(false);
   assert.equal(loader.enabled, false);
 });
+
+test("079: реальный present.js перечитывается и меняет payload после правки", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-hot-present-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.cpSync(path.resolve("dsh-remote/lib"), path.join(dir, "lib"), { recursive: true });
+  const lib = path.join(dir, "lib");
+  const loader = createHotLoader({ libDir: lib, minCheckMs: 0 });
+  const question = { workspace: "/p/project", body: "Продолжать?", options: [{ id: "o1", label: "Да" }], createdAt: 1000 };
+
+  const first = await loader.load("present.js");
+  const before = first.renderBody(question, { maxText: 4096 });
+  assert.match(before, /▸ project · \d{2}:\d{2}/);
+
+  const file = path.join(lib, "present.js");
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("const header = `▸ ", "const header = `▶ "));
+  fs.utimesSync(file, new Date(), new Date(Date.now() + 5_000));
+  const second = await loader.load("present.js");
+  const after = second.renderBody(question, { maxText: 4096 });
+  assert.match(after, /▶ project · \d{2}:\d{2}/);
+  assert.notEqual(after, before);
+});
+
+test("079: правка словаря i18n видна после hot-load i18n (payload present)", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-hot-i18n-"));
+  t.after(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    import("../lib/i18n.js").then((module) => {
+      globalThis.__dshRemoteI18n = { t: module.t, translator: module.translator, resolveLanguage: module.resolveLanguage, formatTemplate: module.formatTemplate };
+    }).catch(() => {});
+  });
+  fs.cpSync(path.resolve("dsh-remote/lib"), path.join(dir, "lib"), { recursive: true });
+  const lib = path.join(dir, "lib");
+  const loader = createHotLoader({ libDir: lib, minCheckMs: 0 });
+  const present = await loader.load("present.js");
+  const question = { workspace: "/p", body: "x", options: [{ id: "o1", label: "Да" }], allowFreeText: true, lang: "ru", createdAt: 1000 };
+  assert.ok(present.renderRows(question, { maxOptions: 5, maxText: 4096 }).flat().some((row) => row.label === "Другой ответ…"));
+
+  const file = path.join(lib, "i18n.js");
+  fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace('"present.freeTextLabel": "Другой ответ…"', '"present.freeTextLabel": "СВОЙ ОТВЕТ"'));
+  fs.utimesSync(file, new Date(), new Date(Date.now() + 5_000));
+  await loader.load("i18n.js");
+  const rows = present.renderRows(question, { maxOptions: 5, maxText: 4096 }).flat();
+  assert.ok(rows.some((row) => row.label === "СВОЙ ОТВЕТ"), "новый словарь виден через global bridge");
+});
