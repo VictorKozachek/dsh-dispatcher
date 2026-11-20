@@ -739,12 +739,10 @@ export function createAnswerer({
       const questionLang = typeof lang === "function" ? lang() : lang;
       const primaryChannel = channelFor(primary?.id ?? null);
       const createdList = createQuestions(items, {
+        // 078: контекст передаём целиком — явный список терял sessionTitle.
+        ...questionContext,
         sessionId,
         workspace,
-        role: questionContext.role,
-        taskId: questionContext.taskId,
-        branch: questionContext.branch,
-        worktree: questionContext.worktree,
         quickReplies,
         lang: questionLang,
         chatId: primaryChannel.chatId,
