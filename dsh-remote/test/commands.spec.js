@@ -2035,3 +2035,22 @@ test("077: approvals mode переключает, пишет журнал и п�
   const bad = await remote.handler({ rawInput: "approvals mode nonsense" });
   assert.equal(bad.kind, "error");
 });
+
+test("079: /remote reload сбрасывает кэш горячих модулей", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-hot-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json"), now: () => START_MS });
+  const journal = { events: [], record: (event, fields = {}) => { journal.events.push({ event, ...fields }); return true; } };
+  const ctx = {
+    get(name) {
+      if (name === "sessions") return { get: () => ({ header: { cwd: WORKSPACE } }) };
+      if (name === "remoteJournal") return journal;
+      return null;
+    },
+  };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => START_MS, config: { hotReload: false } });
+  const res = await remote.handler({ rawInput: "reload" });
+  assert.equal(res.kind, "success", res.text);
+  assert.match(res.text, /перечитаны из диска/);
+  assert.equal(journal.events.some((entry) => entry.event === "hot.reload"), true);
+});

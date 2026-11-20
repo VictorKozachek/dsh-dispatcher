@@ -37,6 +37,7 @@ import {
   throttle,
 } from "./base.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderHtml, renderRows } from "../present.js";
+import { hotLoad } from "../hot.js";
 
 /** Базовый адрес MAX Bot API: документация просит именно platform-api2. */
 export const MAX_API_BASE = "https://platform-api2.max.ru";
@@ -288,18 +289,20 @@ function clipHtml(text, limit) {
 }
 
 /** 047: plain → HTML с бюджетом на теги, без обрыва подсказки. */
-function renderMaxHtml(question, caps) {
+function renderMaxHtml(question, caps, present = null) {
+  const renderBodyFn = typeof present?.renderBody === "function" ? present.renderBody : renderBody;
+  const renderHtmlFn = typeof present?.renderHtml === "function" ? present.renderHtml : renderHtml;
   const max = Number.isFinite(caps?.maxText) ? caps.maxText : MAX_CAPS.maxText;
   let budget = max;
   let html = "";
   for (let attempt = 0; attempt < 6; attempt += 1) {
-    const plain = renderBody(question, { ...caps, maxText: budget });
-    html = renderHtml(plain);
+    const plain = renderBodyFn(question, { ...caps, maxText: budget });
+    html = renderHtmlFn(plain);
     if (html.length <= max) return html;
     budget = Math.max(40, budget - (html.length - max) - 8);
   }
-  const plain = renderBody(question, { ...caps, maxText: Math.max(40, max - 64) });
-  html = renderHtml(plain);
+  const plain = renderBodyFn(question, { ...caps, maxText: Math.max(40, max - 64) });
+  html = renderHtmlFn(plain);
   return html.length <= max ? html : clipHtml(html, max);
 }
 
@@ -697,9 +700,10 @@ export function createMaxTransport(options = {}) {
   }
 
   /** Клавиатура вопроса (attachments MAX) — общая для отправки и правок. */
-  function buildKeyboard(question) {
+  function buildKeyboard(question, present = null) {
     const shortId = question?.shortId;
-    const rows = caps.inlineButtons ? renderRows(question, caps) : [];
+    const renderRowsFn = typeof present?.renderRows === "function" ? present.renderRows : renderRows;
+    const rows = caps.inlineButtons ? renderRowsFn(question, caps) : [];
     const buttons = rows.map((row) => row.map((button) => {
       const optionId = button.optionId
         ?? (button.kind === "free" ? FREE_TEXT_OPTION : button.kind === "more" ? MORE_OPTION : null);
@@ -808,8 +812,9 @@ export function createMaxTransport(options = {}) {
       const targetChat = sendOptions?.chatId ?? chatId;
       const query = targetChat !== null ? { chat_id: targetChat } : { user_id: userId };
 
-      const text = renderMaxHtml(question, caps);
-      const keyboard = buildKeyboard(question);
+      const present = await hotLoad("present.js").catch(() => null);
+      const text = renderMaxHtml(question, caps, present);
+      const keyboard = buildKeyboard(question, present);
       const attachments = keyboard.payload.buttons.length === 0 ? undefined : [keyboard];
 
       const labels = new Map(

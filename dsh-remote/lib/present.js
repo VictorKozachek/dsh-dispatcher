@@ -26,7 +26,13 @@ import path from "node:path";
 
 import { DEFAULT_CAPS } from "./transport/base.js";
 import { normalizeQuickReplies } from "./quick-replies.js";
-import { DEFAULT_LANG, normalizeLang, t } from "./i18n.js";
+import { DEFAULT_LANG, normalizeLang, t as baseT } from "./i18n.js";
+
+/** 079: свежий i18n после /remote reload виден даже уже загруженному present. */
+function t(key, params = {}, lang = DEFAULT_LANG) {
+  const active = globalThis.__dshRemoteI18n;
+  return (typeof active?.t === "function" ? active.t : baseT)(key, params, lang);
+}
 
 /** `optionId` кнопки свободного ответа в `callback_data`. */
 export const FREE_TEXT_OPTION = "free";
