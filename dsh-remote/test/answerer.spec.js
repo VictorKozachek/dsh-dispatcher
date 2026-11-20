@@ -1024,3 +1024,22 @@ test("078: sessionTitle доходит до payload вопроса (шапка �
     else process.env.DSH_HOME = previous;
   }
 });
+
+test("079: ответчик берёт resolveContext из горячего present", async () => {
+  const previous = globalThis.__dshRemotePresent;
+  globalThis.__dshRemotePresent = {
+    resolveContext: () => ({ role: "hot-role", sessionTitle: "ГОРЯЧЕЕ ИМЯ", taskId: null, branch: null, worktree: null }),
+  };
+  try {
+    const { ctx, transport } = skipSetup();
+    const pending = runWaterfall(ctx, EVENT, request(), () => assert.fail("next() не должен вызываться"));
+    await tick();
+    const payload = renderBody(transport.sent[0], { maxText: 4096 });
+    assert.match(payload, /ГОРЯЧЕЕ ИМЯ/);
+    transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+    await pending;
+  } finally {
+    if (previous === undefined) delete globalThis.__dshRemotePresent;
+    else globalThis.__dshRemotePresent = previous;
+  }
+});

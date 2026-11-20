@@ -47,8 +47,14 @@ import {
 import { createAudit } from "./audit.js";
 import { DEFAULT_KEEP, vacuum } from "./rotate.js";
 import { formatStats } from "./metrics.js";
-import { DEFAULT_LANG, LANGS, normalizeLang, resolveLanguage, t } from "./i18n.js";
+import { DEFAULT_LANG, LANGS, normalizeLang, resolveLanguage, t as baseT } from "./i18n.js";
 import { configureHotReload, hotLoad, hotReload } from "./hot.js";
+
+/** 079: команды читают горячий словарь; /remote reload обновляет его. */
+function t(key, params = {}, lang = DEFAULT_LANG) {
+  const active = globalThis.__dshRemoteI18n;
+  return (typeof active?.t === "function" ? active.t : baseT)(key, params, lang);
+}
 
 /** Язык текущего вызова команд: `t()` для строк, вынесенных в словарь (049). */
 let commandLang = DEFAULT_LANG;
@@ -499,6 +505,7 @@ export function createRemoteCommands({
   // 079: горячая перезагрузка презентационных модулей; config.hotReload=false
   // выключает перечитывание, /remote reload всё равно сбрасывает кэш.
   configureHotReload(config?.hotReload !== false, {
+    ...(typeof config?.hotLibDir === "string" && config.hotLibDir !== "" ? { libDir: config.hotLibDir } : {}),
     journal: { record: (event, fields) => journalService()?.record?.(event, fields) },
   });
 

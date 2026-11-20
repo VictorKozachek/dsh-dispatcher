@@ -2054,3 +2054,26 @@ test("079: /remote reload сбрасывает кэш горячих модул�
   assert.match(res.text, /перечитаны из диска/);
   assert.equal(journal.events.some((entry) => entry.event === "hot.reload"), true);
 });
+
+test("079: правка i18n видна в командах после /remote reload", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-cmd-hot-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.cpSync(path.resolve("dsh-remote/lib"), path.join(dir, "lib"), { recursive: true });
+  const lib = path.join(dir, "lib");
+  const i18nFile = path.join(lib, "i18n.js");
+  fs.writeFileSync(i18nFile, fs.readFileSync(i18nFile, "utf8").replace('"commands.helpTitle": "Команды /remote:"', '"commands.helpTitle": "ГОРЯЧИЕ КОМАНДЫ"'));
+  fs.utimesSync(i18nFile, new Date(), new Date(Date.now() + 5_000));
+
+  const store = createStore({ file: path.join(dir, "state.json"), now: () => START_MS });
+  const ctx = { get: () => null };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => START_MS, config: { hotLibDir: lib } });
+  try {
+    const reload = await remote.handler({ rawInput: "reload" });
+    assert.equal(reload.kind, "success", reload.text);
+    const help = await remote.handler({ rawInput: "help" });
+    assert.match(help.text, /ГОРЯЧИЕ КОМАНДЫ/);
+  } finally {
+    const orig = await import("../lib/i18n.js");
+    globalThis.__dshRemoteI18n = { t: orig.t, translator: orig.translator, resolveLanguage: orig.resolveLanguage, formatTemplate: orig.formatTemplate };
+  }
+});

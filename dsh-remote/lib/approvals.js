@@ -37,6 +37,12 @@ import {
 } from "./domain/approval.js";
 import { resolveContext } from "./present.js";
 
+/** 079: свежий present после /remote reload; статический — fallback. */
+function resolveContextHot(options) {
+  const active = globalThis.__dshRemotePresent;
+  return (typeof active?.resolveContext === "function" ? active.resolveContext : resolveContext)(options);
+}
+
 const noopLog = () => {};
 
 /** Имя waterfall'а DSH для подтверждений. */
@@ -536,7 +542,7 @@ export function createApprovals({
   /** Маркировка (006): роль и задача сессии. Ошибки чтения не мешают подтверждению. */
   function marksOf(sessionId) {
     try {
-      const resolved = resolveContext({ sessionId, ctx: context, log });
+      const resolved = resolveContextHot({ sessionId, ctx: context, log });
       return { role: resolved?.role ?? null, taskId: resolved?.taskId ?? null };
     } catch (error) {
       log(`подтверждение: контекст сессии не прочитан (${error?.message ?? error})`);

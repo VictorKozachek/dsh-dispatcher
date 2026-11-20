@@ -762,3 +762,16 @@ export function renderRows(question = {}, caps = {}) {
   }
   return rows.slice(0, maxOptions);
 }
+
+// 079: активный present для ответчика/команд. /remote reload загружает свежий
+// модуль, и читатели берут resolveContext/render* уже из него.
+globalThis.__dshRemotePresent = {
+  resolveContext,
+  sessionTitleFromProjection,
+  inspectSessionTitle,
+  renderBody,
+  renderRows,
+  renderHtml,
+  FREE_TEXT_OPTION,
+  MORE_OPTION,
+};

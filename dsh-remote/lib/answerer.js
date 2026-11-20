@@ -37,6 +37,12 @@ import { ANSWERED_ELSEWHERE, createBroker } from "./broker.js";
 import { createQuestions } from "./domain/question.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, resolveContext } from "./present.js";
 
+/** 079: свежий present после /remote reload; статический — fallback. */
+function resolveContextHot(options) {
+  const active = globalThis.__dshRemotePresent;
+  return (typeof active?.resolveContext === "function" ? active.resolveContext : resolveContext)(options);
+}
+
 const noopLog = () => {};
 
 /** Ошибка «вопрос снят»: DSH по аборту `signal` превращает её в `ASK_ABORTED`. */
@@ -672,7 +678,7 @@ export function createAnswerer({
     // контекста не должны мешать вопросу — тогда просто без задачи.
     let questionContext = { role: null, sessionTitle: null, taskId: null, branch: null, worktree: null };
     try {
-      const resolved = resolveContext({ sessionId, ctx: context, log, journal });
+      const resolved = resolveContextHot({ sessionId, ctx: context, log, journal });
       questionContext = {
         role: resolved.role ?? null,
         sessionTitle: resolved.sessionTitle ?? null,
