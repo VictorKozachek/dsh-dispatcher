@@ -73,11 +73,16 @@ export function readJournalEntries(logFile, {
   workspace = null,
   logger = () => {},
 } = {}) {
-  const files = [`${logFile}.1`, logFile];
-  const cutoff = now - Math.max(1, hours) * 60 * 60 * 1000;
   const entries = [];
   let skipped = 0;
   let failed = false;
+  // Путь не задан (панель собрана без журнала) — это «пока нет событий», а не
+  // ошибка чтения: нечего открывать, и падать тут нечему.
+  if (typeof logFile !== "string" || logFile.trim() === "") {
+    return { entries, skipped, files: [], unreadable: false };
+  }
+  const files = [`${logFile}.1`, logFile];
+  const cutoff = now - Math.max(1, hours) * 60 * 60 * 1000;
 
   for (const file of files) {
     let raw;

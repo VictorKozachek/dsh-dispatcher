@@ -579,6 +579,9 @@ window.__ModuleLoader__.load({
       statusLines,
       deadlineText,
       clockText,
+      // 070: блок истории вопросов — его разметку и раскрытие деталей проверяют тесты.
+      historyStatus,
+      HistoryBlock,
       createClient
     };
 
