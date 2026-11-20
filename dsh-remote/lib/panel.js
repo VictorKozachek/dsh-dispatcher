@@ -17,6 +17,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { DEFAULT_DENY_REMOTE, DEFAULT_TTL_MS as POLICY_TTL_MS, DEFAULT_TOOLS, DEFAULT_ON_TIMEOUT } from "./approvals/policy.js";
+import { HISTORY_HOURS, HISTORY_LIMIT, readQuestionHistory } from "./journal-read.js";
 
 /** Сколько строк журнала показываем: у панели мало места. */
 export const JOURNAL_TAIL = 20;
@@ -502,6 +503,9 @@ export function panelSnapshot({
   policy = null,
   logger = () => {},
   limit = JOURNAL_TAIL,
+  historyLimit = HISTORY_LIMIT,
+  historyHours = HISTORY_HOURS,
+  historyWorkspace = null,
   workspaces = undefined,
   staleMinutes = DEFAULT_STALE_MINUTES,
   includeCwd = false,
@@ -511,6 +515,14 @@ export function panelSnapshot({
   const normalized = normalizeState(state);
   const questions = sortQuestionsByDeadline(normalized.questions, ttlMs);
   const journal = readJournalTail(logFile, { limit, logger });
+  // 070: история вопросов из того же журнала; только чтение, без состояния.
+  const history = readQuestionHistory(logFile, {
+    now: now(),
+    hours: historyHours,
+    limit: historyLimit,
+    workspace: historyWorkspace,
+    logger,
+  });
   const boardData = collectBoard({
     workspaces: boardRoots({ workspaces, settings, state, includeCwd }),
     now,
@@ -529,6 +541,12 @@ export function panelSnapshot({
     journal: {
       lines: journal.lines,
       unreadable: journal.unreadable,
+    },
+    history: {
+      rows: history.rows,
+      total: history.total,
+      skipped: history.skipped,
+      unreadable: history.unreadable,
     },
     board: boardData.board,
     spend: {

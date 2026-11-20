@@ -54,6 +54,17 @@ window.__ModuleLoader__.load({
       questionsNone: "no open questions",
       journal: "journal",
       journalNone: "journal is empty",
+      history: "question history",
+      historyNone: "no events yet",
+      historySkipped: "skipped lines",
+      historyStatusQueued: "sending",
+      historyStatusDelivered: "delivered",
+      historyStatusError: "delivery error",
+      historyStatusAnswered: "answered",
+      historyStatusUnmatched: "not matched",
+      historyStatusCancelled: "closed",
+      historyStatusPairing: "pairing",
+      historyStatusPairingError: "pairing error",
       test: "Test",
       refresh: "Refresh",
       dismiss: "Dismiss",
@@ -93,6 +104,17 @@ window.__ModuleLoader__.load({
       questionsNone: "открытых вопросов нет",
       journal: "журнал",
       journalNone: "журнал пуст",
+      history: "история вопросов",
+      historyNone: "пока нет событий",
+      historySkipped: "пропущено строк",
+      historyStatusQueued: "отправляется",
+      historyStatusDelivered: "доставлен",
+      historyStatusError: "ошибка доставки",
+      historyStatusAnswered: "отвечен",
+      historyStatusUnmatched: "не сопоставлен",
+      historyStatusCancelled: "снят",
+      historyStatusPairing: "привязка",
+      historyStatusPairingError: "ошибка привязки",
       test: "Тест",
       refresh: "Обновить",
       dismiss: "Снять",
@@ -364,6 +386,10 @@ window.__ModuleLoader__.load({
         }
       }
 
+      if (snapshot && snapshot.history) {
+        children.push(h(HistoryBlock, { key: "history", history: snapshot.history, t }));
+      }
+
       const board = snapshot && snapshot.board ? snapshot.board : null;
       if (board !== null) {
         children.push(h("div", { key: "board-title", style: { marginTop: 12, fontSize: 12, color: "#64748b" } }, t("board")));
@@ -413,6 +439,72 @@ window.__ModuleLoader__.load({
       }
 
       return h("div", { style: { padding: "8px 10px", overflow: "auto", height: "100%" } }, children);
+    }
+
+    /** Статус строки истории: локализованная подпись + код/причина. */
+    function historyStatus(row, t) {
+      const keys = {
+        queued: "historyStatusQueued",
+        delivered: "historyStatusDelivered",
+        error: "historyStatusError",
+        answered: "historyStatusAnswered",
+        unmatched: "historyStatusUnmatched",
+        cancelled: "historyStatusCancelled",
+        pairing: "historyStatusPairing",
+        "pairing-error": "historyStatusPairingError",
+      };
+      const label = t(keys[row.status] || "historyStatusQueued");
+      if (row.status === "error" || row.status === "pairing-error") {
+        return row.code ? label + " (" + row.code + ")" : label;
+      }
+      if ((row.status === "unmatched" || row.status === "cancelled") && row.reason) {
+        return label + " (" + row.reason + ")";
+      }
+      return label;
+    }
+
+    /** Блок «История вопросов»: строка = вопрос, клик раскрывает детали. */
+    function HistoryBlock(props) {
+      const history = props.history;
+      const t = props.t;
+      const rows = history && Array.isArray(history.rows) ? history.rows : [];
+      const [expanded, setExpanded] = React.useState("");
+      const children = [
+        h("div", { key: "history-title", style: { marginTop: 12, fontSize: 12, color: "#64748b" } }, t("history")),
+      ];
+      if (rows.length === 0) {
+        children.push(h("div", { key: "history-none", style: { fontSize: 12, color: "#94a3b8" } }, t("historyNone")));
+      } else {
+        for (const row of rows) {
+          const open = expanded === row.key;
+          const head = clockText(row.time) + " · " + historyStatus(row, t) + " · " + (row.shortId || "—");
+          const sub = [row.project || "", row.transport || ""].filter((part) => part !== "").join(" · ");
+          const details = [];
+          if (row.transport) details.push("transport: " + row.transport);
+          if (row.messageId) details.push("messageId: " + row.messageId);
+          if (Array.isArray(row.optionIds) && row.optionIds.length > 0) details.push("optionIds: " + row.optionIds.join(", "));
+          if (Number.isFinite(row.customLength)) details.push("customLength: " + String(row.customLength));
+          if (row.code) details.push("code: " + row.code);
+          if (row.reason) details.push("reason: " + row.reason);
+          children.push(h("div", {
+            key: "history-" + row.key,
+            style: { border: "1px solid #e2e8f0", borderRadius: 6, padding: "4px 6px", marginTop: 4, fontSize: 12 },
+          },
+            h("div", {
+              style: { cursor: "pointer" },
+              onClick: () => setExpanded(open ? "" : row.key),
+            },
+              h("div", { style: { fontFamily: "monospace" } }, head),
+              sub === "" ? null : h("div", { style: { color: "#64748b" } }, sub)
+            ),
+            open ? h("div", { style: { color: "#475569", fontSize: 11, marginTop: 3 } }, details.length > 0 ? details.join(" · ") : "—") : null
+          ));
+        }
+      }
+      if (history && Number.isFinite(history.skipped) && history.skipped > 0) {
+        children.push(h("div", { key: "history-skipped", style: { fontSize: 11, color: "#b45309" } }, t("historySkipped") + ": " + String(history.skipped)));
+      }
+      return h("div", null, children);
     }
 
     /** Заголовок таба. */

@@ -144,6 +144,9 @@ export class PanelService {
         logger: this.options.logger,
         // 045: доска текущего проекта и явные корни из конфига; данные только читаются.
         includeCwd: this.options.includeCwd === true,
+        ...(typeof this.options.historyWorkspace === "string" ? { historyWorkspace: this.options.historyWorkspace } : {}),
+        ...(Number.isFinite(this.options.historyHours) ? { historyHours: this.options.historyHours } : {}),
+        ...(Number.isFinite(this.options.historyLimit) ? { historyLimit: this.options.historyLimit } : {}),
         ...(Array.isArray(this.options.workspaces) ? { workspaces: this.options.workspaces } : {}),
         ...(Number.isFinite(this.options.staleMinutes) ? { staleMinutes: this.options.staleMinutes } : {}),
         ...(typeof this.options.metrics === "function"
