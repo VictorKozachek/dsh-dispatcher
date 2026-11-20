@@ -90,8 +90,10 @@ export const approvalsFeature = {
         const current = store?.read?.()?.approvals;
         if (current === null || typeof current !== "object") return {};
         return {
+          ...(["safe", "all", "gui-only"].includes(current.mode) ? { mode: current.mode } : {}),
           ...(Array.isArray(current.tools) ? { tools: current.tools } : {}),
           ...(Array.isArray(current.denyRemote) ? { denyRemote: current.denyRemote } : {}),
+          ...(Array.isArray(current.denied) ? { denied: current.denied } : {}),
         };
       } catch (error) {
         deps.logger.warn(`approvals: переопределения политики не прочитаны (${error?.message ?? error})`);
@@ -107,6 +109,7 @@ export const approvalsFeature = {
     }
     let lastDecision = null;
     const policy = {
+      get mode() { return effectivePolicy().mode; },
       get tools() { return effectivePolicy().tools; },
       get denyRemote() { return effectivePolicy().denyRemote; },
       get ttlMs() { return effectivePolicy().ttlMs; },
@@ -118,6 +121,7 @@ export const approvalsFeature = {
       snapshot(lang) {
         const current = effectivePolicy();
         return {
+          mode: current.mode,
           tools: [...current.tools],
           denyRemote: [...current.denyRemote],
           onTimeout: current.onTimeout,
@@ -126,6 +130,15 @@ export const approvalsFeature = {
           lines: current.describe(lang),
         };
       },
+      /** 077: переключить режим safe/all/gui-only; состояние общее с allow/deny. */
+      setMode(mode) {
+        if (!["safe", "all", "gui-only"].includes(mode)) throw new TypeError(`approvals mode: неизвестный режим ${mode}`);
+        if (store === null || typeof store?.setApprovals !== "function") {
+          throw new Error("approvals: состояние недоступно — изменить режим нельзя");
+        }
+        store.setApprovals({ mode });
+        return mode;
+      },
       /** 074: явно разрешить инструмент удалённо (убирает denyRemote-запись). */
       allow(tool) {
         const name = String(tool ?? "").trim();
@@ -133,10 +146,11 @@ export const approvalsFeature = {
         const current = effectivePolicy();
         const tools = [...new Set([...current.tools, name])];
         const denyRemote = current.denyRemote.filter((item) => item !== name);
+        const denied = (current.denied ?? []).filter((item) => item !== name);
         if (store === null || typeof store?.setApprovals !== "function") {
           throw new Error("approvals: состояние недоступно — изменить политику нельзя");
         }
-        store.setApprovals({ tools, denyRemote });
+        store.setApprovals({ mode: current.mode, tools, denyRemote, denied });
         return { tool: name, tools, denyRemote };
       },
       /** 074: вернуть инструмент в GUI-only. */
@@ -145,11 +159,12 @@ export const approvalsFeature = {
         if (name === "") throw new TypeError("approvals deny: нужен инструмент");
         const current = effectivePolicy();
         const denyRemote = [...new Set([...current.denyRemote, name])];
+        const denied = [...new Set([...(current.denied ?? []), name])];
         const tools = current.tools.filter((item) => item !== name);
         if (store === null || typeof store?.setApprovals !== "function") {
           throw new Error("approvals: состояние недоступно — изменить политику нельзя");
         }
-        store.setApprovals({ tools, denyRemote });
+        store.setApprovals({ mode: current.mode, tools, denyRemote, denied });
         return { tool: name, tools, denyRemote };
       },
     };

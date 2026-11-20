@@ -68,7 +68,9 @@ function scriptedAsk(answers) {
   return {
     ask: async (request) => {
       const item = request.questions[0];
-      const answer = answers[item.id];
+      const answer = answers[item.id] ?? (item.id === "remote-connect-approvals"
+        ? { selected: ["Только безопасные (по умолчанию)"] }
+        : undefined);
       if (answer === undefined) throw new Error(`нет сценария для ${item.id}`);
       return {
         answers: [{

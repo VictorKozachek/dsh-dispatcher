@@ -719,8 +719,12 @@ export function createStore({
     return update((state) => {
       const current = state.approvals !== null && typeof state.approvals === "object" ? state.approvals : {};
       state.approvals = {
+        mode: patch.mode === undefined
+          ? (["safe", "all", "gui-only"].includes(current.mode) ? current.mode : "safe")
+          : (["safe", "all", "gui-only"].includes(patch.mode) ? patch.mode : "safe"),
         tools: patch.tools === undefined ? (current.tools ?? null) : (Array.isArray(patch.tools) ? [...patch.tools] : null),
         denyRemote: patch.denyRemote === undefined ? (current.denyRemote ?? null) : (Array.isArray(patch.denyRemote) ? [...patch.denyRemote] : null),
+        denied: patch.denied === undefined ? (Array.isArray(current.denied) ? [...current.denied] : []) : (Array.isArray(patch.denied) ? [...patch.denied] : []),
       };
       return state;
     });
@@ -932,12 +936,16 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT, pendi
     },
     mirror: { enabled: value.mirror?.enabled === true },
     approvals: {
+      mode: ["safe", "all", "gui-only"].includes(value.approvals?.mode) ? value.approvals.mode : "safe",
       tools: Array.isArray(value.approvals?.tools)
         ? [...new Set(value.approvals.tools.filter((item) => typeof item === "string" && item.trim() !== "").map((item) => item.trim()))]
         : null,
       denyRemote: Array.isArray(value.approvals?.denyRemote)
         ? [...new Set(value.approvals.denyRemote.filter((item) => typeof item === "string" && item.trim() !== "").map((item) => item.trim()))]
         : null,
+      denied: Array.isArray(value.approvals?.denied)
+        ? [...new Set(value.approvals.denied.filter((item) => typeof item === "string" && item.trim() !== "").map((item) => item.trim()))]
+        : [],
     },
     recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
     pending: Array.isArray(value.pending) ? value.pending.slice(-Math.max(0, pendingLimit)) : [],

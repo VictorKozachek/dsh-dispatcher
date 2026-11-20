@@ -117,6 +117,7 @@ test("toolNameOf понимает формы запроса DSH", () => {
 test("describePolicy перечисляет списки и onTimeout для /remote status", () => {
   const lines = describePolicy(createApprovalPolicy({ tools: ["read_file"], denyRemote: ["bash"], onTimeout: "unavailable", ttlMs: 5 * 60 * 1000 }));
   assert.deepEqual(lines, [
+    "approvals: режим=safe",
     "approvals: tools=[read_file]",
     "approvals: denyRemote=[bash]",
     "approvals: onTimeout=unavailable (отказ), ttl=5 мин",
@@ -132,4 +133,20 @@ test("createApprovalPolicy связывает решение, таймаут и 
   assert.equal(policy.decide({ toolName: "write_file" }).remote, false);
   assert.equal(policy.timeoutOutcome(), "cancelled");
   assert.match(policy.describe().join("\n"), /ttl=2 мин/);
+});
+
+
+test("077: mode all/gui-only и deny сильнее all", () => {
+  const all = createApprovalPolicy({ mode: "all", tools: ["read_file"], denyRemote: ["git_push"], denied: ["git_push"] });
+  assert.equal(all.decide({ toolName: "bash" }).remote, true);
+  assert.equal(all.decide({ toolName: "write_file" }).remote, true);
+  assert.equal(all.decide({ toolName: "git_push" }).remote, false, "denyRemote сильнее all");
+  assert.match(all.describe().join("\n"), /режим=all.*ВНИМАНИЕ/);
+
+  const gui = createApprovalPolicy({ mode: "gui-only" });
+  assert.equal(gui.decide({ toolName: "read_file" }).remote, false);
+  assert.equal(gui.decide({ toolName: "read_file" }).reason, "mode-gui-only");
+  assert.equal(gui.decide({ toolName: "bash" }).remote, false);
+
+  assert.equal(createApprovalPolicy({}).mode, "safe", "дефолт safe");
 });

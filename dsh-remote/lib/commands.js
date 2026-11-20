@@ -638,6 +638,28 @@ export function createRemoteCommands({
   }
 
   /**
+   * 077: один вопрос онбординга про удалённые подтверждения. Для уже
+   * подключённого бота не спрашиваем — режим меняется командой.
+   */
+  async function askApprovalMode(invocation) {
+    if (store.read().bindings !== null) return null;
+    const answer = await askStep(invocation, {
+      id: "remote-connect-approvals",
+      question: tx("commands.connect.approvalsQuestion"),
+      options: [
+        tx("commands.connect.approvalsAll"),
+        tx("commands.connect.approvalsSafe"),
+        tx("commands.connect.approvalsGuiOnly"),
+      ],
+    });
+    const selected = String(answer.selected[0] ?? "").toLowerCase();
+    const labels = (key) => [t(key, {}, "ru"), t(key, {}, "en")].map((label) => label.toLowerCase());
+    if (labels("commands.connect.approvalsAll").includes(selected)) return "all";
+    if (labels("commands.connect.approvalsGuiOnly").includes(selected)) return "gui-only";
+    return "safe";
+  }
+
+  /**
    * Остановить каналы конкретного транспорта (038): фасад, если в нём он, и
    * каналы из реестра 012. Другие транспорты не трогаем — ими управляет их
    * фича/конфиг, а не переключение привязки.
@@ -765,6 +787,7 @@ export function createRemoteCommands({
       options: [tx("commands.connectRelay.9"), tx("commands.connectRelay.10"), tx("commands.connectRelay.11")],
     });
     const scope = planConnectScope(scopeAnswer, invocation);
+    const approvalMode = await askApprovalMode(invocation);
     // 038: прежний канал отключаем ДО записи новой привязки.
     const retired = await retireActiveChannel("relay");
     try {
@@ -778,6 +801,7 @@ export function createRemoteCommands({
         };
         if (scope.plan?.kind === "global") state.enabled.global = true;
         if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
+        if (approvalMode !== null) state.approvals = { ...(state.approvals ?? {}), mode: approvalMode };
         return state;
       });
     } catch (error) {
@@ -942,6 +966,7 @@ export function createRemoteCommands({
       options: [tx("commands.connectMax.19"), tx("commands.connectMax.20"), tx("commands.connectMax.21")],
     });
     const scope = planConnectScope(scopeAnswer, invocation);
+    const approvalMode = await askApprovalMode(invocation);
     // 038: прежний канал отключаем ДО записи новой привязки.
     const retired = await retireActiveChannel("max");
     try {
@@ -957,6 +982,7 @@ export function createRemoteCommands({
         };
         if (scope.plan?.kind === "global") state.enabled.global = true;
         if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
+        if (approvalMode !== null) state.approvals = { ...(state.approvals ?? {}), mode: approvalMode };
         return state;
       });
     } catch (error) {
@@ -1062,6 +1088,7 @@ export function createRemoteCommands({
       });
 
       const scope = planConnectScope(scopeAnswer, invocation);
+      const approvalMode = await askApprovalMode(invocation);
       // 038: прежний канал отключаем ДО записи новой привязки.
       const retired = await retireActiveChannel("telegram");
       try {
@@ -1076,6 +1103,7 @@ export function createRemoteCommands({
           };
           if (scope.plan?.kind === "global") state.enabled.global = true;
           if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
+          if (approvalMode !== null) state.approvals = { ...(state.approvals ?? {}), mode: approvalMode };
           return state;
         });
       } catch (error) {
@@ -1274,6 +1302,23 @@ export function createRemoteCommands({
     };
     if (action === "" || action === "show" || action === "list") {
       return success(show());
+    }
+    if (action === "mode") {
+      const value = Array.isArray(rest) && rest.length > 1 ? String(rest[1]).trim().toLowerCase() : "";
+      if (!["safe", "all", "gui-only"].includes(value)) return failure(tx("commands.approvals.modeUsage"));
+      try {
+        policy.setMode(value);
+      } catch (error) {
+        return failure(`/remote approvals mode ${value}: ${humanError(error)}`);
+      }
+      try {
+        journalService()?.record?.("approvals.mode", { detail: { mode: value } });
+      } catch (error) {
+        log(`approvals.mode: journal record failed (${error?.message ?? error})`);
+      }
+      const lines = [show(), tx("commands.approvals.modeSet", { p0: value })];
+      if (value === "all") lines.push(tx("commands.approvals.modeWarning"));
+      return success(lines.join("\n"));
     }
     if (action !== "allow" && action !== "deny") {
       return failure(tx("commands.approvals.usage") + "\n" + tx("commands.approvals.unknown", { p0: action }));
