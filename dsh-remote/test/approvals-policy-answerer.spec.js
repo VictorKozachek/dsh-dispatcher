@@ -560,3 +560,58 @@ test("077: mode all отправляет bash, gui-only не отправляе�
   assert.equal(gui.transport.sent.length, 0, "gui-only ничего не отправляет");
   assert.equal(nextCalls.length, 1);
 });
+
+test("080: шапка подтверждения — имя сессии из проекции, иначе пресет", async (t) => {
+  const { renderBody } = await import("../lib/present.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-approval-title-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, "storages", "session_projcache", "sessions");
+  fs.mkdirSync(dir, { recursive: true });
+  const agentId = "session-8aac9774-1111";
+  fs.writeFileSync(path.join(dir, `${agentId}.json`), JSON.stringify({ record: { rows: { title: { val: "Оркестратор" } } } }));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const transport = fakeTransport();
+    const handlers = [];
+    const ctx = {
+      on: (event, handler) => { handlers.push({ event, handler }); return () => {}; },
+      get: (name) => (name === "sessions" ? { get: () => ({ header: { cwd: "/p/project", agentPreset: "standard" } }) } : null),
+      provide: () => {},
+      onDispose: () => {},
+    };
+    const approvals = createApprovals({
+      transport,
+      registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+      policy: createApprovalPolicy(null),
+      log: () => {},
+      now: () => 1_700_000_000_000,
+    });
+    approvals.attach(ctx);
+    const handler = handlers.find((item) => item.event === APPROVAL_REQUEST_EVENT)?.handler;
+    assert.equal(typeof handler, "function");
+    const pending = handler(request({ agent: { id: agentId }, toolName: "read_file" }), async () => "gui");
+    await tick();
+    assert.equal(transport.sent.length, 1);
+    const payload = renderBody(transport.sent[0], { maxText: 4096 });
+    assert.match(payload, /Оркестратор/, "в шапке имя сессии");
+    assert.doesNotMatch(payload, /· standard ·/, "пресет не подменяет имя");
+    transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
+    await pending;
+
+    // Без файла проекции — прежний пресет.
+    fs.rmSync(path.join(dir, `${agentId}.json`));
+    const pending2 = handler(request({ agent: { id: agentId }, toolName: "read_file" }), async () => "gui");
+    await tick();
+    const payload2 = renderBody(transport.sent[1], { maxText: 4096 });
+    assert.match(payload2, /· standard ·/, "без имени — пресет");
+    transport.answer({ shortId: transport.sent[1].shortId, optionIds: ["o1"] });
+    await pending2;
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  }
+});

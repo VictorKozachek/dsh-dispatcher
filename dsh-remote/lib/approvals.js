@@ -543,7 +543,14 @@ export function createApprovals({
   function marksOf(sessionId) {
     try {
       const resolved = resolveContextHot({ sessionId, ctx: context, log });
-      return { role: resolved?.role ?? null, taskId: resolved?.taskId ?? null };
+      // 080: весь контекст, а не список (как 078): sessionTitle иначе теряется.
+      return {
+        role: resolved?.role ?? null,
+        sessionTitle: resolved?.sessionTitle ?? null,
+        taskId: resolved?.taskId ?? null,
+        branch: resolved?.branch ?? null,
+        worktree: resolved?.worktree ?? null,
+      };
     } catch (error) {
       log(`подтверждение: контекст сессии не прочитан (${error?.message ?? error})`);
       return { role: null, taskId: null };
@@ -580,8 +587,7 @@ export function createApprovals({
     const approval = new RemoteApproval(request, {
       sessionId,
       workspace,
-      role: marks.role,
-      taskId: marks.taskId,
+      ...marks,
       chatId: channel.chatId,
       threadId: channel.threadId,
       now: now(),
