@@ -150,3 +150,20 @@ test("077: mode all/gui-only и deny сильнее all", () => {
 
   assert.equal(createApprovalPolicy({}).mode, "safe", "дефолт safe");
 });
+
+test("077: явный denyRemote (state 074/конфиг) сильнее mode all", () => {
+  const legacyState = createApprovalPolicy({ mode: "all", tools: [], denyRemote: ["bash"], denied: [] });
+  assert.equal(legacyState.decide({ toolName: "bash" }).remote, false, "старый явный deny bash сохраняет силу");
+  assert.equal(legacyState.decide({ toolName: "shell" }).remote, true, "остальное в all разрешено");
+
+  const fromConfig = createApprovalPolicy({ mode: "all", denyRemote: ["write_file"] });
+  assert.equal(fromConfig.decide({ toolName: "write_file" }).remote, false, "конфигный явный denyRemote тоже сильнее all");
+  assert.equal(fromConfig.decide({ toolName: "bash" }).remote, true, "дефолтный denyRemote в all не блокирует");
+});
+
+test("077: gui-only даёт reason mode-gui-only даже для bash", () => {
+  const policy = createApprovalPolicy({ mode: "gui-only" });
+  const decision = policy.decide({ toolName: "bash" });
+  assert.equal(decision.remote, false);
+  assert.equal(decision.reason, "mode-gui-only");
+});

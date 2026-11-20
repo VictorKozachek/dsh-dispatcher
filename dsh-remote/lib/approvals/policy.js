@@ -116,6 +116,9 @@ export function normalizePolicy(config, { log = noopLog } = {}) {
     tools: tools ?? [...DEFAULT_TOOLS],
     denyRemote: denyRemote ?? [...DEFAULT_DENY_REMOTE],
     denied: denied ?? [],
+    // 077: отличать явный denyRemote (state 074/конфиг) от дефолтного: в mode
+    // all игнорируется только дефолт, явный запрет сильнее all.
+    denyRemoteExplicit: section.denyRemote !== undefined,
     onTimeout,
     ttlMs,
   };
@@ -148,22 +151,24 @@ export function decide(policy, request) {
       message: "инструмент не указан — подтверждение только в GUI",
     };
   }
-  const explicitDeny = (policy?.denied ?? []).includes(toolName);
-  const defaultDeny = policy?.mode === "all" ? false : (policy?.denyRemote ?? []).includes(toolName);
-  if (explicitDeny || defaultDeny) {
-    return {
-      remote: false,
-      reason: "deny-remote",
-      toolName,
-      message: `${toolName} в denyRemote — подтверждение только в GUI`,
-    };
-  }
   if (policy?.mode === "gui-only") {
     return {
       remote: false,
       reason: "mode-gui-only",
       toolName,
       message: "режим gui-only — подтверждение только в GUI",
+    };
+  }
+  const denyRemote = policy?.denyRemote ?? [];
+  const explicitDeny = (policy?.denied ?? []).includes(toolName)
+    || (policy?.denyRemoteExplicit === true && denyRemote.includes(toolName));
+  const defaultDeny = policy?.mode === "all" ? false : denyRemote.includes(toolName);
+  if (explicitDeny || defaultDeny) {
+    return {
+      remote: false,
+      reason: "deny-remote",
+      toolName,
+      message: `${toolName} в denyRemote — подтверждение только в GUI`,
     };
   }
   if (policy?.mode === "all") {
