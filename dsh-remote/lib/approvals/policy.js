@@ -19,7 +19,13 @@
  * публикацией в канал, а при таймауте берёт `timeoutOutcome()`.
  */
 
-import { DEFAULT_LANG, normalizeLang, t } from "../i18n.js";
+import { DEFAULT_LANG, normalizeLang, t as baseT } from "../i18n.js";
+
+/** 079: тексты политики читают горячий словарь (см. present.js). */
+function t(key, params = {}, lang = DEFAULT_LANG) {
+  const active = globalThis.__dshRemoteI18n;
+  return (typeof active?.t === "function" ? active.t : baseT)(key, params, lang);
+}
 
 /** Инструменты, которые по умолчанию можно подтверждать удалённо. */
 export const DEFAULT_TOOLS = Object.freeze([
