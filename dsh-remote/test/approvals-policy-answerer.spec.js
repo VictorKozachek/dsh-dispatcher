@@ -529,6 +529,8 @@ test("074: allow из политики снимает denyRemote и подтве
   assert.equal(transport.sent.length, 1, "после allow bash ушёл в канал");
   transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
   assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+  assert.equal(policy.last.reason, "allowed", "последнее решение — удалённое allowed");
+  assert.equal(policy.last.decision, "remote");
 
   policy.deny("bash");
   assert.equal(policy.decide(request({ toolName: "bash" })).remote, false);

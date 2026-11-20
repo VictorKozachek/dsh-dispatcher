@@ -28,7 +28,7 @@ import { fileURLToPath } from "node:url";
 
 import { createRegistry } from "./domain/registry.js";
 import { detectMirrorMode } from "./answerer.js";
-import { DEFAULT_DENY_REMOTE } from "./approvals/policy.js";
+import { DEFAULT_DENY_REMOTE, DEFAULT_TOOLS } from "./approvals/policy.js";
 import { STATE_VERSION, credentialRef, createCredentialAccess } from "./store.js";
 import {
   buildReport,
@@ -1280,7 +1280,8 @@ export function createRemoteCommands({
     }
     const tool = Array.isArray(rest) && rest.length > 1 ? String(rest[1]).trim() : "";
     if (tool === "") return failure(tx("commands.approvals.usage"));
-    if (action === "allow" && DEFAULT_DENY_REMOTE.includes(tool) && !flags?.has?.("force")) {
+    const dangerous = !DEFAULT_TOOLS.includes(tool);
+    if (action === "allow" && dangerous && !flags?.has?.("force")) {
       return failure(tx("commands.approvals.force", { p0: tool }));
     }
     try {
@@ -1291,7 +1292,7 @@ export function createRemoteCommands({
     }
     const lines = [show()];
     lines.push(tx(action === "allow" ? "commands.approvals.allowed" : "commands.approvals.denied", { p0: tool }));
-    if (action === "allow" && DEFAULT_DENY_REMOTE.includes(tool)) {
+    if (action === "allow" && dangerous) {
       lines.push(tx("commands.approvals.warnDanger", { p0: tool }));
     }
     return success(lines.join("\n"));

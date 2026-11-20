@@ -85,6 +85,8 @@ export function createApprovals({
   policy = null,
   /** Колбэк аудита решений политики (026): {type, toolName, reason, at}. */
   onDecision = null,
+  /** 074: последнее решение по подтверждению (включая remote/timeout) для статуса. */
+  onLastDecision = null,
   /** Исход по таймауту: `cancelled` (по умолчанию) или `unavailable`; никогда `allowed-once`. */
   onTimeout = null,
   setTimeout: setTimeoutImpl = setTimeout,
@@ -481,8 +483,7 @@ export function createApprovals({
    * ответа (аборт запроса; TTL-политика — задача 025).
    */
   function record(approval, { outcome, decision, channel = null, chatId = null, answeredBy = null, reason = null }) {
-    if (audit === null) return;
-    audit.append({
+    const entry = {
       kind: "approval",
       questionId: approval.id,
       toolName: approval.toolName,
@@ -496,7 +497,25 @@ export function createApprovals({
       waitedMs: Math.max(0, now() - approval.createdAt),
       decision,
       ...(reason === null ? {} : { reason }),
-    });
+    };
+    if (audit !== null) audit.append(entry);
+    // 074: «последнее решение» включает и удалённый ответ, и таймаут — иначе
+    // status навсегда показывает старую policy-GUI причину.
+    if (typeof onLastDecision === "function") {
+      try {
+        onLastDecision({
+          type: "approval",
+          decision,
+          toolName: approval.toolName,
+          reason: reason ?? (decision === "remote" ? "allowed" : decision),
+          outcome,
+          at: now(),
+          sessionId: approval.sessionId ?? null,
+        });
+      } catch (error) {
+        log(`подтверждение ${approval.toolName}: last-decision не записан (${error?.message ?? error})`);
+      }
+    }
   }
 
   function statsFor(outcome) {

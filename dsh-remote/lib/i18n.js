@@ -105,7 +105,8 @@ const dictionariesBase = Object.freeze({
     "commands.status.mode": "режим: {scope}",
     "commands.status.effective": "эффективно: {state}",
     "commands.status.approvals": "approvals: политика не загружена — удалённые подтверждения только в GUI",
-  }),  en: Object.freeze({
+  }),
+  en: Object.freeze({
     "present.freeTextLabel": "Other answer…",
     "present.freeTextHint": "↩︎ Reply to this message with text.",
     "present.mirrorNotifyHint": "🪞 Answer in the GUI (or tap a button) — this message is a notification.",

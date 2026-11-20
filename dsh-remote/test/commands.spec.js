@@ -1954,6 +1954,10 @@ test("074: allow bash требует --force, изменяет политику 
   assert.deepEqual(calls, [["allow", "bash"]]);
   assert.match(allowed.text, /теперь можно подтвердить с телефона/);
 
+  const writeWithoutForce = await remote.handler({ rawInput: "approvals allow write_file" });
+  assert.equal(writeWithoutForce.kind, "error", "write_file тоже опасен");
+  assert.match(writeWithoutForce.text, /--force/);
+
   const denied = await remote.handler({ rawInput: "approvals deny bash" });
   assert.equal(denied.kind, "success");
   assert.deepEqual(calls.at(-1), ["deny", "bash"]);

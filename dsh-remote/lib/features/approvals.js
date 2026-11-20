@@ -177,6 +177,7 @@ export const approvalsFeature = {
       channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
       policy,
       onDecision: (record) => { lastDecision = record; },
+      onLastDecision: (record) => { lastDecision = record; },
       ttlMs: policy.ttlMs,
       onTimeout: () => policy.timeoutOutcome(),
       log: (message) => deps.logger.debug(message),
