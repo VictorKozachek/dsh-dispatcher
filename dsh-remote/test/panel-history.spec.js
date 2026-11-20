@@ -1,8 +1,9 @@
 /**
  * Панель: история вопросов из журнала (задача 070).
  *
- * Журнал читается как есть (JSONL + `.1`), события склеиваются по shortId;
- * проверяем статусы, битые строки, ротацию, фильтры и отсутствие секретов.
+ * Журнал читается как есть (JSONL + все ротации `.N`), события склеиваются по
+ * shortId; проверяем статусы (в т.ч. на реальном образце журнала), битые строки,
+ * ротацию и отсутствие секретов.
  */
 
 import test from "node:test";
@@ -38,7 +39,7 @@ function writeLog(file, lines, { rotate = false } = {}) {
   else fs.writeFileSync(file, lines.join("\n") + "\n");
 }
 
-function snapshot(t, { lines = [], rotate = false, historyWorkspace = null } = {}) {
+function snapshot(t, { lines = [], rotate = false } = {}) {
   const dir = tempDir(t);
   const logFile = path.join(dir, "log.jsonl");
   if (lines.length > 0) writeLog(logFile, lines, { rotate });
@@ -46,7 +47,6 @@ function snapshot(t, { lines = [], rotate = false, historyWorkspace = null } = {
     stateFile: path.join(dir, "state.json"),
     logFile,
     now: () => NOW,
-    historyWorkspace,
     workspaces: [],
   });
 }
@@ -93,17 +93,37 @@ test("070: send→sent→received — статус «отвечен» и дет�
   assert.equal(row.transport, "max");
 });
 
-test("070: send→error — «ошибка доставки» с кодом", (t) => {
+test("070: send→error — код берётся из status, когда code пуст (живая форма)", (t) => {
+  // answerer.js пишет для ошибок транспорта `code: ""` и числовой `status`:
+  // панель не должна показывать «ошибка доставки ()».
   const snap = snapshot(t, {
     lines: [
       line("question.send", { shortId: SHORT, transport: "max" }),
-      line("question.error", { shortId: SHORT, transport: "max", detail: { status: 400, code: "proto.payload", message: "too long" } }),
+      line("question.error", {
+        shortId: SHORT,
+        transport: "max",
+        detail: { status: 400, code: "", message: "Bad Request: message is too long" },
+      }),
     ],
   });
   const row = snap.history.rows[0];
   assert.equal(row.status, "error");
-  assert.equal(row.code, "proto.payload");
-  assert.match(row.statusText, /ошибка доставки \(proto\.payload\)/);
+  assert.equal(row.code, "400", "пустой code заменён status");
+  assert.equal(row.statusText, "ошибка доставки (400)");
+  assert.equal(JSON.stringify(snap.history).includes("too long"), false, "текст ошибки не утекает");
+});
+
+test("070: ошибка без кода и статуса — без пустых скобок", (t) => {
+  const snap = snapshot(t, {
+    lines: [
+      line("question.send", { shortId: SHORT, transport: "max" }),
+      line("question.error", { shortId: SHORT, transport: "max", detail: { status: 0, code: "" } }),
+    ],
+  });
+  const row = snap.history.rows[0];
+  assert.equal(row.status, "error");
+  assert.equal(row.code, null, "status:0 — «кода нет», а не «(0)»");
+  assert.equal(row.statusText, "ошибка доставки");
 });
 
 test("070: received→unmatched — причина несовпадения", (t) => {
@@ -120,27 +140,82 @@ test("070: received→unmatched — причина несовпадения", (t
   assert.match(row.statusText, /не сопоставлен \(optionId\)/);
 });
 
-test("070: answer.dropped — «снят» с причиной", (t) => {
+test("070: answer.dropped не понижает отвеченный вопрос — пометка «повторный клик»", (t) => {
+  // Живой сценарий: ответ дошёл (from_transport delivered=tool-result), вопрос
+  // закрыт answered-in-messenger, а следом — dropped от повторного клика в GUI.
+  // Раньше последний dropped давал «снят (already-answered)» — это было враньё.
   const snap = snapshot(t, {
     lines: [
       line("question.send", { shortId: SHORT, transport: "max" }),
-      line("answer.dropped", { shortId: SHORT, transport: "max", detail: { reason: "ttl" } }),
+      line("question.sent", { shortId: SHORT, transport: "max", detail: { messageId: "mid.1" } }),
+      line("answer.received", { shortId: SHORT, transport: "max", detail: { optionIds: ["o1"], customLength: 0 } }),
+      line("answer.from_transport", { shortId: SHORT, transport: "max", detail: { mode: "notify", delivered: "tool-result" } }),
+      line("question.closed", { shortId: SHORT, transport: "max", detail: { reason: "answered-in-messenger" } }),
+      line("answer.dropped", { shortId: SHORT, detail: { reason: "already-answered", source: "gui" } }),
     ],
   });
-  assert.equal(snap.history.rows[0].status, "cancelled");
-  assert.match(snap.history.rows[0].statusText, /снят \(ttl\)/);
+  const row = snap.history.rows[0];
+  assert.equal(row.status, "answered", "dropped не превращает ответ в «снят»");
+  assert.equal(row.statusText, "отвечен");
+  assert.deepEqual(row.note, { code: "repeat", reason: "already-answered" });
+  assert.equal(row.messageId, "mid.1", "детали доставки сохранены");
 });
 
-test("070: ротация читается — старый .1 и новый файл склеиваются", (t) => {
+test("070: answer.dropped(notify) — «отвечен» с пометкой, а не «снят»", (t) => {
+  const snap = snapshot(t, {
+    lines: [
+      line("question.send", { shortId: SHORT, transport: "max" }),
+      line("question.sent", { shortId: SHORT, transport: "max", detail: { messageId: "mid.9" } }),
+      line("answer.received", { shortId: SHORT, transport: "max", detail: { optionIds: ["o1"] } }),
+      line("answer.dropped", { shortId: SHORT, transport: "max", detail: { reason: "notify" } }),
+    ],
+  });
+  const row = snap.history.rows[0];
+  assert.equal(row.status, "answered");
+  assert.deepEqual(row.note, { code: "dropped", reason: "notify" });
+});
+
+test("070: «снят» — только question.closed с причиной снятия/аборта", (t) => {
+  const aborted = snapshot(t, {
+    lines: [
+      line("question.send", { shortId: SHORT, transport: "max" }),
+      line("question.sent", { shortId: SHORT, transport: "max", detail: { messageId: "mid.1" } }),
+      line("question.closed", { shortId: SHORT, transport: "max", detail: { reason: "aborted" } }),
+    ],
+  });
+  assert.equal(aborted.history.rows[0].status, "cancelled");
+  assert.equal(aborted.history.rows[0].statusText, "снят (aborted)");
+
+  const expired = snapshot(t, {
+    lines: [
+      line("question.send", { shortId: SHORT, transport: "max" }),
+      line("answer.received", { shortId: SHORT, transport: "max", detail: { optionIds: ["o1"] } }),
+      line("question.closed", { shortId: SHORT, transport: "max", detail: { reason: "expired" } }),
+    ],
+  });
+  assert.equal(expired.history.rows[0].status, "cancelled", "TTL без принятого ответа — «снят»");
+  assert.equal(expired.history.rows[0].statusText, "снят (expired)");
+});
+
+test("070: ротация читается — все .N от старых к новым, затем сам журнал", (t) => {
+  // rotate.js держит .1…DEFAULT_KEEP(5); читать только .1 значило бы терять
+  // часть окна 24 часов на большом журнале.
   const dir = tempDir(t);
   const file = path.join(dir, "log.jsonl");
-  fs.writeFileSync(`${file}.1`, line("question.send", { shortId: SHORT, transport: "telegram" }) + "\n");
+  const older = { ts: new Date(NOW - 3 * HOUR).toISOString() };
+  const newer = { ts: new Date(NOW - HOUR).toISOString() };
+  fs.writeFileSync(`${file}.2`, line("question.send", { ...older, shortId: "old00002", transport: "telegram" }) + "\n");
+  fs.writeFileSync(`${file}.1`, line("question.send", { ...newer, shortId: SHORT, transport: "telegram" }) + "\n");
   fs.writeFileSync(file, line("question.sent", { shortId: SHORT, transport: "telegram", detail: { messageId: "old-1" } }) + "\n");
+
   const read = readJournalEntries(file, { now: NOW });
-  assert.equal(read.entries.length, 2);
-  assert.equal(read.entries[0].event, "question.send");
-  assert.equal(read.entries[1].event, "question.sent");
-  assert.equal(read.files.includes(`${file}.1`), true);
+  assert.equal(read.entries.length, 3);
+  assert.deepEqual(read.files, [`${file}.2`, `${file}.1`, file], "порядок: старые ротации → свежие → текущий");
+  assert.deepEqual(read.entries.map((entry) => entry.event), ["question.send", "question.send", "question.sent"]);
+
+  const history = buildQuestionHistory(read.entries, {});
+  const ids = history.rows.map((row) => row.shortId).sort();
+  assert.deepEqual(ids, [SHORT, "old00002"], "вопросы из .2 и .1 оба видны");
 });
 
 test("070: фильтр по времени — старые события не попадают", (t) => {
@@ -152,15 +227,17 @@ test("070: фильтр по времени — старые события не
   assert.deepEqual(snap.history.rows.map((row) => row.shortId), [SHORT]);
 });
 
-test("070: фильтр по проекту", (t) => {
+test("070: проект в журнале не пишется — фильтра по проекту нет, строки без проекта", (t) => {
+  // 051 не пишет project/workspace: фильтр по проекту был бы no-op. Проверяем
+  // честное поведение — оба вопроса видны, project: null, чат не выдаёт проект.
   const snap = snapshot(t, {
     lines: [
-      line("question.send", { shortId: "aaa11111", transport: "max", detail: { workspace: "/p/one", chatId: 1 } }),
-      line("question.send", { shortId: "bbb22222", transport: "max", detail: { workspace: "/p/two", chatId: 2 } }),
+      line("question.send", { ts: new Date(NOW - HOUR).toISOString(), shortId: "aaa11111", transport: "max", detail: { chatId: 1 } }),
+      line("question.send", { shortId: "bbb22222", transport: "max", detail: { chatId: 2 } }),
     ],
-    historyWorkspace: "/p/one",
   });
-  assert.deepEqual(snap.history.rows.map((row) => row.shortId), ["aaa11111"]);
+  assert.deepEqual(snap.history.rows.map((row) => row.shortId), ["bbb22222", "aaa11111"]);
+  assert.deepEqual(snap.history.rows.map((row) => row.project), [null, null]);
 });
 
 test("070: в историю не попадают токены и текст ответа", (t) => {
@@ -264,9 +341,11 @@ test("070: служебные события не сбрасывают стат�
       line("answer.received", { shortId: SHORT, transport: "max", detail: { optionIds: ["o1"] } }),
       line("answer.duplicate", { shortId: SHORT, transport: "max", detail: { reason: "duplicate" } }),
       line("question.expired", { shortId: SHORT }),
+      line("question.error", { shortId: SHORT, detail: { status: "close-failed", message: "message can't be edited" } }),
     ],
   });
-  assert.equal(snap.history.rows[0].status, "answered");
+  assert.equal(snap.history.rows[0].status, "answered", "ошибка закрытия — не ошибка доставки");
+  assert.deepEqual(snap.history.rows[0].note, { code: "close", reason: "close-failed" });
 });
 
 /** Словарь подписей панели (как в `client.js`, русская локаль). */
@@ -282,6 +361,9 @@ const RU = {
   historyStatusCancelled: "снят",
   historyStatusPairing: "привязка",
   historyStatusPairingError: "ошибка привязки",
+  historyNoteRepeat: "был повторный клик",
+  historyNoteDropped: "ответ отброшен",
+  historyNoteClose: "сообщение не снято",
 };
 const t = (key) => RU[key] ?? key;
 
@@ -441,4 +523,87 @@ test("070: подписи статусов блока истории", () => {
   assert.equal(historyStatus({ status: "unmatched", reason: "shortId" }, t), "не сопоставлен (shortId)");
   assert.equal(historyStatus({ status: "cancelled", reason: "ttl" }, t), "снят (ttl)");
   assert.equal(historyStatus({ status: "cancelled" }, t), "снят");
+});
+
+/** Реальный образец журнала (обезличенный): окно 24 ч с живой машины 20.11. */
+const FIXTURE = path.join(here, "snapshots", "journal-real-sample.jsonl");
+const FIXTURE_NOW = Date.UTC(2026, 10, 20, 15, 6, 0);
+
+test("070: реальный образец журнала — 4 строки окна, ни одна не «снят»", (t) => {
+  const read = readJournalEntries(FIXTURE, { now: FIXTURE_NOW });
+  assert.equal(read.skipped, 0);
+  assert.equal(read.entries.length, 23, "все строки образца разобрались");
+  const history = buildQuestionHistory(read.entries, {});
+  assert.equal(history.rows.length, 4);
+  assert.deepEqual(
+    history.rows.map((row) => row.shortId),
+    ["408a0d3a", "f70c5ea9", "e1665bf0", "2f52c1c8"],
+    "свежие сверху",
+  );
+  assert.equal(history.rows.some((row) => row.status === "cancelled"), false, "живые ответы больше не «снят»");
+
+  // 408a0d3a: ответ дошёл (from_transport delivered=tool-result), закрыт
+  // answered-in-messenger; последний dropped — повторный клик в GUI.
+  const answered = history.rows[0];
+  assert.equal(answered.status, "answered");
+  assert.equal(answered.statusText, "отвечен");
+  assert.deepEqual(answered.note, { code: "repeat", reason: "already-answered" });
+  assert.equal(answered.messageId, "mid.sample-408a0d3a");
+  assert.deepEqual(answered.optionIds, ["o1"]);
+  assert.equal(answered.customLength, 0);
+
+  // Три notify-вопроса: ответ пришёл и отброшен в пользу GUI — это не «снят».
+  for (const row of history.rows.slice(1)) {
+    assert.equal(row.status, "answered");
+    assert.deepEqual(row.note, { code: "dropped", reason: "notify" });
+  }
+  for (const row of history.rows) assert.equal(row.project, null, "проекта в журнале нет");
+
+  const dir = tempDir(t);
+  const snap = panelSnapshot({ stateFile: path.join(dir, "state.json"), logFile: FIXTURE, now: () => FIXTURE_NOW, workspaces: [] });
+  assert.deepEqual(snap.history.rows.map((row) => row.shortId), history.rows.map((row) => row.shortId));
+  assert.equal(snap.history.skipped, 0);
+});
+
+test("070: блок истории показывает пометку к строке", () => {
+  const client = loadClient();
+  const history = {
+    rows: [
+      {
+        key: "aaaaaaaa",
+        shortId: "aaaaaaaa",
+        time: NOW,
+        project: null,
+        transport: "max",
+        status: "answered",
+        messageId: "mid.1",
+        optionIds: [],
+        customLength: 0,
+        code: null,
+        reason: null,
+        note: { code: "repeat", reason: "already-answered" },
+      },
+      {
+        key: "bbbbbbbb",
+        shortId: "bbbbbbbb",
+        time: NOW - 60_000,
+        project: null,
+        transport: "max",
+        status: "answered",
+        note: { code: "dropped", reason: "notify" },
+      },
+    ],
+    total: 2,
+    skipped: 0,
+    unreadable: false,
+  };
+  let text = flatText(client.render({ history, t }));
+  assert.match(text, /был повторный клик/, "пометка видна без клика");
+  assert.match(text, /ответ отброшен \(notify\)/);
+  assert.equal(text.includes("снят"), false);
+
+  const clickable = flatNodes(client.render({ history, t })).find((node) => typeof node.props?.onClick === "function");
+  clickable.props.onClick();
+  text = flatText(client.render({ history, t }));
+  assert.match(text, /note: был повторный клик/, "и в деталях");
 });

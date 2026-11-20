@@ -505,7 +505,6 @@ export function panelSnapshot({
   limit = JOURNAL_TAIL,
   historyLimit = HISTORY_LIMIT,
   historyHours = HISTORY_HOURS,
-  historyWorkspace = null,
   workspaces = undefined,
   staleMinutes = DEFAULT_STALE_MINUTES,
   includeCwd = false,
@@ -520,7 +519,6 @@ export function panelSnapshot({
     now: now(),
     hours: historyHours,
     limit: historyLimit,
-    workspace: historyWorkspace,
     logger,
   });
   const boardData = collectBoard({

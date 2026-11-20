@@ -65,6 +65,9 @@ window.__ModuleLoader__.load({
       historyStatusCancelled: "closed",
       historyStatusPairing: "pairing",
       historyStatusPairingError: "pairing error",
+      historyNoteRepeat: "repeat click",
+      historyNoteDropped: "answer dropped",
+      historyNoteClose: "message not closed",
       test: "Test",
       refresh: "Refresh",
       dismiss: "Dismiss",
@@ -115,6 +118,9 @@ window.__ModuleLoader__.load({
       historyStatusCancelled: "снят",
       historyStatusPairing: "привязка",
       historyStatusPairingError: "ошибка привязки",
+      historyNoteRepeat: "был повторный клик",
+      historyNoteDropped: "ответ отброшен",
+      historyNoteClose: "сообщение не снято",
       test: "Тест",
       refresh: "Обновить",
       dismiss: "Снять",
@@ -463,6 +469,18 @@ window.__ModuleLoader__.load({
       return label;
     }
 
+    /**
+     * Пометка к строке истории (070): ответ пришёл, но не пошёл в дело —
+     * повторный клик по уже отвеченному вопросу, notify/gui-ответ.
+     */
+    function historyNote(row, t) {
+      if (!row || row.note === null || typeof row.note !== "object") return "";
+      if (row.note.code === "repeat") return t("historyNoteRepeat");
+      if (row.note.code === "close") return t("historyNoteClose");
+      const base = t("historyNoteDropped");
+      return row.note.reason ? base + " (" + row.note.reason + ")" : base;
+    }
+
     /** Блок «История вопросов»: строка = вопрос, клик раскрывает детали. */
     function HistoryBlock(props) {
       const history = props.history;
@@ -478,9 +496,11 @@ window.__ModuleLoader__.load({
         for (const row of rows) {
           const open = expanded === row.key;
           const head = clockText(row.time) + " · " + historyStatus(row, t) + " · " + (row.shortId || "—");
-          const sub = [row.project || "", row.transport || ""].filter((part) => part !== "").join(" · ");
+          const note = historyNote(row, t);
+          const sub = [row.project || "", row.transport || "", note].filter((part) => part !== "").join(" · ");
           const details = [];
           if (row.transport) details.push("transport: " + row.transport);
+          if (note !== "") details.push("note: " + note);
           if (row.messageId) details.push("messageId: " + row.messageId);
           if (Array.isArray(row.optionIds) && row.optionIds.length > 0) details.push("optionIds: " + row.optionIds.join(", "));
           if (Number.isFinite(row.customLength)) details.push("customLength: " + String(row.customLength));
