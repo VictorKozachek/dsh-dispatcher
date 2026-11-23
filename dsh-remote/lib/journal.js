@@ -75,16 +75,37 @@ export function createJournal({
    * Записать событие. Поля фиксированы; `detail` — объект/строка без секретов.
    * @returns {boolean} удалось ли записать.
    */
+  /** 081: один сегмент пути — полный путь в журнал не попадает. */
+  function workspaceField(value) {
+    if (typeof value !== "string" || value.trim() === "") return null;
+    const trimmed = value.trim().replace(/[\\/]+$/, "");
+    const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+    return index >= 0 ? trimmed.slice(index + 1) : trimmed;
+  }
+
+  /** 081: id маскируется повторно (старые вызывающие могли передать полный). */
+  function sessionField(value) {
+    if (typeof value !== "string" || value === "") return null;
+    if (value.includes("…")) return value;
+    return `${value.replace(/^(?:session|agent|sess)-/, "").slice(0, 8)}…`;
+  }
+
   function record(event, fields = {}) {
     if (disabled) return false;
     if (typeof event !== "string" || event === "") return false;
     const ts = new Date(now()).toISOString();
+    const workspace = workspaceField(fields?.workspace);
+    const sessionId = sessionField(fields?.sessionId);
+    const preset = typeof fields?.preset === "string" && fields.preset !== "" ? fields.preset : null;
     const entry = {
       ts,
       level: typeof fields?.level === "string" && fields.level !== "" ? fields.level : "info",
       event,
       ...(typeof fields?.transport === "string" && fields.transport !== "" ? { transport: fields.transport } : {}),
       ...(typeof fields?.shortId === "string" && fields.shortId !== "" ? { shortId: fields.shortId } : {}),
+      ...(workspace === null ? {} : { workspace }),
+      ...(sessionId === null ? {} : { sessionId }),
+      ...(preset === null ? {} : { preset }),
       ...(sanitizeDetail(fields?.detail) === undefined ? {} : { detail: sanitizeDetail(fields.detail) }),
     };
     const line = `${JSON.stringify(entry)}\n`;
