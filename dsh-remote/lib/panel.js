@@ -16,6 +16,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { DEFAULT_DENY_REMOTE, DEFAULT_TTL_MS as POLICY_TTL_MS, DEFAULT_TOOLS, DEFAULT_ON_TIMEOUT } from "./approvals/policy.js";
+import { HISTORY_HOURS, HISTORY_LIMIT, readQuestionHistory } from "./journal-read.js";
+
 /** Сколько строк журнала показываем: у панели мало места. */
 export const JOURNAL_TAIL = 20;
 
@@ -240,14 +243,32 @@ export function readJournalTail(logFile, { limit = JOURNAL_TAIL, logger = () => 
  * @param options - `{state, channelPresent, settings}`.
  * @returns `{binding, enabled, channel, configChannel}`.
  */
-export function describeStatus({ state = null, channelPresent = false, settings = {} } = {}) {
+export function describeStatus({ state = null, channelPresent = false, settings = {}, policy = null } = {}) {
   const normalized = normalizeState(state);
   const configChat = settings?.telegram?.chatId;
+  // 074: политика подтверждений — эффективная из фичи approvals, иначе хотя бы
+  // переопределения из state.json (панель остаётся осмысленной без сервиса).
+  let policySnapshot = null;
+  try {
+    if (typeof policy?.snapshot === "function") policySnapshot = policy.snapshot();
+  } catch {
+    policySnapshot = null;
+  }
+  const stored = state?.approvals !== null && typeof state?.approvals === "object" ? state.approvals : {};
+  const tools = policySnapshot?.tools ?? (Array.isArray(stored.tools) ? stored.tools : [...DEFAULT_TOOLS]);
+  const denyRemote = policySnapshot?.denyRemote ?? (Array.isArray(stored.denyRemote) ? stored.denyRemote : [...DEFAULT_DENY_REMOTE]);
   return {
     binding: normalized.binding,
     enabled: normalized.enabled,
     channel: channelPresent === true,
     configChannel: configChat !== undefined && configChat !== null,
+    approvals: {
+      tools: [...tools],
+      denyRemote: [...denyRemote],
+      onTimeout: policySnapshot?.onTimeout ?? DEFAULT_ON_TIMEOUT,
+      ttlMs: Number.isFinite(policySnapshot?.ttlMs) ? policySnapshot.ttlMs : POLICY_TTL_MS,
+      last: policySnapshot?.last ?? null,
+    },
   };
 }
 
@@ -479,8 +500,12 @@ export function panelSnapshot({
   ttlMs = DEFAULT_TTL_MS,
   channelPresent = false,
   settings = {},
+  policy = null,
   logger = () => {},
   limit = JOURNAL_TAIL,
+  historyLimit = HISTORY_LIMIT,
+  historyHours = HISTORY_HOURS,
+  historyWorkspace = null,
   workspaces = undefined,
   staleMinutes = DEFAULT_STALE_MINUTES,
   includeCwd = false,
@@ -490,6 +515,14 @@ export function panelSnapshot({
   const normalized = normalizeState(state);
   const questions = sortQuestionsByDeadline(normalized.questions, ttlMs);
   const journal = readJournalTail(logFile, { limit, logger });
+  // 070: история вопросов из того же журнала; только чтение, без состояния.
+  const history = readQuestionHistory(logFile, {
+    now: now(),
+    hours: historyHours,
+    limit: historyLimit,
+    workspace: historyWorkspace,
+    logger,
+  });
   const boardData = collectBoard({
     workspaces: boardRoots({ workspaces, settings, state, includeCwd }),
     now,
@@ -501,13 +534,19 @@ export function panelSnapshot({
     ok: true,
     generatedAt: now(),
     status: {
-      ...describeStatus({ state, channelPresent, settings }),
+      ...describeStatus({ state, channelPresent, settings, policy }),
       unreadable,
     },
     questions,
     journal: {
       lines: journal.lines,
       unreadable: journal.unreadable,
+    },
+    history: {
+      rows: history.rows,
+      total: history.total,
+      skipped: history.skipped,
+      unreadable: history.unreadable,
     },
     board: boardData.board,
     spend: {

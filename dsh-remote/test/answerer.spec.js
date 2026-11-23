@@ -15,6 +15,7 @@ import path from "node:path";
 
 import { apply } from "../lib/index.js";
 import { createAnswerer } from "../lib/answerer.js";
+import { renderBody } from "../lib/present.js";
 import { createRegistry } from "../lib/domain/registry.js";
 import { QUESTION_STATUS } from "../lib/domain/question.js";
 
@@ -881,4 +882,164 @@ test("037: три вопроса — каждый получает свой TTL 
   const result = await pending;
   assert.equal(result.answers.length, 3, "все три части в результате");
   assert.equal(answerer.pending.size, 0, "висящих ожиданий нет");
+});
+
+/** 075: журнал ранних выходов ответчика. */
+function fakeJournal() {
+  const events = [];
+  return { events, record: (event, fields = {}) => { events.push({ event, ...fields }); return true; } };
+}
+
+function skipSetup({ enabled = true, registry = null, transport = fakeTransport(), journal = fakeJournal(), transports = null } = {}) {
+  const ctx = fakeContext({ services: { sessions: { get: () => ({ header: { cwd: "/p/project", agentPreset: "worker" } }) } } });
+  const resolvedRegistry = registry ?? createRegistry({ readState: () => (enabled ? { global: true } : {}) });
+  const answerer = createAnswerer({
+    transport,
+    ...(transports === null ? {} : { transports }),
+    registry: resolvedRegistry,
+    journal,
+    log: () => {},
+    now: () => 1_000,
+  });
+  answerer.attach(ctx);
+  return { ctx, answerer, journal, transport };
+}
+
+test("075: no-questions не журналируется", async () => {
+  const { journal, ctx } = skipSetup();
+  let fallback = 0;
+  await runWaterfall(ctx, EVENT, { questions: [], agent: { id: "s1" } }, () => { fallback += 1; return "gui"; });
+  assert.equal(fallback, 1);
+  assert.equal(journal.events.some((entry) => entry.event === "question.skipped"), false);
+});
+
+test("075: mode-disabled журналируется с scope, маской id и preset", async () => {
+  const journal = fakeJournal();
+  const { ctx } = skipSetup({
+    registry: { resolve: () => ({ enabled: false, scope: "global", global: true }) },
+    journal,
+  });
+  await runWaterfall(ctx, EVENT, request({ agent: { id: "session-8aac9774-1111" } }), () => "gui");
+  const entry = journal.events.find((item) => item.event === "question.skipped");
+  assert.ok(entry);
+  assert.equal(entry.detail.reason, "mode-disabled");
+  assert.equal(entry.detail.scope, "global");
+  assert.equal(entry.sessionId, "8aac9774…", "контекст продублирован на верхнем уровне");
+  assert.equal(entry.workspace, "project");
+  assert.equal(entry.detail.sessionId, "8aac9774…");
+  assert.equal(entry.detail.workspace, "project", "только basename, без пути");
+  assert.equal(entry.detail.preset, "worker");
+  assert.equal(entry.detail.level, "warn", "global=true, а режим выключен — противоречие");
+});
+
+test("075: no-transport журналируется", async () => {
+  const journal = fakeJournal();
+  const transport = { id: "no-send", onAnswer: () => () => {} };
+  const { ctx } = skipSetup({ transport, journal });
+  await runWaterfall(ctx, EVENT, request(), () => "gui");
+  const entry = journal.events.find((item) => item.event === "question.skipped");
+  assert.equal(entry.detail.reason, "no-transport");
+});
+
+test("075: broker-unsupported журналируется", async () => {
+  const journal = fakeJournal();
+  const { ctx } = skipSetup({ transports: [fakeTransport(), { id: "bad" }], journal });
+  await runWaterfall(ctx, EVENT, request(), () => "gui");
+  const entry = journal.events.find((item) => item.event === "question.skipped");
+  assert.equal(entry.detail.reason, "broker-unsupported");
+});
+
+test("075: aborted журналируется и промис отклоняется", async () => {
+  const journal = fakeJournal();
+  const { ctx } = skipSetup({ journal });
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    runWaterfall(ctx, EVENT, request({ signal: controller.signal }), () => "gui"),
+    (error) => error?.name === "AbortError",
+  );
+  const entry = journal.events.find((item) => item.event === "question.skipped");
+  assert.equal(entry.detail.reason, "aborted");
+});
+
+test("075: пачка из трёх вопросов даёт одно question.skipped", async () => {
+  const journal = fakeJournal();
+  const { ctx } = skipSetup({ enabled: false, journal });
+  const questions = [item(), item(), item()];
+  await runWaterfall(ctx, EVENT, { questions, agent: { id: "s1" } }, () => "gui");
+  assert.equal(journal.events.filter((item) => item.event === "question.skipped").length, 1);
+});
+
+test("076: события журнала несут sessionId/workspace/preset из запроса", async () => {
+  const journal = fakeJournal();
+  const { ctx, transport } = skipSetup({ journal });
+  const pending = runWaterfall(ctx, EVENT, request({ agent: { id: "session-8aac9774-1111" } }), () => assert.fail("next() не должен вызываться"));
+  await tick();
+  const send = journal.events.find((entry) => entry.event === "question.send");
+  assert.ok(send, "question.send записан");
+  assert.equal(send.sessionId, "8aac9774…", "маска уникальной части");
+  assert.equal(send.workspace, "project", "только basename");
+  assert.equal(send.preset, "worker");
+  const resolved = journal.events.find((entry) => entry.event === "context.resolve");
+  assert.equal(resolved.detail.workspace, "project");
+  transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+  await pending;
+  const received = journal.events.find((entry) => entry.event === "answer.received");
+  assert.equal(received.sessionId, "8aac9774…");
+  assert.equal(received.workspace, "project");
+});
+
+
+test("078: sessionTitle доходит до payload вопроса (шапка — имя, не пресет)", async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-answerer-title-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, "storages", "session_projcache", "sessions");
+  fs.mkdirSync(dir, { recursive: true });
+  const agentId = "session-8aac9774-1111";
+  fs.writeFileSync(path.join(dir, `${agentId}.json`), JSON.stringify({
+    record: { rows: { title: { val: "Оркестратор" } } },
+  }));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const transport = fakeTransport();
+    const ctx = fakeContext({ services: { sessions: { get: () => ({ header: { cwd: "/p/project", agentPreset: "standard" } }) } } });
+    const answerer = createAnswerer({
+      transport,
+      registry: createRegistry({ readState: () => ({ global: true }) }),
+      log: () => {},
+      now: () => 1_000,
+    });
+    answerer.attach(ctx);
+    const pending = runWaterfall(ctx, EVENT, request({ agent: { id: agentId } }), () => assert.fail("next() не должен вызываться"));
+    await tick();
+    assert.equal(transport.sent.length, 1, "вопрос ушёл в канал");
+    const payload = renderBody(transport.sent[0], { maxText: 4096 });
+    assert.match(payload, /Оркестратор/, "в шапке имя сессии");
+    assert.doesNotMatch(payload, /· standard ·/, "пресет не подменяет имя");
+    transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+    await pending;
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  }
+});
+
+test("079: ответчик берёт resolveContext из горячего present", async () => {
+  const previous = globalThis.__dshRemotePresent;
+  globalThis.__dshRemotePresent = {
+    resolveContext: () => ({ role: "hot-role", sessionTitle: "ГОРЯЧЕЕ ИМЯ", taskId: null, branch: null, worktree: null }),
+  };
+  try {
+    const { ctx, transport } = skipSetup();
+    const pending = runWaterfall(ctx, EVENT, request(), () => assert.fail("next() не должен вызываться"));
+    await tick();
+    const payload = renderBody(transport.sent[0], { maxText: 4096 });
+    assert.match(payload, /ГОРЯЧЕЕ ИМЯ/);
+    transport.answer({ shortId: transport.sent[0].shortId, optionId: "o1" });
+    await pending;
+  } finally {
+    if (previous === undefined) delete globalThis.__dshRemotePresent;
+    else globalThis.__dshRemotePresent = previous;
+  }
 });

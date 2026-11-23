@@ -80,10 +80,94 @@ export const approvalsFeature = {
 
     // 025: политика по умолчанию — безопасная (allowlist, denyRemote,
     // таймаут = отказ); конфиг может только сузить права, но не расширить
-    // их молча.
-    const policy = createApprovalPolicy(config?.approvals, {
+    // их молча. 074: переопределения из state.json читаются на каждое решение,
+    // поэтому `/remote approvals allow|deny` действует без перезапуска.
+    const basePolicy = createApprovalPolicy(config?.approvals, {
       log: (message) => deps.logger.warn(message),
     });
+    function policyOverrides() {
+      try {
+        const current = store?.read?.()?.approvals;
+        if (current === null || typeof current !== "object") return {};
+        return {
+          ...(["safe", "all", "gui-only"].includes(current.mode) ? { mode: current.mode } : {}),
+          ...(Array.isArray(current.tools) ? { tools: current.tools } : {}),
+          ...(Array.isArray(current.denyRemote) ? { denyRemote: current.denyRemote } : {}),
+          ...(Array.isArray(current.denied) ? { denied: current.denied } : {}),
+        };
+      } catch (error) {
+        deps.logger.warn(`approvals: переопределения политики не прочитаны (${error?.message ?? error})`);
+        return {};
+      }
+    }
+    function effectivePolicy() {
+      const overrides = policyOverrides();
+      if (Object.keys(overrides).length === 0) return basePolicy;
+      return createApprovalPolicy({ ...(config?.approvals ?? {}), ...overrides }, {
+        log: (message) => deps.logger.warn(message),
+      });
+    }
+    let lastDecision = null;
+    const policy = {
+      get mode() { return effectivePolicy().mode; },
+      get tools() { return effectivePolicy().tools; },
+      get denyRemote() { return effectivePolicy().denyRemote; },
+      get ttlMs() { return effectivePolicy().ttlMs; },
+      get onTimeout() { return effectivePolicy().onTimeout; },
+      decide: (request) => effectivePolicy().decide(request),
+      describe: (lang) => effectivePolicy().describe(lang),
+      timeoutOutcome: () => effectivePolicy().timeoutOutcome(),
+      get last() { return lastDecision; },
+      snapshot(lang) {
+        const current = effectivePolicy();
+        return {
+          mode: current.mode,
+          tools: [...current.tools],
+          denyRemote: [...current.denyRemote],
+          onTimeout: current.onTimeout,
+          ttlMs: current.ttlMs,
+          last: lastDecision,
+          lines: current.describe(lang),
+        };
+      },
+      /** 077: переключить режим safe/all/gui-only; состояние общее с allow/deny. */
+      setMode(mode) {
+        if (!["safe", "all", "gui-only"].includes(mode)) throw new TypeError(`approvals mode: неизвестный режим ${mode}`);
+        if (store === null || typeof store?.setApprovals !== "function") {
+          throw new Error("approvals: состояние недоступно — изменить режим нельзя");
+        }
+        store.setApprovals({ mode });
+        return mode;
+      },
+      /** 074: явно разрешить инструмент удалённо (убирает denyRemote-запись). */
+      allow(tool) {
+        const name = String(tool ?? "").trim();
+        if (name === "") throw new TypeError("approvals allow: нужен инструмент");
+        const current = effectivePolicy();
+        const tools = [...new Set([...current.tools, name])];
+        const denyRemote = current.denyRemote.filter((item) => item !== name);
+        const denied = (current.denied ?? []).filter((item) => item !== name);
+        if (store === null || typeof store?.setApprovals !== "function") {
+          throw new Error("approvals: состояние недоступно — изменить политику нельзя");
+        }
+        store.setApprovals({ mode: current.mode, tools, denyRemote, denied });
+        return { tool: name, tools, denyRemote };
+      },
+      /** 074: вернуть инструмент в GUI-only. */
+      deny(tool) {
+        const name = String(tool ?? "").trim();
+        if (name === "") throw new TypeError("approvals deny: нужен инструмент");
+        const current = effectivePolicy();
+        const denyRemote = [...new Set([...current.denyRemote, name])];
+        const denied = [...new Set([...(current.denied ?? []), name])];
+        const tools = current.tools.filter((item) => item !== name);
+        if (store === null || typeof store?.setApprovals !== "function") {
+          throw new Error("approvals: состояние недоступно — изменить политику нельзя");
+        }
+        store.setApprovals({ mode: current.mode, tools, denyRemote, denied });
+        return { tool: name, tools, denyRemote };
+      },
+    };
     deps.logger.debug(`approvals: ${policy.describe().join("; ")}`);
 
     // Аудит решений (026): `audit.jsonl` рядом с state.json; путь можно
@@ -107,6 +191,8 @@ export const approvalsFeature = {
       // 015: канал проекта — свой чат/топик, иначе общий чат привязки.
       channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
       policy,
+      onDecision: (record) => { lastDecision = record; },
+      onLastDecision: (record) => { lastDecision = record; },
       ttlMs: policy.ttlMs,
       onTimeout: () => policy.timeoutOutcome(),
       log: (message) => deps.logger.debug(message),
@@ -124,6 +210,7 @@ export const approvalsFeature = {
       });
       // Для `/remote status` (025): действующая политика.
       ctx.provide?.("remoteApprovalPolicy", policy);
+      ctx.provide?.("approvalPolicy", policy);
     } catch (error) {
       deps.logger.debug(`approvals: сервис статистики не зарегистрирован (${error?.message ?? error})`);
     }

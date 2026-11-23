@@ -37,6 +37,12 @@ import { ANSWERED_ELSEWHERE, createBroker } from "./broker.js";
 import { createQuestions } from "./domain/question.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, resolveContext } from "./present.js";
 
+/** 079: свежий present после /remote reload; статический — fallback. */
+function resolveContextHot(options) {
+  const active = globalThis.__dshRemotePresent;
+  return (typeof active?.resolveContext === "function" ? active.resolveContext : resolveContext)(options);
+}
+
 const noopLog = () => {};
 
 /** Ошибка «вопрос снят»: DSH по аборту `signal` превращает её в `ASK_ABORTED`. */
@@ -139,6 +145,20 @@ function answerSummary(question) {
  * @param {() => number} [options.now] — часы (мс epoch), в тестах подменяются.
  * @returns {{attach: (ctx: object) => () => void, handler: Function, dispose: (reason?: string) => void}}
  */
+/**
+ * 063: полное зеркало только если хост даёт settle+cancel и подтверждает
+ * forwarded-событие resolved (`capabilities.resolvedEvent`). Наличие ctx.on
+ * само по себе ничего не доказывает — cordis даёт его всегда.
+ */
+export function detectMirrorMode(host) {
+  const hasSettle = typeof host?.settle === "function";
+  const hasCancel = typeof host?.cancel === "function";
+  const hasResolved = host?.capabilities?.resolvedEvent === true
+    || host?.resolvedEvent === true
+    || host?.supportsResolvedEvent === true;
+  return hasSettle && hasCancel && hasResolved ? "full" : "notify";
+}
+
 export function createAnswerer({
   transport = null,
   transports = null,
@@ -160,6 +180,8 @@ export function createAnswerer({
   lang = null,
   /** 051: рабочий журнал (log.jsonl), необязателен. */
   journal = null,
+  /** 063: mirror `{enabled, mode:full|notify|none, settle, cancel, host}` или функция. */
+  mirror = null,
   /** 013: доставка позднего ответа; по умолчанию `sessionController.prompt`. */
   steer = null,
   /** 013: таймеры инжектируются, тесты не ждут реальные 20 секунд. */
@@ -169,10 +191,28 @@ export function createAnswerer({
   /** Счётчики гибрида для журнала и `/remote status`. */
   const stats = { hybridHanded: 0, hybridPhoneAnswers: 0 };
 
+  /** 076: контекст выполнения, один на запрос, для аддитивных полей журнала. */
+  const journalContexts = new Map();
+  function maskJournalSession(value) {
+    if (typeof value !== "string" || value === "") return null;
+    return `${value.replace(/^(?:session|agent|sess)-/, "").slice(0, 8)}…`;
+  }
+  function journalWorkspace(value) {
+    if (typeof value !== "string" || value === "") return null;
+    const trimmed = value.replace(/[\\/]+$/, "");
+    const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+    return index >= 0 ? trimmed.slice(index + 1) : trimmed;
+  }
+  function journalContextFor(shortId) {
+    return typeof shortId === "string" ? journalContexts.get(shortId) ?? null : null;
+  }
+
   /** 051: запись в журнал; ошибка журнала не должна ронять вопрос. */
-  function journalEvent(event, fields) {
+  function journalEvent(event, fields = {}) {
+    const base = journalContextFor(fields?.shortId);
+    const enriched = base === null ? fields : { ...base, ...fields };
     try {
-      journal?.record?.(event, fields);
+      journal?.record?.(event, enriched);
     } catch {
       /* журнал не должен ронять плагин */
     }
@@ -194,6 +234,25 @@ export function createAnswerer({
       enabled: value.enabled === true,
       waitMs: Number.isFinite(value.waitMs) && value.waitMs > 0 ? Math.floor(value.waitMs) : 20_000,
     };
+  }
+
+  /** 063: текущая конфигурация mirror; ошибка конфига — обычный режим. */
+  function mirrorConfig() {
+    let value = mirror;
+    if (typeof value === "function") {
+      try {
+        value = value();
+      } catch (error) {
+        log(`mirror: конфиг не прочитан (${error?.message ?? error})`);
+        value = null;
+      }
+    }
+    if (value === null || typeof value !== "object" || value.enabled !== true) return { mode: "none" };
+    const settle = typeof value.settle === "function" ? value.settle : null;
+    const cancel = typeof value.cancel === "function" ? value.cancel : null;
+    // full требует и settle, и cancel; иначе честно notify.
+    const mode = value.mode === "full" && settle !== null && cancel !== null ? "full" : "notify";
+    return { mode, settle, cancel, host: value.host ?? null };
   }
 
   /** Отправить поздний ответ в сессию как уточнение (`steer`). */
@@ -308,7 +367,7 @@ export function createAnswerer({
     }
   };
 
-  async function closeQuestions(questions, reason, attempted = null) {
+  async function closeQuestions(questions, reason, attempted = null, onCloseError = null) {
     for (const question of questions) {
       pending.delete(question.shortId);
       rememberClosed(question);
@@ -327,6 +386,11 @@ export function createAnswerer({
         }
       } catch (error) {
         log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
+        try {
+          onCloseError?.(question, error);
+        } catch {
+          /* диагностика не должна ломать закрытие */
+        }
       }
     }
   }
@@ -389,12 +453,25 @@ export function createAnswerer({
       });
       return;
     }
-    journalEvent("answer.received", {
-      transport: sourceTransport?.id ?? null,
-      shortId: normalized.shortId,
-      detail: { optionIds: normalized.optionIds, customLength: normalized.text.length },
-    });
+    // 066: повторный ответ на уже отвеченный вопрос — duplicate, и это не
+    // second answer.received. Первое событие по-прежнему received.
+    const knownBefore = known.get(normalized.shortId);
+    if (knownBefore?.status !== "answered") {
+      journalEvent("answer.received", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { optionIds: normalized.optionIds, customLength: normalized.text.length },
+      });
+    }
     const entry = pending.get(normalized.shortId);
+    if (entry !== undefined && entry.mirrorGui === true) {
+      journalEvent("answer.dropped", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { reason: "gui" },
+      });
+      return;
+    }
     if (entry !== undefined && entry.hybridGui === true) {
       // Вопрос уже показан в GUI: ответ из мессенджера — не результат
       // инструмента, а уточнение к сессии. Принимаем один раз и шлём steer.
@@ -416,21 +493,62 @@ export function createAnswerer({
       return;
     }
     if (entry === undefined) {
-      journalEvent("answer.unmatched", {
-        transport: sourceTransport?.id ?? null,
-        shortId: normalized.shortId,
-        detail: { reason: "shortId", optionIds: normalized.optionIds },
-      });
+      // 063: ответ канала после mirror-settle/GUI — dropped, не unmatched.
+      const closedMirror = recentlyClosed.get(normalized.shortId);
+      if (closedMirror?.mirrorSettled === true || closedMirror?.mirrorGui === true) {
+        const reason = closedMirror.mirrorSettled === true ? "settled" : "gui";
+        journalEvent("answer.dropped", {
+          transport: sourceTransport?.id ?? null,
+          shortId: normalized.shortId,
+          detail: { reason },
+        });
+        if (reason === "gui" && closedMirror.mirrorGuiNotified !== true) {
+          try {
+            closedMirror.mirrorGuiNotified = true;
+            void Promise.resolve(primary?.closeQuestion?.(closedMirror, "answered-in-gui")).catch(() => {});
+          } catch {
+            /* подсказка не должна ронять ответчик */
+          }
+        }
+        return;
+      }
       const knownQuestion = known.get(normalized.shortId);
       if (knownQuestion !== undefined && knownQuestion.status === "answered") {
-        // Ответ из канала, который проиграл гонку: решение уже принято.
+        if (knownQuestion.mirrorNotify === true) {
+          // 073: повторный клик после ответа канала — dropped, не duplicate.
+          journalEvent("answer.dropped", {
+            transport: sourceTransport?.id ?? null,
+            shortId: normalized.shortId,
+            detail: { reason: "already-answered" },
+          });
+          return;
+        }
+        // 066: повтор/второй проход того же события — duplicate, не unmatched.
+        journalEvent("answer.duplicate", {
+          transport: sourceTransport?.id ?? null,
+          shortId: normalized.shortId,
+          detail: { reason: "duplicate", answeredVia: knownQuestion.answeredVia ?? null },
+        });
         log(`ответ на ${normalized.shortId} из канала ${sourceTransport?.id ?? "?"} проигнорирован:`
           + ` вопрос уже отвечен в ${knownQuestion.answeredVia ?? "другом канале"}`);
         return;
       }
+      journalEvent("answer.unmatched", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { reason: knownQuestion === undefined ? "shortId" : "closed", optionIds: normalized.optionIds },
+      });
       // Поздний ответ: вопрос уже снят (TTL/аборт/перезапуск). Это не игнор —
       // карточка требует, чтобы ответ дошёл до сессии через `steer`.
       const closedQuestion = recentlyClosed.get(normalized.shortId);
+      if (closedQuestion?.mirrorSettled === true || closedQuestion?.mirrorGui === true) {
+        journalEvent("answer.dropped", {
+          transport: sourceTransport?.id ?? null,
+          shortId: normalized.shortId,
+          detail: { reason: closedQuestion.mirrorSettled === true ? "settled" : "gui" },
+        });
+        return;
+      }
       if (closedQuestion === undefined || typeof reliability?.applyLateAnswer !== "function") {
         log(`ответ на ${normalized.shortId}: вопроса нет (уже отвечен или закрыт) — игнор`);
         return;
@@ -482,7 +600,40 @@ export function createAnswerer({
       entry.hybridTimer = null;
     }
     entry.resolve(entry.question);
-    void closeMessage(entry.question);
+    if (entry.question.mirrorNotify === true) {
+      journalEvent("answer.from_transport", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { mode: "notify", delivered: "tool-result" },
+      });
+      journalEvent("question.closed", {
+        transport: sourceTransport?.id ?? null,
+        shortId: normalized.shortId,
+        detail: { reason: "answered-in-messenger" },
+      });
+      try {
+        void Promise.resolve(primary?.closeQuestion?.(entry.question, "answered-in-messenger")).catch(() => {});
+      } catch {
+        /* закрытие не должно ронять ответ */
+      }
+    } else {
+      void closeMessage(entry.question);
+    }
+  }
+
+  /** 075: маска id как в context.resolve — уникальная часть, 8 символов. */
+  function maskSessionId(value) {
+    if (typeof value !== "string" || value === "") return null;
+    const unique = value.replace(/^(?:session|agent|sess)-/, "");
+    return `${unique.slice(0, 8)}…`;
+  }
+
+  /** 075: basename воркспейса без полного пути. */
+  function workspaceBasename(value) {
+    if (typeof value !== "string" || value === "") return null;
+    const trimmed = value.replace(/[\\/]+$/, "");
+    const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+    return index >= 0 ? trimmed.slice(index + 1) : trimmed;
   }
 
   /**
@@ -495,21 +646,42 @@ export function createAnswerer({
   async function handler(request, next) {
     const items = Array.isArray(request?.questions) ? request.questions : [];
     if (items.length === 0) return next(); // пустой запрос — ошибка ядра, не наша
-    if (request?.signal?.aborted) throw abortError();
-
-    if (useBroker && channels.some((item) => typeof item.sendQuestion !== "function" && typeof deliverFor !== "function")) {
-      log("ответчик: не все каналы умеют sendQuestion — отдаю GUI");
-      return next();
-    }
     const sessionId = typeof request?.agent?.id === "string" ? request.agent.id : null;
     const workspace = workspaceOf(sessionId);
-    // Маркировка (006): роль и задача, которую ведёт эта сессия. Ошибки чтения
+    // 075: ранние выходы ответчика не должны быть слепым пятном. Одно событие
+    // на запрос (не на вопрос пачки), только факты и маскированные id.
+    const skipped = (reason, decision = null, preset = null) => {
+      const contradiction = decision !== null
+        && decision.enabled !== true
+        && decision.scope === "global"
+        && decision.global === true;
+      journalEvent("question.skipped", {
+        sessionId: maskJournalSession(sessionId),
+        workspace: journalWorkspace(workspace),
+        preset,
+        detail: {
+          reason,
+          scope: decision?.scope ?? null,
+          sessionId: maskJournalSession(sessionId),
+          workspace: journalWorkspace(workspace),
+          preset,
+          ...(contradiction ? { level: "warn", contradiction: "global-enabled-but-mode-disabled" } : {}),
+        },
+      });
+    };
+    if (request?.signal?.aborted) {
+      skipped("aborted");
+      throw abortError();
+    }
+
+    // Маркировка (006): роль и задачу, которую ведёт эта сессия. Ошибки чтения
     // контекста не должны мешать вопросу — тогда просто без задачи.
-    let questionContext = { role: null, taskId: null, branch: null, worktree: null };
+    let questionContext = { role: null, sessionTitle: null, taskId: null, branch: null, worktree: null };
     try {
-      const resolved = resolveContext({ sessionId, ctx: context, log });
+      const resolved = resolveContextHot({ sessionId, ctx: context, log, journal });
       questionContext = {
         role: resolved.role ?? null,
+        sessionTitle: resolved.sessionTitle ?? null,
         taskId: resolved.taskId ?? null,
         branch: resolved.branch ?? null,
         worktree: resolved.worktree ?? null,
@@ -517,20 +689,41 @@ export function createAnswerer({
     } catch (error) {
       log(`вопрос: контекст сессии не прочитан (${error?.message ?? error})`);
     }
+    // 076: контекст выполнения считается один раз на запрос; события пачки
+    // получают его через shortId, а не пересчитывают путь/id каждый раз.
+    const requestJournalContext = {
+      sessionId: maskJournalSession(sessionId),
+      workspace: journalWorkspace(workspace),
+      preset: questionContext.role,
+    };
     let decision = { enabled: false, scope: null };
     try {
       decision = registry?.resolve?.({ sessionId, workspace }) ?? decision;
     } catch (error) {
       log(`реестр режима: ${error?.message ?? error} — считаю режим выключенным`);
     }
+    if (useBroker && channels.some((item) => typeof item.sendQuestion !== "function" && typeof deliverFor !== "function")) {
+      log("ответчик: не все каналы умеют sendQuestion — отдаю GUI");
+      skipped("broker-unsupported", decision, questionContext.role);
+      return next();
+    }
     if (!decision.enabled) {
       log(`вопрос ${sessionId ?? "(без агента)"}: режим выключен — отдаю GUI (next)`);
+      skipped("mode-disabled", decision, questionContext.role);
       return next();
     }
     if (typeof deliver !== "function" && !useBroker && typeof primary?.sendQuestion !== "function") {
       log("вопрос: транспорт не умеет sendQuestion — отдаю GUI (next)");
+      skipped("no-transport", decision, questionContext.role);
       return next();
     }
+    const mirrorState = mirrorConfig();
+    const mirrorFull = mirrorState.mode === "full" && typeof mirrorState.settle === "function";
+    const mirrorNotify = mirrorState.mode === "notify";
+    const callId = request?.callId ?? request?.toolCallId ?? request?.id ?? null;
+    let mirrorGuiPromise = null;
+    let mirrorGuiWon = false;
+    let mirrorCancelCalled = false;
 
     // 015: канал проекта — свой для каждого транспорта; нет канала —
     // общий чат этого транспорта.
@@ -552,12 +745,10 @@ export function createAnswerer({
       const questionLang = typeof lang === "function" ? lang() : lang;
       const primaryChannel = channelFor(primary?.id ?? null);
       const createdList = createQuestions(items, {
+        // 078: контекст передаём целиком — явный список терял sessionTitle.
+        ...questionContext,
         sessionId,
         workspace,
-        role: questionContext.role,
-        taskId: questionContext.taskId,
-        branch: questionContext.branch,
-        worktree: questionContext.worktree,
         quickReplies,
         lang: questionLang,
         chatId: primaryChannel.chatId,
@@ -569,6 +760,8 @@ export function createAnswerer({
         known.set(created.shortId, created);
         if (known.size > 200) known.delete(known.keys().next().value);
         questions.push(created);
+        journalContexts.set(created.shortId, requestJournalContext);
+        if (journalContexts.size > 200) journalContexts.delete(journalContexts.keys().next().value);
         try {
           metrics?.inc?.("questions.asked");
         } catch {
@@ -601,7 +794,7 @@ export function createAnswerer({
       // `catch`-заглушка: если вопрос снимают (аборт, ошибка отправки), промис
       // остаётся неразрешённым, но не должен шуметь как необработанный отказ.
       const waited = new Promise((resolve, reject) => {
-        pending.set(question.shortId, { question, resolve, reject, signal: request?.signal ?? null });
+        pending.set(question.shortId, { question, resolve, reject, signal: request?.signal ?? null, mirrorFull, mirrorNotify });
       });
       waited.catch(() => {});
 
@@ -621,6 +814,14 @@ export function createAnswerer({
           pending.delete(question.shortId);
           rememberClosed(question);
           if (info?.kind === "abort") {
+            if (mirrorFull && !mirrorCancelCalled) {
+              mirrorCancelCalled = true;
+              try {
+                void Promise.resolve(mirrorState.cancel?.(request?.agent ?? { id: question.sessionId }, callId, "ttl")).catch(() => {});
+              } catch {
+                /* отмена GUI не должна ронять TTL */
+              }
+            }
             entry.reject(info.error ?? abortError("вопрос истёк по TTL"));
             return;
           }
@@ -718,6 +919,11 @@ export function createAnswerer({
       if (waitingEntry !== undefined) waitingEntry.hybridTimer = timer;
     }
 
+    // 072: режим известен до публикации — представление должно сразу знать,
+    // что это notify-уведомление (без приглашения печатать текст).
+    if (mirrorNotify) {
+      for (const question of questions) question.mirrorNotify = true;
+    }
     let currentQuestion = null;
     try {
       try {
@@ -810,9 +1016,90 @@ export function createAnswerer({
             });
           }
 
+          // 063: mirror. Full — вопрос уже в канале, теперь отдаём его и в GUI
+          // (next()); notify — GUI источник истины, канал лишь уведомление.
+          if (mirrorNotify) {
+            for (const item of questions) {
+              item.mirrorNotify = true;
+              const itemEntry = pending.get(item.shortId);
+              if (itemEntry !== undefined) itemEntry.mirrorNotify = true;
+            }
+            journalEvent("question.mirror.published", { shortId: question.shortId, detail: { mode: "notify", targets: [primary?.id ?? null] } });
+            cleanupHybrid();
+            // 073: гонка «ответ GUI» vs «ответ канала» — первый завершает tool-call.
+            const guiPromise = Promise.resolve().then(() => next()).catch((error) => {
+              log(`mirror notify: next() не ответил (${error?.message ?? error})`);
+              return undefined;
+            });
+            let winner;
+            try {
+              winner = await Promise.race([waited, guiPromise, aborted]);
+            } catch (error) {
+              for (const item of questions) item.mirrorGui = true;
+              await closeQuestions(questions, "answered-in-gui", attempted, (item, closeError) => {
+                journalEvent("question.error", {
+                  shortId: item.shortId,
+                  detail: { status: "close-failed", message: String(closeError?.message ?? closeError) },
+                });
+              });
+              throw error;
+            }
+            if (winner === question) {
+              // Ответ канала уже принят и закрыт в onTransportAnswer; поздний
+              // GUI-ответ — безвредный дубль.
+              guiPromise.then(() => {
+                journalEvent("answer.dropped", {
+                  shortId: question.shortId,
+                  detail: { reason: "already-answered", source: "gui" },
+                });
+              }).catch(() => {});
+              const answer = expiredAnswers.get(question.shortId) ?? question.toAnswer();
+              return { answers: [answer] };
+            }
+            // GUI ответил первым: закрыть сообщения канала.
+            for (const item of questions) item.mirrorGui = true;
+            await closeQuestions(questions, "answered-in-gui", attempted, (item, closeError) => {
+              journalEvent("question.error", {
+                shortId: item.shortId,
+                detail: { status: "close-failed", message: String(closeError?.message ?? closeError) },
+              });
+            });
+            const targets = [...new Set(questions.flatMap((item) => (item.deliveries ?? []).map((delivery) => delivery.transport)).filter((id) => typeof id === "string" && id !== ""))];
+            journalEvent("answer.from_gui", { shortId: question.shortId, detail: { mode: "notify", targets: targets.length === 0 ? [primary?.id ?? null] : targets } });
+            return winner;
+
+          }
+          if (mirrorFull && mirrorGuiPromise === null && typeof next === "function") {
+            mirrorGuiPromise = Promise.resolve()
+              .then(() => next())
+              .catch((error) => {
+                log(`mirror: next() не ответил (${error?.message ?? error})`);
+                return undefined;
+              });
+            journalEvent("question.mirror.published", { shortId: question.shortId, detail: { mode: "full", targets: [primary?.id ?? null] } });
+          }
+
           // 037: дождались ответа на текущий — только теперь публикуем следующий.
           armHybrid(question);
-          const answered = await Promise.race([waited, aborted, guiRace]);
+          const races = [waited, aborted, guiRace];
+          if (mirrorGuiPromise !== null) races.push(mirrorGuiPromise);
+          const answered = await Promise.race(races);
+          if (mirrorGuiPromise !== null && answered !== question
+            && answered !== HYBRID_GUI
+            && !(answered !== null && typeof answered === "object" && typeof answered.shortId === "string")) {
+            // GUI ответил первым: гасим сообщения, поздние ответы канала — dropped.
+            mirrorGuiWon = true;
+            for (const item of questions) {
+              item.mirrorGui = true;
+              const itemEntry = pending.get(item.shortId);
+              if (itemEntry !== undefined) itemEntry.mirrorGui = true;
+            }
+            cleanupHybrid();
+            await closeQuestions(questions, "answered-in-gui", attempted);
+            for (const item of questions) item.mirrorGuiNotified = true;
+            journalEvent("answer.from_gui", { shortId: questions[0]?.shortId, detail: { mode: "full", targets: [primary?.id ?? null] } });
+            return answered;
+          }
           if (answered === HYBRID_GUI || guiRequested) {
             // pending оставляем: поздний ответ из мессенджера должен уйти
             // steer-ом, а не потеряться (как и до 037); снимаем только таймеры.
@@ -829,6 +1116,14 @@ export function createAnswerer({
           }
           cleanupBatch();
           await closeQuestions(questions, "aborted", attempted);
+          if (mirrorFull && !mirrorCancelCalled) {
+            mirrorCancelCalled = true;
+            try {
+              await mirrorState.cancel?.(request?.agent ?? { id: sessionId }, callId, "aborted");
+            } catch (cancelError) {
+              log(`mirror: cancel не удался (${cancelError?.message ?? cancelError})`);
+            }
+          }
           throw error;
         }
         log(`вопрос: доставить не удалось (${error?.message ?? error}) — снимаю и отдаю GUI`);
@@ -857,10 +1152,24 @@ export function createAnswerer({
     }
 
     cleanupBatch();
-    log(`вопросов ${questions.length}: ответ получен (${decision.scope})`);
-    return {
+    const result = {
       answers: questions.map((question) => expiredAnswers.get(question.shortId) ?? question.toAnswer()),
     };
+    if (mirrorFull && mirrorGuiWon !== true) {
+      try {
+        journalEvent("answer.from_transport", { shortId: questions[0]?.shortId, detail: { mode: "full", targets: [primary?.id ?? null] } });
+        await mirrorState.settle?.(request?.agent ?? { id: sessionId }, callId, result);
+        for (const question of questions) {
+          question.mirrorSettled = true;
+          rememberClosed(question);
+        }
+        journalEvent("answer.settled", { detail: { mode: "full", callId } });
+      } catch (error) {
+        log(`mirror: settle не удался (${error?.message ?? error})`);
+      }
+    }
+    log(`вопросов ${questions.length}: ответ получен (${decision.scope})`);
+    return result;
   }
 
   /**

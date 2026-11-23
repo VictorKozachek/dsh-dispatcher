@@ -382,6 +382,7 @@ test("фича approvals пишет policy-GUI в реальный audit.jsonl (
   assert.equal(last.kind, "approval");
   assert.equal(last.toolName, "bash");
   assert.equal(last.decision, "gui");
+  assert.equal(last.reason, "deny-remote", "аудит объясняет, почему не ушло в канал");
   assert.equal(last.outcome, "unavailable", "policy-GUI — это unavailable для DSH");
 
   const { rmSync } = await import("node:fs");
@@ -492,4 +493,125 @@ test("policy-GUI не оставляет запись, если ответ пр�
 
   assert.equal(audit.entries.length, 1, "policy-GUI не писался: ответили удалённо");
   assert.equal(audit.entries[0].decision, "remote");
+});
+
+test("074: allow из политики снимает denyRemote и подтверждение идёт в канал", async () => {
+  const transport = fakeTransport();
+  const ctx = fakeContext();
+  const provided = new Map();
+  ctx.provide = (name, service) => provided.set(name, service);
+  const saved = { approvals: { tools: null, denyRemote: null } };
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => {
+      if (name === "remoteTransport") return transport;
+      if (name === "remoteStore") {
+        return {
+          read: () => ({ enabled: { global: true, workspaces: {}, sessions: {} }, bindings: null, channels: {}, ...saved }),
+          setApprovals: (patch) => { saved.approvals = { ...saved.approvals, ...patch }; },
+        };
+      }
+      return null;
+    },
+    onDispose: (fn) => ctx.onDispose(fn),
+  };
+  approvalsFeature.apply(ctx, { approvals: { tools: ["read_file"], denyRemote: ["bash"] } }, deps);
+  const policy = provided.get("remoteApprovalPolicy");
+  const handler = ctx.subscriptions.find((item) => item.name === APPROVAL_REQUEST_EVENT)?.handler;
+
+  assert.equal(await handler(request({ toolName: "bash" }), async () => "gui"), "gui", "по умолчанию bash в GUI");
+  assert.equal(transport.sent.length, 0);
+
+  policy.allow("bash");
+  assert.equal(policy.decide(request({ toolName: "bash" })).remote, true);
+  const pending = handler(request({ toolName: "bash" }), async () => "gui");
+  await tick();
+  assert.equal(transport.sent.length, 1, "после allow bash ушёл в канал");
+  transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+  assert.equal(policy.last.reason, "allowed", "последнее решение — удалённое allowed");
+  assert.equal(policy.last.decision, "remote");
+
+  policy.deny("bash");
+  assert.equal(policy.decide(request({ toolName: "bash" })).remote, false);
+
+  policy.setMode("all");
+  assert.equal(policy.mode, "all");
+  assert.equal(policy.decide(request({ toolName: "shell" })).remote, true, "all разрешает default deny");
+  policy.deny("bash");
+  assert.equal(policy.decide(request({ toolName: "bash" })).remote, false, "явный deny сильнее all");
+});
+
+test("077: mode all отправляет bash, gui-only не отправляет даже read_file", async () => {
+  const all = setup({ policyConfig: { mode: "all" } });
+  const pending = all.ctx.subscriptions[0].handler(request({ toolName: "bash" }), all.next);
+  await tick();
+  assert.equal(all.transport.sent.length, 1, "mode all: bash ушёл в канал");
+  all.transport.answer({ shortId: all.transport.sent[0].shortId, optionIds: ["o1"] });
+  assert.equal(await pending, APPROVAL_OUTCOME.allowedOnce);
+
+  const gui = setup({ policyConfig: { mode: "gui-only" } });
+  const nextCalls = [];
+  const result = await gui.ctx.subscriptions[0].handler(request({ toolName: "read_file" }), async () => {
+    nextCalls.push(true);
+    return "gui";
+  });
+  assert.equal(result, "gui");
+  assert.equal(gui.transport.sent.length, 0, "gui-only ничего не отправляет");
+  assert.equal(nextCalls.length, 1);
+});
+
+test("080: шапка подтверждения — имя сессии из проекции, иначе пресет", async (t) => {
+  const { renderBody } = await import("../lib/present.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-approval-title-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, "storages", "session_projcache", "sessions");
+  fs.mkdirSync(dir, { recursive: true });
+  const agentId = "session-8aac9774-1111";
+  fs.writeFileSync(path.join(dir, `${agentId}.json`), JSON.stringify({ record: { rows: { title: { val: "Оркестратор" } } } }));
+  const previous = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const transport = fakeTransport();
+    const handlers = [];
+    const ctx = {
+      on: (event, handler) => { handlers.push({ event, handler }); return () => {}; },
+      get: (name) => (name === "sessions" ? { get: () => ({ header: { cwd: "/p/project", agentPreset: "standard" } }) } : null),
+      provide: () => {},
+      onDispose: () => {},
+    };
+    const approvals = createApprovals({
+      transport,
+      registry: { resolve: () => ({ enabled: true, scope: "global" }) },
+      policy: createApprovalPolicy(null),
+      log: () => {},
+      now: () => 1_700_000_000_000,
+    });
+    approvals.attach(ctx);
+    const handler = handlers.find((item) => item.event === APPROVAL_REQUEST_EVENT)?.handler;
+    assert.equal(typeof handler, "function");
+    const pending = handler(request({ agent: { id: agentId }, toolName: "read_file" }), async () => "gui");
+    await tick();
+    assert.equal(transport.sent.length, 1);
+    const payload = renderBody(transport.sent[0], { maxText: 4096 });
+    assert.match(payload, /Оркестратор/, "в шапке имя сессии");
+    assert.doesNotMatch(payload, /· standard ·/, "пресет не подменяет имя");
+    transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
+    await pending;
+
+    // Без файла проекции — прежний пресет.
+    fs.rmSync(path.join(dir, `${agentId}.json`));
+    const pending2 = handler(request({ agent: { id: agentId }, toolName: "read_file" }), async () => "gui");
+    await tick();
+    const payload2 = renderBody(transport.sent[1], { maxText: 4096 });
+    assert.match(payload2, /· standard ·/, "без имени — пресет");
+    transport.answer({ shortId: transport.sent[1].shortId, optionIds: ["o1"] });
+    await pending2;
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = previous;
+  }
 });

@@ -15,7 +15,10 @@ waterfall `user-questions/request`.
 - **каналы** — Telegram, MAX (включается `config.max`), свой релей (`docs/relay/PROTOCOL.md`),
   несколько каналов одновременно;
 - **устойчивость** — повторы доставки, TTL и напоминания, поздние ответы,
-  состояние и журналы в `~/.dsh/remote-control/`.
+  состояние и журналы в `~/.dsh/remote-control/`;
+- **зеркало `mirror`** — вопрос одновременно в GUI и канале; `full` при
+  поддержке хоста, иначе `notify` (GUI — источник истины). Подробно:
+  [«Зеркальный режим» в user-guide](../docs/user-guide.md#51-зеркальный-режим-mirror).
 
 Подробности: [docs/user-guide.md](../docs/user-guide.md) — пошагово для человека,
 [docs/RUNBOOK.md](../docs/RUNBOOK.md) — эксплуатация, инциденты и SLO,
@@ -369,6 +372,36 @@ telegram-чат не должен уезжать в MAX. По умолчанию
   принятым, сообщение не закрывается, в лог пишется причина; повторная попытка
   будет при следующем ответе из мессенджера. Авто-ретрая нет намеренно, чтобы не
   дублировать уточнение в сессию.
+
+## Зеркало mirror (задача 063)
+
+Кратко: `/remote mirror on|off`, `/remote mirror` показывает `full|notify|none` и
+причину; как это работает и что делать в каждом режиме — в
+[user-guide, §5.1](../docs/user-guide.md#51-зеркальный-режим-mirror).
+
+`/remote mirror on` включает зеркало: вопрос публикуется в канал и **одновременно**
+отдаётся в GUI через `next()`. Режим определяется при старте по
+`detectMirrorMode` (задача 063), а не по наличию `ctx.on` (cordis даёт его
+всегда):
+
+- **`full`** — только если у сервиса есть **и** `settle`, **и** `cancel`, **и**
+  подтверждено событие `resolved` (`userQuestions.capabilities.resolvedEvent ===
+  true`, либо флаг `resolvedEvent`/`supportsResolvedEvent`). Тогда первый ответ
+  побеждает: ответ из канала вызывает `settle(agent, callId, answer)`, ответ GUI
+  гасит сообщение в канале, поздний ответ проигравшего пишется в журнал как
+  `answer.dropped` без `steer`;
+- **`notify`** — во всех остальных случаях, в том числе если есть `settle`, но нет
+  `cancel` или подтверждённого события, и на текущем DSH 0.2.1-rc.5. GUI —
+  источник истины: клик в канале не завершает tool-call, а просит ответить в GUI;
+  сообщение закрывается подсказкой;
+- **`none`** — `/remote mirror off` и обычный `remote-only`.
+
+`/remote mirror` и `/remote status` показывают `mirror: full|notify|none` и
+причину («хост не даёт settle»). События журнала: `question.mirror.published`,
+`answer.from_gui`, `answer.from_transport`, `answer.settled`, `answer.dropped`.
+Аборт/TTL в `full` снимают сообщение в канале **и** отменяют вопрос в GUI
+(`cancel`); в `notify` закрывается только сообщение канала, карточка GUI живёт по
+правилам DSH (ответ/аборт запроса).
 
 ## Транспорт relay (свой сервер)
 

@@ -93,7 +93,9 @@ function scriptedAsk(answers) {
   const ask = async (request) => {
     const item = request.questions[0];
     asked.push(item);
-    const answer = answers[item.id];
+    const answer = answers[item.id] ?? (item.id === "remote-connect-approvals"
+      ? { selected: ["Только безопасные (по умолчанию)"] }
+      : undefined);
     if (answer === undefined) throw new Error(`нет сценария для ${item.id}`);
     if (answer instanceof Error) throw answer;
     return {
@@ -244,6 +246,7 @@ test("connect: шаги, привязка, режим, токен не утек�
   assert.equal(state.bindings.userId, 7);
   assert.equal(state.bindings.botUsername, "test_bot");
   assert.equal(state.enabled.workspaces[WORKSPACE], true, "режим включён для текущего проекта");
+  assert.equal(state.approvals.mode, "safe", "онбординг по умолчанию — safe");
 
   assert.deepEqual(stand.credentials.calls[0].slice(0, 2), ["set", TELEGRAM_TOKEN_REF]);
   assert.equal(fs.readFileSync(stand.file, "utf8").includes(TOKEN), false, "токен не попал на диск");
@@ -252,7 +255,7 @@ test("connect: шаги, привязка, режим, токен не утек�
 
   const poll = telegram.calls.find((call) => call.method === "getUpdates");
   assert.deepEqual(poll.payload.allowed_updates, ["message"]);
-  assert.equal(stand.asked.length, 4, "четыре шага: транспорт, токен, код, режим");
+  assert.equal(stand.asked.length, 5, "пять шагов: транспорт, токен, код, режим, подтверждения");
 });
 
 test("connect: после привязки просит транспорт начать поллинг", async (t) => {
@@ -1891,4 +1894,186 @@ test("052: пропал MAX-токен — прежний поллер оста�
   assert.equal(facade.current, null, "фасад пуст");
   assert.equal(first.polling, false, "старый поллер остановлен, а не продолжает работать без токена");
   assert.match(stand.logs.join("\n"), /привязка на MAX, а секрета .* нет — канал не поднят/);
+});
+
+test("074: /remote approvals показывает политику и последнюю причину", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-approvals-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json"), now: () => START_MS });
+  const policy = {
+    last: { toolName: "bash", reason: "deny-remote", decision: "gui" },
+    describe: () => ["tools=[read_file]", "denyRemote=[bash]", "onTimeout=cancelled (отказ), ttl=30 мин"],
+    snapshot() { return { lines: this.describe(), last: this.last }; },
+    allow() { throw new Error("not called"); },
+    deny() { throw new Error("not called"); },
+  };
+  const ctx = {
+    get(name) {
+      if (name === "sessions") return { get: () => ({ header: { cwd: WORKSPACE } }) };
+      if (name === "remoteApprovalPolicy") return policy;
+      return null;
+    },
+  };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => START_MS });
+  const res = await remote.handler({ rawInput: "approvals" });
+  assert.equal(res.kind, "success");
+  assert.match(res.text, /tools=\[read_file\]/);
+  assert.match(res.text, /bash/);
+  assert.match(res.text, /deny-remote/);
+
+  const status = await remote.handler({ rawInput: "status" });
+  assert.equal(status.kind, "success");
+  assert.match(status.text, /последнее решение bash → deny-remote/);
+});
+
+test("074: allow bash требует --force, изменяет политику и статус", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-approvals-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json"), now: () => START_MS });
+  const calls = [];
+  const policy = {
+    last: null,
+    describe: () => ["tools=[read_file]", "denyRemote=[bash]"],
+    snapshot() { return { lines: this.describe(), last: this.last }; },
+    allow(tool) { calls.push(["allow", tool]); this.last = { toolName: tool, reason: "allowed", decision: "remote" }; },
+    deny(tool) { calls.push(["deny", tool]); },
+  };
+  const ctx = {
+    get(name) {
+      if (name === "sessions") return { get: () => ({ header: { cwd: WORKSPACE } }) };
+      if (name === "remoteApprovalPolicy") return policy;
+      return null;
+    },
+  };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => START_MS });
+
+  const withoutForce = await remote.handler({ rawInput: "approvals allow bash" });
+  assert.equal(withoutForce.kind, "error");
+  assert.match(withoutForce.text, /--force/);
+  assert.deepEqual(calls, []);
+
+  const allowed = await remote.handler({ rawInput: "approvals allow bash --force" });
+  assert.equal(allowed.kind, "success");
+  assert.deepEqual(calls, [["allow", "bash"]]);
+  assert.match(allowed.text, /теперь можно подтвердить с телефона/);
+
+  const statusAfterRemote = await remote.handler({ rawInput: "status" });
+  assert.equal(statusAfterRemote.kind, "success");
+  assert.match(statusAfterRemote.text, /последнее решение bash → allowed \(remote\)/);
+
+  const writeWithoutForce = await remote.handler({ rawInput: "approvals allow write_file" });
+  assert.equal(writeWithoutForce.kind, "error", "write_file тоже опасен");
+  assert.match(writeWithoutForce.text, /--force/);
+
+  const denied = await remote.handler({ rawInput: "approvals deny bash" });
+  assert.equal(denied.kind, "success");
+  assert.deepEqual(calls.at(-1), ["deny", "bash"]);
+});
+
+test("074: store сохраняет переопределения политики в state.json", (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-approvals-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "state.json");
+  const store = createStore({ file, now: () => START_MS });
+  store.setApprovals({ tools: ["read_file", "bash"], denyRemote: ["bash", "rm"] });
+  const saved = store.read();
+  assert.deepEqual(saved.approvals, { mode: "safe", tools: ["read_file", "bash"], denyRemote: ["bash", "rm"], denied: [] });
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).approvals.tools.includes("bash"), true);
+});
+
+test("077: онбординг connect спрашивает режим и сохраняет all", async (t) => {
+  const telegram = telegramFetch();
+  const stand = harness(t, {
+    answers: { ...CONNECT_ANSWERS, "remote-connect-approvals": { selected: ["Да, всё"] } },
+    fetchImpl: telegram.fetch,
+  });
+  const result = await stand.remote.handler(invoke("connect"));
+  assert.equal(result.kind, "success", result.text);
+  assert.equal(stand.asked.some((item) => item.id === "remote-connect-approvals"), true);
+  assert.equal(stand.store.read().approvals.mode, "all");
+});
+
+test("077: онбординг connect сохраняет gui-only", async (t) => {
+  const telegram = telegramFetch();
+  const stand = harness(t, {
+    answers: { ...CONNECT_ANSWERS, "remote-connect-approvals": { selected: ["Всё только в GUI"] } },
+    fetchImpl: telegram.fetch,
+  });
+  const result = await stand.remote.handler(invoke("connect"));
+  assert.equal(result.kind, "success", result.text);
+  assert.equal(stand.store.read().approvals.mode, "gui-only");
+});
+
+test("077: approvals mode переключает, пишет журнал и предупреждает для all", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-approvals-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json"), now: () => START_MS });
+  const calls = [];
+  const journal = { events: [], record: (event, fields = {}) => { journal.events.push({ event, ...fields }); return true; } };
+  const policy = {
+    last: null,
+    describe: () => ["approvals: режим=safe"],
+    snapshot() { return { lines: this.describe(), last: this.last }; },
+    setMode(mode) { calls.push(mode); this.last = null; },
+  };
+  const ctx = {
+    get(name) {
+      if (name === "sessions") return { get: () => ({ header: { cwd: WORKSPACE } }) };
+      if (name === "remoteApprovalPolicy") return policy;
+      if (name === "remoteJournal") return journal;
+      return null;
+    },
+  };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => START_MS });
+  const res = await remote.handler({ rawInput: "approvals mode all" });
+  assert.equal(res.kind, "success", res.text);
+  assert.deepEqual(calls, ["all"]);
+  assert.match(res.text, /режим подтверждений: all/);
+  assert.match(res.text, /ВНИМАНИЕ/);
+  assert.equal(journal.events.some((entry) => entry.event === "approvals.mode" && entry.detail.mode === "all"), true);
+
+  const bad = await remote.handler({ rawInput: "approvals mode nonsense" });
+  assert.equal(bad.kind, "error");
+});
+
+test("079: /remote reload сбрасывает кэш горячих модулей", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-hot-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const store = createStore({ file: path.join(dir, "state.json"), now: () => START_MS });
+  const journal = { events: [], record: (event, fields = {}) => { journal.events.push({ event, ...fields }); return true; } };
+  const ctx = {
+    get(name) {
+      if (name === "sessions") return { get: () => ({ header: { cwd: WORKSPACE } }) };
+      if (name === "remoteJournal") return journal;
+      return null;
+    },
+  };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => START_MS, config: { hotReload: false } });
+  const res = await remote.handler({ rawInput: "reload" });
+  assert.equal(res.kind, "success", res.text);
+  assert.match(res.text, /перечитаны из диска/);
+  assert.equal(journal.events.some((entry) => entry.event === "hot.reload"), true);
+});
+
+test("079: правка i18n видна в командах после /remote reload", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-remote-cmd-hot-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  fs.cpSync(path.resolve("dsh-remote/lib"), path.join(dir, "lib"), { recursive: true });
+  const lib = path.join(dir, "lib");
+  const i18nFile = path.join(lib, "i18n.js");
+  fs.writeFileSync(i18nFile, fs.readFileSync(i18nFile, "utf8").replace('"commands.helpTitle": "Команды /remote:"', '"commands.helpTitle": "ГОРЯЧИЕ КОМАНДЫ"'));
+  fs.utimesSync(i18nFile, new Date(), new Date(Date.now() + 5_000));
+
+  const store = createStore({ file: path.join(dir, "state.json"), now: () => START_MS });
+  const ctx = { get: () => null };
+  const remote = createRemoteCommands({ ctx, store, log: () => {}, now: () => START_MS, config: { hotLibDir: lib } });
+  try {
+    const reload = await remote.handler({ rawInput: "reload" });
+    assert.equal(reload.kind, "success", reload.text);
+    const help = await remote.handler({ rawInput: "help" });
+    assert.match(help.text, /ГОРЯЧИЕ КОМАНДЫ/);
+  } finally {
+    const orig = await import("../lib/i18n.js");
+    globalThis.__dshRemoteI18n = { t: orig.t, translator: orig.translator, resolveLanguage: orig.resolveLanguage, formatTemplate: orig.formatTemplate };
+  }
 });

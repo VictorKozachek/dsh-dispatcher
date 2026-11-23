@@ -40,14 +40,17 @@ export const STATE_SERVICE = "remoteStore";
  * Пока внутри пусто (`current === null`), методы — no-op: «канал не поднят» не
  * должен ронять ответчик.
  */
-function createTransportFacade() {
+export function createTransportFacade() {
   let current = null;
   /** Отписки подписчиков на текущем транспорте (чтобы снимать их при подмене). */
   const offs = new Map();
   const subscribers = new Set();
 
   const facade = {
-    id: "telegram",
+    /** 066: настоящий id текущего транспорта, а не жёсткий «telegram». */
+    get id() {
+      return current?.id ?? "facade";
+    },
     get caps() {
       return current?.caps ?? DEFAULT_CAPS;
     },

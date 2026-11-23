@@ -130,13 +130,27 @@ export class PanelService {
         stateFile: this.options.stateFile,
         logFile: this.options.logFile,
         settings: this.options.settings,
+        ...(typeof this.options.approvalPolicy === "function"
+          ? (() => {
+            try {
+              return { policy: this.options.approvalPolicy() ?? null };
+            } catch {
+              return {};
+            }
+          })()
+          : (this.options.approvalPolicy === undefined ? {} : { policy: this.options.approvalPolicy })),
         channelPresent,
         now: this.options.now,
         logger: this.options.logger,
         // 045: доска текущего проекта и явные корни из конфига; данные только читаются.
         includeCwd: this.options.includeCwd === true,
+        ...(Number.isFinite(this.options.historyHours) ? { historyHours: this.options.historyHours } : {}),
+        ...(Number.isFinite(this.options.historyLimit) ? { historyLimit: this.options.historyLimit } : {}),
         ...(Array.isArray(this.options.workspaces) ? { workspaces: this.options.workspaces } : {}),
         ...(Number.isFinite(this.options.staleMinutes) ? { staleMinutes: this.options.staleMinutes } : {}),
+        ...(typeof this.options.historyWorkspace === "string" && this.options.historyWorkspace !== ""
+          ? { historyWorkspace: this.options.historyWorkspace }
+          : {}),
         ...(typeof this.options.metrics === "function"
           ? (() => {
             try {
@@ -251,6 +265,8 @@ export function registerPanelService(ctx, options = {}) {
     stateFile: options.stateFile ?? paths.stateFile,
     logFile: options.logFile ?? paths.logFile,
     settings: options.settings ?? {},
+    ...(options.approvalPolicy === undefined ? {} : { approvalPolicy: options.approvalPolicy }),
+    ...(options.historyWorkspace === undefined ? {} : { historyWorkspace: options.historyWorkspace }),
     now: options.now ?? (() => Date.now()),
     logger: options.logger ?? (() => {}),
     // Функцию храним как есть: снимок спросит её каждый раз заново.

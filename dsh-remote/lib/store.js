@@ -348,6 +348,7 @@ export function defaultState() {
     enabled: { global: false, workspaces: {}, sessions: {} },
     /** Гибридный режим: мессенджер → GUI через `waitMs` (задача 013). */
     hybrid: { enabled: false, waitMs: DEFAULT_HYBRID_WAIT_MS },
+    mirror: { enabled: false },
     /** 046: язык пользовательских сообщений (`/remote lang`). */
     lang: DEFAULT_LANG,
     recent: [],
@@ -705,6 +706,30 @@ export function createStore({
    * Гибридный режим (013): включить/выключить и при желании поменять ожидание.
    * Поле отдельное от `enabled`: это не scope, а «показать вопрос ещё и в GUI».
    */
+  /** 063: режим mirror (вопрос и в GUI, и в канале). */
+  function setMirror(enabled) {
+    return update((state) => {
+      state.mirror = { enabled: enabled === true };
+      return state;
+    });
+  }
+
+  /** 074: сохранить переопределения политики подтверждений (не конфиг профиля). */
+  function setApprovals(patch = {}) {
+    return update((state) => {
+      const current = state.approvals !== null && typeof state.approvals === "object" ? state.approvals : {};
+      state.approvals = {
+        mode: patch.mode === undefined
+          ? (["safe", "all", "gui-only"].includes(current.mode) ? current.mode : "safe")
+          : (["safe", "all", "gui-only"].includes(patch.mode) ? patch.mode : "safe"),
+        tools: patch.tools === undefined ? (current.tools ?? null) : (Array.isArray(patch.tools) ? [...patch.tools] : null),
+        denyRemote: patch.denyRemote === undefined ? (current.denyRemote ?? null) : (Array.isArray(patch.denyRemote) ? [...patch.denyRemote] : null),
+        denied: patch.denied === undefined ? (Array.isArray(current.denied) ? [...current.denied] : []) : (Array.isArray(patch.denied) ? [...patch.denied] : []),
+      };
+      return state;
+    });
+  }
+
   function setHybrid(patch = {}) {
     return update((state) => {
       state.hybrid = {
@@ -856,6 +881,8 @@ export function createStore({
     setChannel,
     removeChannel,
     setHybrid,
+    setMirror,
+    setApprovals,
     setBinding,
     addRecent,
     setPending,
@@ -906,6 +933,19 @@ function normalizeState(value, log = () => {}, recentLimit = RECENT_LIMIT, pendi
       waitMs: Number.isFinite(value.hybrid?.waitMs) && value.hybrid.waitMs > 0
         ? Math.floor(value.hybrid.waitMs)
         : DEFAULT_HYBRID_WAIT_MS,
+    },
+    mirror: { enabled: value.mirror?.enabled === true },
+    approvals: {
+      mode: ["safe", "all", "gui-only"].includes(value.approvals?.mode) ? value.approvals.mode : "safe",
+      tools: Array.isArray(value.approvals?.tools)
+        ? [...new Set(value.approvals.tools.filter((item) => typeof item === "string" && item.trim() !== "").map((item) => item.trim()))]
+        : null,
+      denyRemote: Array.isArray(value.approvals?.denyRemote)
+        ? [...new Set(value.approvals.denyRemote.filter((item) => typeof item === "string" && item.trim() !== "").map((item) => item.trim()))]
+        : null,
+      denied: Array.isArray(value.approvals?.denied)
+        ? [...new Set(value.approvals.denied.filter((item) => typeof item === "string" && item.trim() !== "").map((item) => item.trim()))]
+        : [],
     },
     recent: Array.isArray(value.recent) ? value.recent.slice(-Math.max(1, recentLimit)) : [],
     pending: Array.isArray(value.pending) ? value.pending.slice(-Math.max(0, pendingLimit)) : [],

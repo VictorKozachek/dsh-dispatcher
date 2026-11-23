@@ -27,6 +27,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createRegistry } from "./domain/registry.js";
+import { detectMirrorMode } from "./answerer.js";
+import { DEFAULT_DENY_REMOTE, DEFAULT_TOOLS } from "./approvals/policy.js";
 import { STATE_VERSION, credentialRef, createCredentialAccess } from "./store.js";
 import {
   buildReport,
@@ -45,7 +47,14 @@ import {
 import { createAudit } from "./audit.js";
 import { DEFAULT_KEEP, vacuum } from "./rotate.js";
 import { formatStats } from "./metrics.js";
-import { DEFAULT_LANG, LANGS, normalizeLang, resolveLanguage, t } from "./i18n.js";
+import { DEFAULT_LANG, LANGS, normalizeLang, resolveLanguage, t as baseT } from "./i18n.js";
+import { configureHotReload, hotLoad, hotReload } from "./hot.js";
+
+/** 079: команды читают горячий словарь; /remote reload обновляет его. */
+function t(key, params = {}, lang = DEFAULT_LANG) {
+  const active = globalThis.__dshRemoteI18n;
+  return (typeof active?.t === "function" ? active.t : baseT)(key, params, lang);
+}
 
 /** Язык текущего вызова команд: `t()` для строк, вынесенных в словарь (049). */
 let commandLang = DEFAULT_LANG;
@@ -145,6 +154,8 @@ function helpText(lang = DEFAULT_LANG) {
     t("commands.helpStats", {}, code),
     t("commands.helpVacuum", {}, code),
     t("commands.helpLang", {}, code),
+    t("commands.helpApprovals", {}, code),
+    t("commands.helpReload", {}, code),
     t("commands.helpChannel", {}, code),
     t("commands.helpForce", {}, code),
     t("commands.helpTransport", {}, code),
@@ -491,6 +502,12 @@ export function createRemoteCommands({
   const credentials = createCredentialAccess(ctx, { log });
   /** 056: журнал: явный сервис из deps.expose важнее ctx.get (cordis его не видит). */
   const journalService = () => journal ?? ctx?.get?.("remoteJournal") ?? null;
+  // 079: горячая перезагрузка презентационных модулей; config.hotReload=false
+  // выключает перечитывание, /remote reload всё равно сбрасывает кэш.
+  configureHotReload(config?.hotReload !== false, {
+    ...(typeof config?.hotLibDir === "string" && config.hotLibDir !== "" ? { libDir: config.hotLibDir } : {}),
+    journal: { record: (event, fields) => journalService()?.record?.(event, fields) },
+  });
 
   /** Журнал решений (026): читаем тот же `audit.jsonl`, куда пишет ответчик. */
   const audit = createAudit({
@@ -635,6 +652,28 @@ export function createRemoteCommands({
   }
 
   /**
+   * 077: один вопрос онбординга про удалённые подтверждения. Для уже
+   * подключённого бота не спрашиваем — режим меняется командой.
+   */
+  async function askApprovalMode(invocation) {
+    if (store.read().bindings !== null) return null;
+    const answer = await askStep(invocation, {
+      id: "remote-connect-approvals",
+      question: tx("commands.connect.approvalsQuestion"),
+      options: [
+        tx("commands.connect.approvalsAll"),
+        tx("commands.connect.approvalsSafe"),
+        tx("commands.connect.approvalsGuiOnly"),
+      ],
+    });
+    const selected = String(answer.selected[0] ?? "").toLowerCase();
+    const labels = (key) => [t(key, {}, "ru"), t(key, {}, "en")].map((label) => label.toLowerCase());
+    if (labels("commands.connect.approvalsAll").includes(selected)) return "all";
+    if (labels("commands.connect.approvalsGuiOnly").includes(selected)) return "gui-only";
+    return "safe";
+  }
+
+  /**
    * Остановить каналы конкретного транспорта (038): фасад, если в нём он, и
    * каналы из реестра 012. Другие транспорты не трогаем — ими управляет их
    * фича/конфиг, а не переключение привязки.
@@ -762,6 +801,7 @@ export function createRemoteCommands({
       options: [tx("commands.connectRelay.9"), tx("commands.connectRelay.10"), tx("commands.connectRelay.11")],
     });
     const scope = planConnectScope(scopeAnswer, invocation);
+    const approvalMode = await askApprovalMode(invocation);
     // 038: прежний канал отключаем ДО записи новой привязки.
     const retired = await retireActiveChannel("relay");
     try {
@@ -775,6 +815,7 @@ export function createRemoteCommands({
         };
         if (scope.plan?.kind === "global") state.enabled.global = true;
         if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
+        if (approvalMode !== null) state.approvals = { ...(state.approvals ?? {}), mode: approvalMode };
         return state;
       });
     } catch (error) {
@@ -939,6 +980,7 @@ export function createRemoteCommands({
       options: [tx("commands.connectMax.19"), tx("commands.connectMax.20"), tx("commands.connectMax.21")],
     });
     const scope = planConnectScope(scopeAnswer, invocation);
+    const approvalMode = await askApprovalMode(invocation);
     // 038: прежний канал отключаем ДО записи новой привязки.
     const retired = await retireActiveChannel("max");
     try {
@@ -954,6 +996,7 @@ export function createRemoteCommands({
         };
         if (scope.plan?.kind === "global") state.enabled.global = true;
         if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
+        if (approvalMode !== null) state.approvals = { ...(state.approvals ?? {}), mode: approvalMode };
         return state;
       });
     } catch (error) {
@@ -1059,6 +1102,7 @@ export function createRemoteCommands({
       });
 
       const scope = planConnectScope(scopeAnswer, invocation);
+      const approvalMode = await askApprovalMode(invocation);
       // 038: прежний канал отключаем ДО записи новой привязки.
       const retired = await retireActiveChannel("telegram");
       try {
@@ -1073,6 +1117,7 @@ export function createRemoteCommands({
           };
           if (scope.plan?.kind === "global") state.enabled.global = true;
           if (scope.plan?.kind === "workspace") state.enabled.workspaces[scope.plan.id] = true;
+          if (approvalMode !== null) state.approvals = { ...(state.approvals ?? {}), mode: approvalMode };
           return state;
         });
       } catch (error) {
@@ -1223,6 +1268,95 @@ export function createRemoteCommands({
     return success(t("commands.lang.set", { lang: normalized }, normalized));
   }
 
+  /** 063: возможности хоста для mirror: settle + событие (ctx.on). */
+  function mirrorCapability() {
+    const host = ctx?.get?.("userQuestions") ?? null;
+    const full = detectMirrorMode(host) === "full";
+    return { mode: full ? "full" : "notify", reason: full ? null : tx("commands.mirror.noSettle") };
+  }
+
+  /** `/remote mirror [on|off]`. */
+  async function mirrorCommand(rest) {
+    const value = Array.isArray(rest) ? String(rest[0] ?? "").toLowerCase() : "";
+    if (value !== "on" && value !== "off") {
+      const capability = mirrorCapability();
+      const enabled = store.read().mirror?.enabled === true;
+      const mode = enabled ? capability.mode : "none";
+      return success(tx("commands.mirror.status", {
+        p0: mode,
+        p1: mode === "none" ? "" : capability.reason === null ? "" : tx("commands.mirror.reason", { p0: capability.reason }),
+      }));
+    }
+    if (value === "on") {
+      if (store.read().bindings === null && liveTransport() === null) {
+        return failure(tx("commands.mirror.noChannel"));
+      }
+      store.setMirror(true);
+      return success(tx("commands.mirror.on", { p0: mirrorCapability().mode }));
+    }
+    store.setMirror(false);
+    return success(tx("commands.mirror.off"));
+  }
+
+  /** 074: показать/изменить политику подтверждений из чата (state.json). */
+  function approvalsCommand(rest, flags) {
+    const policy = ctx?.get?.("remoteApprovalPolicy") ?? null;
+    if (policy === null || typeof policy?.describe !== "function") {
+      return failure(tx("commands.approvals.unavailable"));
+    }
+    const lang = currentLang();
+    const action = Array.isArray(rest) && rest.length > 0 ? String(rest[0]).toLowerCase() : "";
+    const show = () => {
+      const snapshot = typeof policy.snapshot === "function" ? policy.snapshot(lang) : null;
+      const lines = [tx("commands.approvals.title"), ...(snapshot?.lines ?? policy.describe(lang))];
+      const last = snapshot?.last ?? policy.last ?? null;
+      if (last === null) lines.push(tx("commands.approvals.none"));
+      else lines.push(tx("commands.approvals.last", { p0: last.toolName ?? "?", p1: last.reason ?? "?", p2: last.decision ?? "?" }));
+      return lines.join("\n");
+    };
+    if (action === "" || action === "show" || action === "list") {
+      return success(show());
+    }
+    if (action === "mode") {
+      const value = Array.isArray(rest) && rest.length > 1 ? String(rest[1]).trim().toLowerCase() : "";
+      if (!["safe", "all", "gui-only"].includes(value)) return failure(tx("commands.approvals.modeUsage"));
+      try {
+        policy.setMode(value);
+      } catch (error) {
+        return failure(`/remote approvals mode ${value}: ${humanError(error)}`);
+      }
+      try {
+        journalService()?.record?.("approvals.mode", { detail: { mode: value } });
+      } catch (error) {
+        log(`approvals.mode: journal record failed (${error?.message ?? error})`);
+      }
+      const lines = [show(), tx("commands.approvals.modeSet", { p0: value })];
+      if (value === "all") lines.push(tx("commands.approvals.modeWarning"));
+      return success(lines.join("\n"));
+    }
+    if (action !== "allow" && action !== "deny") {
+      return failure(tx("commands.approvals.usage") + "\n" + tx("commands.approvals.unknown", { p0: action }));
+    }
+    const tool = Array.isArray(rest) && rest.length > 1 ? String(rest[1]).trim() : "";
+    if (tool === "") return failure(tx("commands.approvals.usage"));
+    const dangerous = !DEFAULT_TOOLS.includes(tool);
+    if (action === "allow" && dangerous && !flags?.has?.("force")) {
+      return failure(tx("commands.approvals.force", { p0: tool }));
+    }
+    try {
+      if (action === "allow") policy.allow(tool);
+      else policy.deny(tool);
+    } catch (error) {
+      return failure(`/remote approvals ${action} ${tool}: ${humanError(error)}`);
+    }
+    const lines = [show()];
+    lines.push(tx(action === "allow" ? "commands.approvals.allowed" : "commands.approvals.denied", { p0: tool }));
+    if (action === "allow" && dangerous) {
+      lines.push(tx("commands.approvals.warnDanger", { p0: tool }));
+    }
+    return success(lines.join("\n"));
+  }
+
   async function status(invocation) {
     const state = store.read();
     const lang = currentLang();
@@ -1288,6 +1422,16 @@ export function createRemoteCommands({
 
     const hybridState = state.hybrid.enabled ? tx("commands.status.13", { p0: Math.round(state.hybrid.waitMs / 1000) }) : tx("commands.status.14");
     lines.push(t("commands.status.hybrid", { state: hybridState }, lang));
+    // 063: mirror режим и причина, если полное зеркало недоступно.
+    {
+      const capability = mirrorCapability();
+      const enabled = state.mirror?.enabled === true;
+      const mode = enabled ? capability.mode : "none";
+      lines.push(t("commands.status.mirror", {
+        p0: mode,
+        p1: mode === "none" ? "" : capability.reason === null ? "" : tx("commands.mirror.reason", { p0: capability.reason }),
+      }, lang));
+    }
     const hybridStats = ctx?.get?.("remoteAnswerer")?.stats ?? null;
     if (hybridStats !== null && (hybridStats.hybridHanded > 0 || hybridStats.hybridPhoneAnswers > 0)) {
       lines.push(tx("commands.status.15", { p0: hybridStats.hybridHanded, p1: hybridStats.hybridPhoneAnswers }));
@@ -1326,6 +1470,10 @@ export function createRemoteCommands({
       const policy = ctx?.get?.("remoteApprovalPolicy") ?? null;
       if (policy !== null && typeof policy?.describe === "function") {
         for (const line of policy.describe(currentLang())) lines.push(line);
+        const last = policy.last ?? null;
+        if (last !== null) {
+          lines.push(t("commands.status.approvalsLast", { tool: last.toolName ?? "?", reason: last.reason ?? "?", decision: last.decision ?? "?" }, lang));
+        }
       } else {
         lines.push(t("commands.status.approvals", {}, lang));
       }
@@ -1750,6 +1898,21 @@ export function createRemoteCommands({
     ].join("\n"));
   }
 
+  /** 079: сбросить кэш горячих модулей — следующий рендер перечитает файлы. */
+  async function reloadCommand() {
+    hotReload("manual");
+    // 079: сначала словарь (present читает его через globalThis), затем present.
+    for (const module of ["i18n.js", "present.js"]) {
+      try {
+        await hotLoad(module);
+      } catch (error) {
+        log(`hot: ${module} reload failed (${error?.message ?? error})`);
+      }
+    }
+    journalService()?.record?.("hot.reload", { detail: { module: null, reason: "command" } });
+    return success(tx("commands.reload.ok"));
+  }
+
   /** Обработчик `/remote`: разбор и диспетчеризация. */
   async function handler(invocation) {
     commandLang = currentLang();
@@ -1764,6 +1927,12 @@ export function createRemoteCommands({
           return await setMode(invocation, false, flags);
         case "status":
           return await status(invocation);
+        case "mirror":
+          return await mirrorCommand(rest);
+        case "reload":
+          return await reloadCommand();
+        case "approvals":
+          return approvalsCommand(rest, flags);
         case "lang":
           return await langCommand(rest);
         case "audit":
@@ -1798,7 +1967,7 @@ export function createRemoteCommands({
   const definition = {
     name: "remote",
     description: tx("commands.help.1"),
-    input: { hint: "connect|on|off|status|test|who|disconnect" },
+    input: { hint: "connect|on|off|mirror|approvals|reload|status|test|who|disconnect" },
     recordInput: false,
     handler,
   };

@@ -21,11 +21,18 @@
  */
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { DEFAULT_CAPS } from "./transport/base.js";
 import { normalizeQuickReplies } from "./quick-replies.js";
-import { DEFAULT_LANG, normalizeLang, t } from "./i18n.js";
+import { DEFAULT_LANG, normalizeLang, t as baseT } from "./i18n.js";
+
+/** 079: свежий i18n после /remote reload виден даже уже загруженному present. */
+function t(key, params = {}, lang = DEFAULT_LANG) {
+  const active = globalThis.__dshRemoteI18n;
+  return (typeof active?.t === "function" ? active.t : baseT)(key, params, lang);
+}
 
 /** `optionId` кнопки свободного ответа в `callback_data`. */
 export const FREE_TEXT_OPTION = "free";
@@ -343,6 +350,79 @@ export function findOwnedTask(cwd, sessionId, { log = noop } = {}) {
 }
 
 /**
+ * 068/069: осмотр кэша проекций DSH (только чтение).
+ *
+ * Возвращает не только title, но и диагностику для живого разбора: откуда
+ * DSH_HOME, существует ли каталог, найден ли файл, есть ли в нём поле title.
+ * Полные пути/id наружу не отдаются — только booleans и source.
+ */
+export function inspectSessionTitle(sessionId, { env = process.env, log = noop } = {}) {
+  const result = {
+    title: null,
+    homeSource: null,
+    cacheDirExists: false,
+    fileFound: false,
+    hasTitleField: false,
+  };
+  if (typeof sessionId !== "string" || sessionId === "") return result;
+  const fromEnv = typeof env?.DSH_HOME === "string" && env.DSH_HOME !== "";
+  result.homeSource = fromEnv ? "env" : "homedir";
+  const home = fromEnv ? env.DSH_HOME : path.join(os.homedir(), ".dsh");
+  const dir = path.join(home, "storages", "session_projcache", "sessions");
+  try {
+    result.cacheDirExists = fs.statSync(dir).isDirectory();
+  } catch {
+    result.cacheDirExists = false;
+  }
+  for (const name of [`session-${sessionId}.json`, `${sessionId}.json`]) {
+    let text;
+    try {
+      text = fs.readFileSync(path.join(dir, name), "utf8");
+      result.fileFound = true;
+    } catch (error) {
+      if (error?.code !== "ENOENT") log(`session title: ${name} could not be read (${error?.message ?? error})`);
+      continue;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      log(`session title: ${name} — invalid JSON (${error?.message ?? error})`);
+      continue;
+    }
+    const title = parsed?.record?.rows?.title?.val;
+    if (typeof title === "string") {
+      result.hasTitleField = true;
+      if (title.trim() !== "") {
+        result.title = title.trim();
+        return result;
+      }
+    }
+  }
+  return result;
+}
+
+/** 068: имя из кэша проекций; совместимая обёртка над inspectSessionTitle. */
+export function sessionTitleFromProjection(sessionId, options = {}) {
+  return inspectSessionTitle(sessionId, options).title;
+}
+
+/** 069: маска уникальной части id (префикс session-/agent- не информативен). */
+function maskSessionId(value) {
+  if (typeof value !== "string" || value === "") return null;
+  const unique = value.replace(/^(?:session|agent|sess)-/, "");
+  return `${unique.slice(0, 8)}…`;
+}
+
+/** Имя сессии из публичного API (если хост его отдаёт). */
+function sessionTitleOf(session) {
+  for (const value of [session?.title, session?.header?.title, session?.header?.name, session?.name]) {
+    if (typeof value === "string" && value.trim() !== "") return value.trim();
+  }
+  return null;
+}
+
+/**
  * Контекст сессии для шапки.
  *
  * `workspace` — имя каталога (`basename(cwd)`), `role` — `agentPreset` шапки,
@@ -350,12 +430,13 @@ export function findOwnedTask(cwd, sessionId, { log = noop } = {}) {
  *
  * @returns {{sessionId: string|null, workspace: string|null, cwd: string|null, role: string|null, taskId: string|null}}
  */
-export function resolveContext({ sessionId, ctx, log = noop } = {}) {
+export function resolveContext({ sessionId, ctx, log = noop, journal = null } = {}) {
   const context = {
     sessionId: typeof sessionId === "string" && sessionId !== "" ? sessionId : null,
     workspace: null,
     cwd: null,
     role: null,
+    sessionTitle: null,
     taskId: null,
     branch: null,
     worktree: null,
@@ -367,6 +448,31 @@ export function resolveContext({ sessionId, ctx, log = noop } = {}) {
     session = ctx?.get?.("sessions")?.get?.(context.sessionId) ?? null;
   } catch (error) {
     log(`sessions.get(${context.sessionId}): ${error?.message ?? error}`);
+    try {
+      journal?.record?.("context.resolve", {
+        sessionId: maskSessionId(context.sessionId),
+        workspace: null,
+        preset: null,
+        detail: {
+          sessionId: maskSessionId(context.sessionId),
+          sessionObjectId: null,
+          sameId: null,
+          foundTitle: false,
+          preset: null,
+          workspace: null,
+          titleSource: null,
+          homeSource: null,
+          cacheDirExists: false,
+          fileFoundByAgentId: false,
+          fileFoundBySessionId: false,
+          hasTitleByAgentId: false,
+          hasTitleBySessionId: false,
+          sessionsError: true,
+        },
+      });
+    } catch {
+      /* журнал не должен ронять контекст */
+    }
     return context;
   }
 
@@ -377,6 +483,49 @@ export function resolveContext({ sessionId, ctx, log = noop } = {}) {
   context.role = typeof header?.agentPreset === "string" && header.agentPreset !== ""
     ? header.agentPreset
     : null;
+  // 068/069: предпочитаем штатное имя из API, затем кэш проекций по id агента
+  // и по id сессии (в живом запросе request.agent.id может быть id агента).
+  const sessionObjectId = typeof session?.id === "string" && session.id !== ""
+    ? session.id
+    : (typeof session?.sessionId === "string" && session.sessionId !== "" ? session.sessionId : null);
+  const apiTitle = sessionTitleOf(session);
+  const agentInspect = apiTitle === null ? inspectSessionTitle(context.sessionId, { log }) : null;
+  const sessionInspect = apiTitle === null && agentInspect?.title === null
+    && sessionObjectId !== null && sessionObjectId !== context.sessionId
+    ? inspectSessionTitle(sessionObjectId, { log })
+    : null;
+  context.sessionTitle = apiTitle ?? agentInspect?.title ?? sessionInspect?.title ?? null;
+  const titleSource = apiTitle !== null
+    ? "api"
+    : agentInspect?.title !== null && agentInspect?.title !== undefined
+      ? "agent-id"
+      : sessionInspect?.title !== null && sessionInspect?.title !== undefined ? "session-id" : null;
+  // 069: только безопасные факты/диагностика для живого разбора (без полных id,
+  // путей и имён).
+  try {
+    journal?.record?.("context.resolve", {
+      sessionId: maskSessionId(context.sessionId),
+      workspace: context.workspace,
+      preset: context.role,
+      detail: {
+        sessionId: maskSessionId(context.sessionId),
+        sessionObjectId: maskSessionId(sessionObjectId),
+        sameId: sessionObjectId === null ? null : sessionObjectId === context.sessionId,
+        foundTitle: context.sessionTitle !== null,
+        preset: context.role,
+        workspace: context.workspace,
+        titleSource,
+        homeSource: agentInspect?.homeSource ?? null,
+        cacheDirExists: agentInspect?.cacheDirExists === true,
+        fileFoundByAgentId: agentInspect?.fileFound === true,
+        fileFoundBySessionId: sessionInspect?.fileFound === true,
+        hasTitleByAgentId: agentInspect?.hasTitleField === true,
+        hasTitleBySessionId: sessionInspect?.hasTitleField === true,
+      },
+    });
+  } catch {
+    /* журнал не должен ронять контекст */
+  }
   const card = findOwnedTaskCard(cwd, context.sessionId, { log });
   context.taskId = card === null ? null : card.id;
   context.branch = card === null ? null : card.branch;
@@ -407,8 +556,12 @@ export function renderHeader(context = {}) {
   const tail = [];
   if (taskId !== "") tail.push(t("present.task", { id: taskId }, lang));
   if (shortBranch !== null && shortBranch !== taskId) tail.push(truncateWord(shortBranch, BRANCH_LIMIT));
-  const role = typeof context.role === "string" && context.role !== ""
-    ? truncateWord(context.role, WORKSPACE_LIMIT)
+  // 068: в шапке — имя сессии, иначе пресет (обратная совместимость).
+  const displayRole = typeof context.sessionTitle === "string" && context.sessionTitle !== ""
+    ? context.sessionTitle
+    : context.role;
+  const role = typeof displayRole === "string" && displayRole !== ""
+    ? truncateWord(displayRole, WORKSPACE_LIMIT)
     : null;
   if (role !== null) tail.push(role);
   // Номер вопроса в пачке: в мессенджере вопросы идут отдельными сообщениями.
@@ -481,6 +634,7 @@ export function renderBody(question = {}, caps = {}) {
     taskId: question.taskId ?? null,
     branch: question.branch ?? null,
     role: question.role ?? null,
+    sessionTitle: question.sessionTitle ?? null,
     index: question.index ?? null,
     total: question.total ?? null,
     now,
@@ -505,7 +659,10 @@ export function renderBody(question = {}, caps = {}) {
   const hasOptions = Array.isArray(question.options) && question.options.length > 0;
   const buttonsUsable = caps.inlineButtons !== false;
   let answerHint = null;
-  if (hasOptions) {
+  if (question.mirrorNotify === true) {
+    // 072: в notify не приглашаем печатать текст — ответ в GUI/кнопкой.
+    answerHint = t("present.mirrorNotifyHint", {}, lang);
+  } else if (hasOptions) {
     answerHint = buttonsUsable ? t("present.buttonHint", {}, lang) : t("present.freeTextHint", {}, lang);
   } else if (question.allowFreeText !== false) {
     const quick = normalizeQuickReplies(question.quickReplies, lang);
@@ -578,7 +735,8 @@ export function renderRows(question = {}, caps = {}) {
   // Раскладка по приоритету: варианты → «Показать ещё» (если не всё влезло) →
   // «Другой ответ…». При одном свободном ряде (maxOptions=1) жертвуем раскрытием:
   // одна кнопка «Показать ещё» без вариантов бессмысленна.
-  let freeSlots = question.allowFreeText === false ? 0 : 1;
+  // 072: в notify не предлагаем «Другой ответ…» — текст не приглашается.
+  let freeSlots = question.allowFreeText === false || question.mirrorNotify === true ? 0 : 1;
   // Карточка: «Показать ещё» появляется, когда вариантов больше, чем maxOptions-1
   // (один ряд всегда оставляем под служебную кнопку).
   let showMore = options.length > Math.max(1, maxOptions - 1);
@@ -604,3 +762,16 @@ export function renderRows(question = {}, caps = {}) {
   }
   return rows.slice(0, maxOptions);
 }
+
+// 079: активный present для ответчика/команд. /remote reload загружает свежий
+// модуль, и читатели берут resolveContext/render* уже из него.
+globalThis.__dshRemotePresent = {
+  resolveContext,
+  sessionTitleFromProjection,
+  inspectSessionTitle,
+  renderBody,
+  renderRows,
+  renderHtml,
+  FREE_TEXT_OPTION,
+  MORE_OPTION,
+};

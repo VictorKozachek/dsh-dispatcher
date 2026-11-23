@@ -37,6 +37,12 @@ import {
 } from "./domain/approval.js";
 import { resolveContext } from "./present.js";
 
+/** 079: свежий present после /remote reload; статический — fallback. */
+function resolveContextHot(options) {
+  const active = globalThis.__dshRemotePresent;
+  return (typeof active?.resolveContext === "function" ? active.resolveContext : resolveContext)(options);
+}
+
 const noopLog = () => {};
 
 /** Имя waterfall'а DSH для подтверждений. */
@@ -85,6 +91,8 @@ export function createApprovals({
   policy = null,
   /** Колбэк аудита решений политики (026): {type, toolName, reason, at}. */
   onDecision = null,
+  /** 074: последнее решение по подтверждению (включая remote/timeout) для статуса. */
+  onLastDecision = null,
   /** Исход по таймауту: `cancelled` (по умолчанию) или `unavailable`; никогда `allowed-once`. */
   onTimeout = null,
   setTimeout: setTimeoutImpl = setTimeout,
@@ -480,9 +488,8 @@ export function createApprovals({
    * кнопкой, `gui` — отдали GUI (доставка не удалась), `timeout` — снято без
    * ответа (аборт запроса; TTL-политика — задача 025).
    */
-  function record(approval, { outcome, decision, channel = null, chatId = null, answeredBy = null }) {
-    if (audit === null) return;
-    audit.append({
+  function record(approval, { outcome, decision, channel = null, chatId = null, answeredBy = null, reason = null }) {
+    const entry = {
       kind: "approval",
       questionId: approval.id,
       toolName: approval.toolName,
@@ -495,7 +502,26 @@ export function createApprovals({
       workspace: approval.workspace ?? undefined,
       waitedMs: Math.max(0, now() - approval.createdAt),
       decision,
-    });
+      ...(reason === null ? {} : { reason }),
+    };
+    if (audit !== null) audit.append(entry);
+    // 074: «последнее решение» включает и удалённый ответ, и таймаут — иначе
+    // status навсегда показывает старую policy-GUI причину.
+    if (typeof onLastDecision === "function") {
+      try {
+        onLastDecision({
+          type: "approval",
+          decision,
+          toolName: approval.toolName,
+          reason: reason ?? (decision === "remote" ? "allowed" : decision),
+          outcome,
+          at: now(),
+          sessionId: approval.sessionId ?? null,
+        });
+      } catch (error) {
+        log(`подтверждение ${approval.toolName}: last-decision не записан (${error?.message ?? error})`);
+      }
+    }
   }
 
   function statsFor(outcome) {
@@ -516,8 +542,15 @@ export function createApprovals({
   /** Маркировка (006): роль и задача сессии. Ошибки чтения не мешают подтверждению. */
   function marksOf(sessionId) {
     try {
-      const resolved = resolveContext({ sessionId, ctx: context, log });
-      return { role: resolved?.role ?? null, taskId: resolved?.taskId ?? null };
+      const resolved = resolveContextHot({ sessionId, ctx: context, log });
+      // 080: весь контекст, а не список (как 078): sessionTitle иначе теряется.
+      return {
+        role: resolved?.role ?? null,
+        sessionTitle: resolved?.sessionTitle ?? null,
+        taskId: resolved?.taskId ?? null,
+        branch: resolved?.branch ?? null,
+        worktree: resolved?.worktree ?? null,
+      };
     } catch (error) {
       log(`подтверждение: контекст сессии не прочитан (${error?.message ?? error})`);
       return { role: null, taskId: null };
@@ -554,8 +587,7 @@ export function createApprovals({
     const approval = new RemoteApproval(request, {
       sessionId,
       workspace,
-      role: marks.role,
-      taskId: marks.taskId,
+      ...marks,
       chatId: channel.chatId,
       threadId: channel.threadId,
       now: now(),
@@ -581,7 +613,7 @@ export function createApprovals({
           /* метрики не должны ронять решение */
         }
         statsFor(APPROVAL_OUTCOME.unavailable);
-        record(approval, { outcome: APPROVAL_OUTCOME.unavailable, decision: "gui" });
+        record(approval, { outcome: APPROVAL_OUTCOME.unavailable, decision: "gui", reason: resolution.reason });
         const legacy = recordPolicyDecision(request, toolName, resolution);
         log(`подтверждение ${toolName}: отдано GUI по политике (${resolution.reason}: ${resolution.message}; audit ${legacy.type})`);
         return next();

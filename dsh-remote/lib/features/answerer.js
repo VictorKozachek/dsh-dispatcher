@@ -9,7 +9,7 @@
  * пока источник пустой, значит режим выключен, и это тот же безопасный путь.
  */
 
-import { createAnswerer } from "../answerer.js";
+import { createAnswerer, detectMirrorMode } from "../answerer.js";
 import { resolveChannel } from "../store.js";
 import { resolveLanguage } from "../i18n.js";
 import { createRegistry } from "../domain/registry.js";
@@ -78,15 +78,30 @@ function createBindingTransport({ facade, registry, store, log = () => {} }) {
     return active();
   };
   const sync = () => {
-    const candidates = new Set([facade]);
+    // 066: подписываемся на настоящие транспорты, а не на фасад и его же
+    // current одновременно — иначе один ответ приходит дважды (фасад «telegram»
+    // + реальный «max»). Set дедуплицирует ссылки на один объект.
+    const candidates = new Set();
+    const add = (channel) => {
+      if (channel !== null && channel !== undefined && typeof channel.onAnswer === "function") candidates.add(channel);
+    };
+    add(facade?.current ?? null);
     try {
-      for (const channel of registry?.values?.() ?? []) candidates.add(channel);
+      for (const channel of registry?.values?.() ?? []) add(channel);
     } catch {
       /* реестр недоступен */
     }
+    for (const [channel, off] of subscriptions) {
+      if (candidates.has(channel)) continue;
+      try {
+        off?.();
+      } catch {
+        /* уже отписан */
+      }
+      subscriptions.delete(channel);
+    }
     for (const channel of candidates) {
-      if (channel === null || channel === undefined || subscriptions.has(channel)) continue;
-      if (typeof channel.onAnswer !== "function") continue;
+      if (subscriptions.has(channel)) continue;
       let off = null;
       try {
         off = channel.onAnswer((event) => {
@@ -229,6 +244,10 @@ export const answererFeature = {
 
     // 012: у каждого канала — своя доставка reliability (повторы/backoff/give-up).
     const deliverFor = deps.get("remoteReliabilityDeliver");
+    // 063: feature-detect возможностей хоста. settle + событие (ctx.on) — полное
+    // зеркало; без settle — деградация B (GUI источник истины, канал уведомляет).
+    const userQuestions = deps.get("userQuestions") ?? ctx?.get?.("userQuestions") ?? null;
+    const mirrorCaps = detectMirrorMode(userQuestions);
     // Гибрид (013): ждём ответ в мессенджере `hybrid.waitMs`, потом отдаём в GUI.
     const answerer = createAnswerer({
       transport: activeTransport,
@@ -237,6 +256,16 @@ export const answererFeature = {
       channelOf: (workspace, transportId) => resolveChannel(store?.read?.() ?? {}, workspace, transportId),
       transports,
       hybrid: () => (store?.read?.().hybrid ?? { enabled: false }),
+      mirror: () => {
+        const enabled = store?.read?.().mirror?.enabled === true;
+        return {
+          enabled,
+          mode: enabled ? mirrorCaps : "none",
+          settle: userQuestions?.settle ?? null,
+          cancel: userQuestions?.cancel ?? null,
+          host: userQuestions,
+        };
+      },
       registry,
       quickReplies: config?.quickReplies,
       // 056: журнал мог не попасть в общий реестр (или deps.get вернул null) —

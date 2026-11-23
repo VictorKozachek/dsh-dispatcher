@@ -34,6 +34,7 @@ import {
   parseCallbackData,
 } from "./base.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderHtml, renderRows } from "../present.js";
+import { hotLoad } from "../hot.js";
 
 /** Базовый адрес Bot API: тот же формат, что в доке (`/bot<token>/<method>`). */
 const API_BASE = "https://api.telegram.org";
@@ -428,14 +429,20 @@ export function createTelegramTransport(options = {}) {
     const text = String(summary ?? "").trim();
     // Пустая строка или служебная причина — не ответ: снимаем кнопки, но текст
     // не переписываем, иначе человек увидит «Ответ: aborted».
-    const silent = text === "" || CLOSE_REASONS.has(text.toLowerCase());
+    const inGui = text === "answered-in-gui";
+    const inMessenger = text === "answered-in-messenger";
+    const silent = !inGui && !inMessenger && (text === "" || CLOSE_REASONS.has(text.toLowerCase()));
     const payload = silent
       ? { chat_id: record.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }
       : {
         chat_id: record.chatId,
         message_id: messageId,
         parse_mode: "HTML",
-        text: `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
+        text: inGui
+          ? "✅ <b>Отвечено в GUI</b>"
+          : inMessenger
+            ? "✅ <b>Отвечено (передано в сессию)</b>"
+            : `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
         reply_markup: { inline_keyboard: [] },
       };
     try {
@@ -504,12 +511,16 @@ export function createTelegramTransport(options = {}) {
       // Текст собирает слой представления (006): шапка «откуда», тело, подсказка
       // multiSelect, усечение под caps.maxText. Отправляем parse_mode HTML,
       // поэтому экранируем ВЕСЬ простой текст целиком — сущности не рвутся.
-      const text = renderHtml(renderBody(question, caps));
+      const present = await hotLoad("present.js").catch(() => null);
+      const renderBodyFn = typeof present?.renderBody === "function" ? present.renderBody : renderBody;
+      const renderHtmlFn = typeof present?.renderHtml === "function" ? present.renderHtml : renderHtml;
+      const renderRowsFn = typeof present?.renderRows === "function" ? present.renderRows : renderRows;
+      const text = renderHtmlFn(renderBodyFn(question, caps));
 
       // Кнопки — тоже из представления: варианты по одной в ряд, «Показать ещё»
       // при переполнении, «Другой ответ…» последним.
       const buttons = caps.inlineButtons
-        ? renderRows(question, caps)
+        ? renderRowsFn(question, caps)
           .map((row) => row
             .map((button) => {
               const optionId = button.optionId
