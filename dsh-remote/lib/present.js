@@ -556,10 +556,10 @@ export function renderHeader(context = {}) {
   const tail = [];
   if (taskId !== "") tail.push(t("present.task", { id: taskId }, lang));
   if (shortBranch !== null && shortBranch !== taskId) tail.push(truncateWord(shortBranch, BRANCH_LIMIT));
-  // 068: в шапке — имя сессии, иначе пресет (обратная совместимость).
-  const displayRole = typeof context.sessionTitle === "string" && context.sessionTitle !== ""
-    ? context.sessionTitle
-    : context.role;
+  // 083: длинное имя сессии печатается отдельной строкой (renderBody), а не
+  // съедает шапку. Без имени в шапке остаётся пресет (068).
+  const hasSessionTitle = typeof context.sessionTitle === "string" && context.sessionTitle.trim() !== "";
+  const displayRole = hasSessionTitle ? null : context.role;
   const role = typeof displayRole === "string" && displayRole !== ""
     ? truncateWord(displayRole, WORKSPACE_LIMIT)
     : null;
@@ -623,6 +623,52 @@ export function taskLinkHint(question = {}) {
  * Строка целиком укладывается в `caps.maxText`; если не влезает — усечение с
  * маркером «…обрезано» (лучше честный хвост, чем молча потерянный текст).
  */
+/** 083: ширина/число строк имени сессии — не съедать тело вопроса. */
+export const SESSION_TITLE_WIDTH = 40;
+export const SESSION_TITLE_LINES = 2;
+
+/** 083: перенос по словам с сохранением начала; длинное — по границе слова. */
+export function wrapSessionTitle(value, { width = SESSION_TITLE_WIDTH, lines = SESSION_TITLE_LINES } = {}) {
+  const text = typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
+  if (text === "") return [];
+  const limit = Math.max(12, Math.floor(width));
+  const maxLines = Math.max(1, Math.floor(lines));
+  const words = text.split(" ");
+  const out = [];
+  let current = "";
+  let truncated = false;
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index];
+    const candidate = current === "" ? word : `${current} ${word}`;
+    if (candidate.length <= limit) {
+      current = candidate;
+      continue;
+    }
+    if (current !== "") {
+      out.push(current);
+      current = "";
+      if (out.length === maxLines) {
+        truncated = true;
+        break;
+      }
+    }
+    if (word.length > limit) {
+      out.push(`${word.slice(0, Math.max(1, limit - 1))}…`);
+      truncated = index < words.length - 1;
+      current = "";
+      break;
+    }
+    current = word;
+  }
+  if (!truncated && current !== "") out.push(current);
+  if (out.length === 0) return [];
+  if (truncated) {
+    const last = out[out.length - 1];
+    out[out.length - 1] = last.endsWith("…") ? last : `${last}…`;
+  }
+  return out.slice(0, maxLines);
+}
+
 export function renderBody(question = {}, caps = {}) {
   const lang = normalizeLang(question.lang ?? caps.lang) ?? DEFAULT_LANG;
   const maxText = Number.isFinite(caps.maxText) ? caps.maxText : DEFAULT_CAPS.maxText;
@@ -642,7 +688,10 @@ export function renderBody(question = {}, caps = {}) {
     lang,
   });
 
-  const parts = [header, ""];
+  const titleWidth = Math.max(12, Math.min(SESSION_TITLE_WIDTH, Math.floor(maxText / 4)));
+  const sessionLines = wrapSessionTitle(question.sessionTitle, { width: titleWidth });
+  const sessionBlock = sessionLines.join("\n");
+  const parts = [header, ...(sessionLines.length === 0 ? [""] : [sessionBlock, ""])];
   const title = typeof question.title === "string" ? question.title.trim() : "";
   if (title !== "") parts.push(title, "");
   const detail = typeof question.detail === "string" ? question.detail.trim() : "";
