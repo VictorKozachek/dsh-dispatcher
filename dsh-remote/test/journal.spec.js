@@ -477,3 +477,55 @@ test("056: commandsFeature берёт журнал из deps.expose при ctx.g
     else process.env.DSH_HOME = previousHome;
   }
 });
+
+test("081: реальный log.jsonl получает workspace/sessionId/preset с первого события", async (t) => {
+  const dir = tempDir(t);
+  const file = path.join(dir, "log.jsonl");
+  const journal = createJournal({ file, now: () => 1_700_000_000_000 });
+  const handlers = new Set();
+  const transport = {
+    id: "max",
+    sent: [],
+    closed: [],
+    async sendQuestion(question) { this.sent.push(question); return { messageId: "m-1" }; },
+    async closeQuestion() {},
+    onAnswer(handler) { handlers.add(handler); return () => handlers.delete(handler); },
+    answer(event) { for (const handler of [...handlers]) handler(event); },
+  };
+  const answerer = createAnswerer({
+    transport,
+    registry: createRegistry({ readState: () => ({ global: true }) }),
+    journal,
+    now: () => 1_000,
+    log: () => {},
+  });
+  const ctx = {
+    on: () => () => {},
+    effect: (fn) => { const dispose = fn(); return () => dispose?.(); },
+    get: (name) => (name === "sessions"
+      ? { get: () => ({ header: { cwd: "/p/project", agentPreset: "worker" } }) }
+      : null),
+  };
+  answerer.attach(ctx);
+  const pending = answerer.handler({
+    questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }],
+    agent: { id: "session-8aac9774-1111" },
+  }, () => "gui");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(transport.sent.length, 1);
+  transport.answer({ shortId: transport.sent[0].shortId, optionIds: ["o1"] });
+  await pending;
+
+  const entries = fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const send = entries.find((entry) => entry.event === "question.send");
+  assert.ok(send, "question.send записан");
+  assert.equal(send.workspace, "project");
+  assert.equal(send.sessionId, "8aac9774…");
+  assert.equal(send.preset, "worker");
+  assert.equal(JSON.stringify(entries).includes("/p/project"), false, "полного пути нет");
+  for (const entry of entries.filter((item) => typeof item.shortId === "string")) {
+    assert.equal(entry.workspace, "project", `${entry.event}: workspace`);
+    assert.equal(entry.sessionId, "8aac9774…", `${entry.event}: sessionId`);
+    assert.equal(entry.preset, "worker", `${entry.event}: preset`);
+  }
+});
