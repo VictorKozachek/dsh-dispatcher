@@ -69,6 +69,10 @@ const dictionariesBase = Object.freeze({
     "commands.lang.current": "язык: {lang}",
     "commands.lang.set": "язык переключён: {lang}",
     "commands.lang.usage": "usage: /remote lang ru|en",
+    "answer.rejected.unknown": "Этот вопрос уже снят — ответьте в GUI",
+    "answer.rejected.expired": "Вопрос уже снят (истекло время) — ответьте в GUI",
+    "answer.rejected.already-answered": "Ответ уже дан — повторный не нужен",
+
     "commands.connect.approvalsQuestion": "Присылать подтверждения опасных действий (запуск команд, запись файлов, git push) в мессенджер? «Да, всё» разрешает подтверждать выполнение команд с телефона.",
     "commands.connect.approvalsAll": "Да, всё",
     "commands.connect.approvalsSafe": "Только безопасные (по умолчанию)",
@@ -156,6 +160,10 @@ const dictionariesBase = Object.freeze({
     "commands.lang.current": "language: {lang}",
     "commands.lang.set": "language switched: {lang}",
     "commands.lang.usage": "usage: /remote lang ru|en",
+    "answer.rejected.unknown": "This question is already closed — answer in the GUI",
+    "answer.rejected.expired": "The question has expired — answer in the GUI",
+    "answer.rejected.already-answered": "Already answered — no need to repeat",
+
     "commands.connect.approvalsQuestion": "Send confirmations of dangerous actions (commands, file writes, git push) to the messenger? «Yes, all» allows approving command execution from the phone.",
     "commands.connect.approvalsAll": "Yes, all",
     "commands.connect.approvalsSafe": "Safe only (default)",

@@ -34,6 +34,7 @@
 import { randomUUID } from "node:crypto";
 
 import { ANSWERED_ELSEWHERE, createBroker } from "./broker.js";
+import { t } from "./i18n.js";
 import { createQuestions } from "./domain/question.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, resolveContext } from "./present.js";
 
@@ -453,6 +454,31 @@ export function createAnswerer({
     void closeMessage(entry.question);
   }
 
+  /** 085: не спамить подсказками на одно сообщение (LRU по chat/message). */
+  const rejectedHints = new Map();
+  function rejectHint(event, reason, question = null) {
+    const key = `${event?.chatId ?? ""}:${event?.messageId ?? event?.callbackId ?? ""}`;
+    if (key !== ":" && rejectedHints.has(key)) return false;
+    if (key !== ":") {
+      rejectedHints.set(key, reason);
+      if (rejectedHints.size > 200) rejectedHints.delete(rejectedHints.keys().next().value);
+    }
+    journalEvent("answer.rejected", { shortId: event?.shortId ?? null, detail: { reason } });
+    const text = t(`answer.rejected.${reason}`);
+    const payload = { ...(event ?? {}), text, userText: typeof event?.text === "string" ? event.text : "", question };
+    try {
+      const source = question?.sourceTransport ?? null;
+      if (typeof source?.rejectUnknown === "function") {
+        void Promise.resolve(source.rejectUnknown(payload)).catch(() => {});
+      } else if (typeof primary?.rejectUnknown === "function") {
+        void Promise.resolve(primary.rejectUnknown(payload)).catch(() => {});
+      }
+    } catch {
+      /* подсказка не должна ронять ответчик */
+    }
+    return true;
+  }
+
   function onTransportAnswer(event, sourceTransport = null) {
     let incoming = event;
     // 037: свободный текст без reply. Транспорт обычно проставляет shortId
@@ -552,6 +578,7 @@ export function createAnswerer({
         });
         log(`ответ на ${normalized.shortId} из канала ${sourceTransport?.id ?? "?"} проигнорирован:`
           + ` вопрос уже отвечен в ${knownQuestion.answeredVia ?? "другом канале"}`);
+        rejectHint(event, "already-answered", knownQuestion);
         return;
       }
       journalEvent("answer.unmatched", {
@@ -559,6 +586,10 @@ export function createAnswerer({
         shortId: normalized.shortId,
         detail: { reason: knownQuestion === undefined ? "shortId" : "closed", optionIds: normalized.optionIds },
       });
+      const rejectReason = knownQuestion?.status === "expired" || knownQuestion?.status === "cancelled"
+        ? "expired"
+        : "unknown";
+      rejectHint(event, rejectReason, knownQuestion ?? recentlyClosed.get(normalized.shortId) ?? null);
       // Поздний ответ: вопрос уже снят (TTL/аборт/перезапуск). Это не игнор —
       // карточка требует, чтобы ответ дошёл до сессии через `steer`.
       const closedQuestion = recentlyClosed.get(normalized.shortId);

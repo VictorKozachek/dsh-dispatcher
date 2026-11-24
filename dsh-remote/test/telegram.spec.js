@@ -1007,3 +1007,16 @@ test("055: Telegram по-прежнему режет текст по 4096", asyn
   assert.ok(send, "sendMessage ушёл");
   assert.ok(send.payload.text.length <= 4096, `длина ${send.payload.text.length}`);
 });
+
+test("085: rejectUnknown отвечает на callback и не правит текст человека", async () => {
+  const { transport, calls } = setup();
+  assert.equal(await transport.rejectUnknown({ callbackId: "cb-1", chatId: 42, text: "Этот вопрос уже снят" }), true);
+  const answer = calls.filter((call) => call.method === "answerCallbackQuery").at(-1);
+  assert.equal(answer.payload.callback_query_id, "cb-1");
+  assert.match(answer.payload.text, /уже снят/);
+
+  assert.equal(await transport.rejectUnknown({ chatId: 42, messageId: 77, text: "Этот вопрос уже снят", userText: "мой ответ" }), true);
+  const sent = calls.filter((call) => call.method === "sendMessage").at(-1);
+  assert.match(sent.payload.text, /уже снят/);
+  assert.equal(calls.some((call) => call.method === "editMessageText" && call.payload.message_id === 77), false, "чужое сообщение не правим");
+});
