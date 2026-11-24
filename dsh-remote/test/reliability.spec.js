@@ -381,7 +381,7 @@ test("TTL: пометка «⌛» невозможна — закрываем и
 
   assert.equal(transport.closed.length, 1, "кнопки сняты, даже если пометить нельзя");
   assert.equal(outcomes.length, 1, "исход истечения применён");
-  assert.match(fs.readFileSync(files.log, "utf8"), /expire-unmarked/);
+  assert.match(fs.readFileSync(files.log, "utf8"), /question\.expired/);
 });
 
 test("сторож включается через setInterval с unref и выключается", () => {

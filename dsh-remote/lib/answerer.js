@@ -377,17 +377,31 @@ export function createAnswerer({
       if (!question.cancel(reason, now())) continue;
       if (attempted !== null && !attempted.has(question)) continue;
       try {
+        let closed = true;
         if (useBroker && (question.deliveries?.length ?? 0) > 0) {
           // 012: в мультиканале одиночный `transport` — пустой фасад, поэтому
           // закрываем через брокер, иначе сообщения остаются с кнопками.
-          await broker.closeAll(question, { winner: null, summary: reason });
+          const outcome = await broker.closeAll(question, { winner: null, summary: reason });
+          closed = outcome?.ok !== false;
         } else {
-          await primary?.closeQuestion?.(question, reason);
+          // 084: `false` — транспорт не смог править сообщение; это не повод
+          // считать вопрос снятым молча.
+          closed = (await primary?.closeQuestion?.(question, reason)) !== false;
         }
+        if (!closed) throw new Error("канал не смог снять сообщение");
       } catch (error) {
         log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
         try {
-          onCloseError?.(question, error);
+          if (typeof onCloseError !== "function") {
+            // 084: неудача правки видна в журнале; ответ и сессия при этом не
+            // страдают — закрытие сообщения уже best effort.
+            journalEvent("question.closeFailed", {
+              shortId: question.shortId,
+              detail: { reason, message: String(error?.message ?? error) },
+            });
+          } else {
+            onCloseError(question, error);
+          }
         } catch {
           /* диагностика не должна ломать закрытие */
         }
@@ -1115,6 +1129,12 @@ export function createAnswerer({
             /* метрики не должны ронять аборт */
           }
           cleanupBatch();
+          // 084: снятие видно в журнале до правок сообщений. Отвеченный в пачке
+          // вопрос не «снят» — его пропускаем.
+          for (const item of questions) {
+            if (item?.isOpen !== true) continue;
+            journalEvent("question.expired", { shortId: item.shortId, detail: { reason: "aborted" } });
+          }
           await closeQuestions(questions, "aborted", attempted);
           if (mirrorFull && !mirrorCancelCalled) {
             mirrorCancelCalled = true;

@@ -773,7 +773,7 @@ test("TTL на двух каналах: пометка и закрытие ид�
 
   assert.deepEqual(telegram.closed.map((item) => item.summary), ["expired"]);
   assert.deepEqual(max.closed.map((item) => item.summary), ["expired"]);
-  assert.equal(max.edited.at(-1).text, "⌛ ждёт ответа");
+  assert.equal(max.edited.length, 1, "TTL больше не правит текст отдельной пометкой");
 });
 
 test("recover после рестарта закрывает обе доставки из state.questions", async (t) => {
@@ -892,8 +892,8 @@ test("reliabilityFeature передаёт transportFor: TTL и recover идут 
   reliability.watch(question, { onExpire: () => {} });
   await reliability.tick();
 
-  assert.equal(edited.telegram.length, 1, "пометка в telegram");
-  assert.equal(edited.max.length, 1, "пометка в max");
+  assert.equal(edited.telegram.length, 0, "TTL не шлёт отдельную пометку");
+  assert.equal(edited.max.length, 0, "TTL не шлёт отдельную пометку");
   assert.deepEqual(closed.telegram.map((item) => item.summary), ["expired"]);
   assert.deepEqual(closed.max.map((item) => item.summary), ["expired"]);
 
