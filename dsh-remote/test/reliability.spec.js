@@ -343,6 +343,9 @@ test("TTL: правка вернула false — напоминание уход
 
   assert.equal(editCalls, 1, "правку пробовали");
   assert.equal(transport.sent.length, 1, "и упали в новое сообщение, а не потеряли напоминание");
+  assert.match(transport.sent[0].question.body, /⏳ осталось 5 минут \(обновление\)/);
+  await reliability.tick();
+  assert.equal(transport.sent.length, 1, "повторно не спамим новым напоминанием");
 });
 
 test("TTL: фасад без канала (editQuestion -> undefined) — напоминание не теряется молча", async (t) => {
