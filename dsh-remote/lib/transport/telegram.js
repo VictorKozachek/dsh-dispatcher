@@ -307,18 +307,25 @@ export function createTelegramTransport(options = {}) {
 
   /** Кнопка нажата: сначала гасим «часики», потом отдаём ответ наверх. */
   async function handleCallback(query) {
-    if (typeof query?.id === "string") {
-      try {
-        await call("answerCallbackQuery", { callback_query_id: query.id }, { attempts: 1 });
-      } catch (error) {
-        log(`telegram: answerCallbackQuery не прошёл (${error?.message ?? error})`);
-      }
-    }
     if (!allowed(query?.from?.id, query?.message?.chat?.id)) return;
     const parsed = parseCallbackData(query?.data);
     if (parsed === null) {
       log(`telegram: callback_data не разобрал (${JSON.stringify(query?.data)}) — игнор`);
       return;
+    }
+    const record = sent.get(parsed.shortId);
+    const known = record !== undefined && record.closed !== true;
+    const callbackMeta = {
+      callbackId: typeof query?.id === "string" ? query.id : null,
+      chatId: query?.message?.chat?.id ?? null,
+      messageId: query?.message?.message_id ?? null,
+    };
+    if (known && typeof query?.id === "string") {
+      try {
+        await call("answerCallbackQuery", { callback_query_id: query.id }, { attempts: 1 });
+      } catch (error) {
+        log(`telegram: answerCallbackQuery не прошёл (${error?.message ?? error})`);
+      }
     }
     // «Другой ответ…»: у inline-кнопок нет поля ввода, поэтому просим текст
     // отдельным сообщением с force_reply — иначе человек не понимает, куда писать.
@@ -337,6 +344,10 @@ export function createTelegramTransport(options = {}) {
       }
     }
 
+    if (!known) {
+      emit({ shortId: parsed.shortId, optionIds: [parsed.optionId], ...callbackMeta });
+      return;
+    }
     emit({
       shortId: parsed.shortId,
       optionIds: [parsed.optionId],
@@ -355,6 +366,18 @@ export function createTelegramTransport(options = {}) {
     }
     const shortId = shortIdForText(message);
     if (shortId === null) {
+      // 085: текст реплаем на уже снятое сообщение — отдаём ответчику, чтобы
+      // он показал «вопрос снят», а не молчал. Без reply это обычный чат.
+      if (message?.reply_to_message !== undefined) {
+        emit({
+          shortId: "unknown",
+          text,
+          answeredBy: String(message.from.id),
+          chatId: message?.chat?.id ?? null,
+          messageId: message.message_id ?? null,
+        });
+        return;
+      }
       log("telegram: свободный текст без открытого вопроса — игнор");
       return;
     }
@@ -686,6 +709,33 @@ export function createTelegramTransport(options = {}) {
         reply_markup: { inline_keyboard: [] },
       });
       return true;
+    },
+
+    /** 085: подсказка на клик по уже снятому сообщению (одна на сообщение). */
+    async rejectUnknown({ callbackId = null, chatId: targetChat = null, messageId = null, text = "" } = {}) {
+      if (typeof callbackId === "string" && callbackId !== "") {
+        try {
+          await call("answerCallbackQuery", { callback_query_id: callbackId, text: String(text) }, { attempts: 1 });
+          return true;
+        } catch (error) {
+          log(`telegram: подсказка по callback не прошла (${error?.message ?? error})`);
+        }
+      }
+      if (targetChat !== null && messageId !== null) {
+        try {
+          await call("editMessageText", {
+            chat_id: targetChat,
+            message_id: messageId,
+            parse_mode: "HTML",
+            text: escapeHtml(text),
+            reply_markup: { inline_keyboard: [] },
+          });
+          return true;
+        } catch (error) {
+          log(`telegram: подсказка в сообщение не прошла (${error?.message ?? error})`);
+        }
+      }
+      return false;
     },
 
     /** Подписка на ответы; возвращает отписку. */

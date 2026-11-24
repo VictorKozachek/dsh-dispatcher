@@ -614,8 +614,17 @@ export function createMaxTransport(options = {}) {
         return;
       }
       const record = sent.get(parsed.shortId);
+      const callbackMeta = {
+        callbackId: update?.callback?.callback_id ?? null,
+        chatId: update?.callback?.chat?.chat_id
+          ?? update?.callback?.message?.recipient?.chat_id
+          ?? update?.callback?.message?.chat?.chat_id
+          ?? null,
+        messageId: update?.callback?.message?.body?.mid ?? update?.callback?.message?.mid ?? null,
+      };
       if (record === undefined) {
-        log(`max: колбэк для ${parsed.shortId}: вопроса уже нет — игнор`);
+        log(`max: колбэк для ${parsed.shortId}: вопроса уже нет — отдаю ответчику для подсказки`);
+        emit({ shortId: parsed.shortId, optionIds: [parsed.optionId], ...callbackMeta });
         return;
       }
       const label = record.labels.get(parsed.optionId) ?? parsed.optionId;
@@ -965,6 +974,27 @@ export function createMaxTransport(options = {}) {
       }
       sent.delete(question.shortId);
       return ok;
+    },
+
+    /** 085: подсказка на клик по уже снятому сообщению (одна на сообщение). */
+    async rejectUnknown({ callbackId = null, chatId: targetChat = null, messageId = null, text = "" } = {}) {
+      if (typeof callbackId === "string" && callbackId !== "") {
+        try {
+          await answerCallback(callbackId, escapeHtml(text));
+          return true;
+        } catch (error) {
+          log(`max: подсказка по callback не прошла (${describeError(error, token)})`);
+        }
+      }
+      if (targetChat !== null && messageId !== null) {
+        try {
+          await transport.clearButtons({ messageId }, text);
+          return true;
+        } catch (error) {
+          log(`max: подсказка в сообщение не прошла (${describeError(error, token)})`);
+        }
+      }
+      return false;
     },
 
     /** Подписка на ответы; возвращает отписку. */
