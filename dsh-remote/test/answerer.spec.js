@@ -1043,3 +1043,54 @@ test("079: ответчик берёт resolveContext из горячего pres
     else globalThis.__dshRemotePresent = previous;
   }
 });
+
+test("085: клик по неизвестному shortId даёт подсказку один раз и answer.rejected", async () => {
+  const journal = fakeJournal();
+  const transport = fakeTransport();
+  const hints = [];
+  transport.rejectUnknown = async (payload) => { hints.push(payload); return true; };
+  const answerer = createAnswerer({
+    transport,
+    registry: createRegistry({ readState: () => ({ global: true }) }),
+    journal,
+    log: () => {},
+  });
+  const ctx = fakeContext();
+  answerer.attach(ctx);
+  const event = { shortId: "deadbeef", optionIds: ["o1"], callbackId: "cb1", chatId: 42, messageId: 99 };
+  transport.answer(event);
+  await tick();
+  assert.equal(hints.length, 1, "подсказка отправлена");
+  assert.match(hints[0].text, /вопрос уже снят|вопрос снят/i);
+  const rejected = journal.events.filter((item) => item.event === "answer.rejected");
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].detail.reason, "unknown");
+  transport.answer(event);
+  await tick();
+  assert.equal(hints.length, 1, "повтор не спамит");
+});
+
+test("085: повторный ответ на известный вопрос — answer.rejected already-answered", async () => {
+  const journal = fakeJournal();
+  const transport = fakeTransport();
+  const hints = [];
+  transport.rejectUnknown = async (payload) => { hints.push(payload); return true; };
+  const answerer = createAnswerer({
+    transport,
+    registry: createRegistry({ readState: () => ({ global: true }) }),
+    journal,
+    log: () => {},
+  });
+  const ctx = fakeContext();
+  answerer.attach(ctx);
+  const pending = answerer.handler({ questions: [item()], agent: { id: "s1" } }, () => assert.fail("next"));
+  await tick();
+  const shortId = transport.sent[0].shortId;
+  transport.answer({ shortId, optionIds: ["o1"], answeredBy: "7" });
+  await pending;
+  transport.answer({ shortId, optionIds: ["o2"], answeredBy: "7", chatId: 42, messageId: 10 });
+  await tick();
+  const rejected = journal.events.find((entry) => entry.event === "answer.rejected");
+  assert.equal(rejected.detail.reason, "already-answered");
+  assert.equal(hints.length, 1);
+});

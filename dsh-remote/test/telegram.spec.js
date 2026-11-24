@@ -442,8 +442,10 @@ test("служебная причина закрытия не выдаётся �
 
   await transport.closeQuestion(question(), "aborted");
 
-  assert.ok(calls.some((call) => call.method === "editMessageReplyMarkup"), "кнопки сняты");
-  assert.equal(calls.some((call) => call.method === "editMessageText"), false, "текст не врёт про ответ");
+  const edit = calls.find((call) => call.method === "editMessageText");
+  assert.ok(edit, "сообщение правится текстом «снят»");
+  assert.match(edit.payload.text, /⌛ вопрос снят/i);
+  assert.deepEqual(edit.payload.reply_markup, { inline_keyboard: [] });
 });
 
 test("ошибка правки не ломает ответ", async () => {
@@ -815,9 +817,10 @@ test("аборт во время отправки: сообщение закры
   releaseSend(response({ ok: true, result: { message_id: 500 } }));
   await settle(6);
 
-  const edit = calls.find((call) => call.method === "editMessageReplyMarkup");
+  const edit = calls.find((call) => call.method === "editMessageText");
   assert.ok(edit, "сообщение закрыто, когда отправка завершилась");
   assert.equal(edit.payload.message_id, 500);
+  assert.match(edit.payload.text, /⌛ вопрос снят/i);
   assert.deepEqual(edit.payload.reply_markup, { inline_keyboard: [] }, "кнопки сняты");
   assert.equal(transport.messages.has(shortId), false, "открытых записей не осталось");
 });
@@ -1003,4 +1006,17 @@ test("055: Telegram по-прежнему режет текст по 4096", asyn
   const send = calls.find((call) => call.method === "sendMessage");
   assert.ok(send, "sendMessage ушёл");
   assert.ok(send.payload.text.length <= 4096, `длина ${send.payload.text.length}`);
+});
+
+test("085: rejectUnknown отвечает на callback и не правит текст человека", async () => {
+  const { transport, calls } = setup();
+  assert.equal(await transport.rejectUnknown({ callbackId: "cb-1", chatId: 42, text: "Этот вопрос уже снят" }), true);
+  const answer = calls.filter((call) => call.method === "answerCallbackQuery").at(-1);
+  assert.equal(answer.payload.callback_query_id, "cb-1");
+  assert.match(answer.payload.text, /уже снят/);
+
+  assert.equal(await transport.rejectUnknown({ chatId: 42, messageId: 77, text: "Этот вопрос уже снят", userText: "мой ответ" }), true);
+  const sent = calls.filter((call) => call.method === "sendMessage").at(-1);
+  assert.match(sent.payload.text, /уже снят/);
+  assert.equal(calls.some((call) => call.method === "editMessageText" && call.payload.message_id === 77), false, "чужое сообщение не правим");
 });

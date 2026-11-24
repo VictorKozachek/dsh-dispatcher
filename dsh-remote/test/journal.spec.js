@@ -330,7 +330,7 @@ test("056: каркас journalFeature → deps → answerer пишет question
   for (const field of ["sessionId", "sessionObjectId", "sameId", "foundTitle", "preset"]) {
     assert.ok(Object.hasOwn(contextDetail, field), `context.resolve.${field}`);
   }
-  const entries = allEntries.filter((entry) => entry.event !== "context.resolve");
+  const entries = allEntries.filter((entry) => !["context.resolve", "question.expired"].includes(entry.event));
   const names = entries.map((entry) => entry.event);
   assert.deepEqual(names, ["question.send", "question.sent"], "обе записи через общий реестр");
   assert.equal(entries[0].transport, "max");
@@ -345,7 +345,7 @@ test("056: answerer берёт журнал через ctx.get, если deps.ge
 
   await runFeatureQuestion(stand);
 
-  const names = lines(file).filter((entry) => entry.event !== "context.resolve").map((entry) => entry.event);
+  const names = lines(file).filter((entry) => !["context.resolve", "question.expired"].includes(entry.event)).map((entry) => entry.event);
   assert.deepEqual(names, ["question.send", "question.sent"], "страховочный путь ctx.get");
 });
 

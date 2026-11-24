@@ -32,6 +32,7 @@ import {
   callbackData,
   checkTransport,
   chrome,
+  closeMarkupText,
   parseCallbackData,
   splitText,
   throttle,
@@ -217,7 +218,11 @@ export const MAX_CHAT_RPS_INTERVAL_MS = 500;
  */
 export const MAX_PAIRING_POLL_TIMEOUT_SEC = 5;
 
-/** Причины, при которых сообщение закрывается молчаливой пометкой. */
+/**
+ * Причины, при которых сообщение закрывается молчаливой пометкой (084: снятие
+ * по TTL/аборту/рестарту пишет «⌛ вопрос снят …» — текст берётся из
+ * `closeMarkupText` в `base.js`, чтобы Telegram и MAX не разошлись).
+ */
 const QUIET_REASONS = new Set([
   "aborted",
   "cancelled",
@@ -609,8 +614,17 @@ export function createMaxTransport(options = {}) {
         return;
       }
       const record = sent.get(parsed.shortId);
+      const callbackMeta = {
+        callbackId: update?.callback?.callback_id ?? null,
+        chatId: update?.callback?.chat?.chat_id
+          ?? update?.callback?.message?.recipient?.chat_id
+          ?? update?.callback?.message?.chat?.chat_id
+          ?? null,
+        messageId: update?.callback?.message?.body?.mid ?? update?.callback?.message?.mid ?? null,
+      };
       if (record === undefined) {
-        log(`max: колбэк для ${parsed.shortId}: вопроса уже нет — игнор`);
+        log(`max: колбэк для ${parsed.shortId}: вопроса уже нет — отдаю ответчику для подсказки`);
+        emit({ shortId: parsed.shortId, optionIds: [parsed.optionId], ...callbackMeta });
         return;
       }
       const label = record.labels.get(parsed.optionId) ?? parsed.optionId;
@@ -906,25 +920,37 @@ export function createMaxTransport(options = {}) {
       return true;
     },
 
-    /** Закрыть вопрос: кнопки снимаются, текст помечается. */
+    /**
+     * Закрыть вопрос: кнопки снимаются, текст помечается.
+     *
+     * 084: снятие по TTL/аборту/рестарту — одна правка «⌛ вопрос снят …» с
+     * `attachments: []`, а не «тихое» удаление клавиатуры: иначе в чате остаются
+     * живые кнопки, человек жмёт и не получает ничего (`answer.unmatched`).
+     *
+     * @returns {Promise<boolean|null>} `true` — правка ушла, `false` — не удалась
+     *   (вызывающий пишет `question.closeFailed`), `null` — снимать нечего.
+     */
     async closeQuestion(question, summary = "") {
       const record = sent.get(question?.shortId);
       if (record === undefined) {
         const messageId = question?.messageId;
-        if (messageId !== undefined && messageId !== null) {
-          // clearButtons сам экранирует текст — здесь не экранируем, иначе двойное.
-          const text = summary === "answered-in-gui"
-            ? "✅ Отвечено в GUI"
-            : summary === "answered-in-messenger"
-              ? "✅ Отвечено (передано в сессию)"
-              : summary === "answered-elsewhere"
-                ? "Отвечено в другом канале"
-                : QUIET_REASONS.has(summary)
-                  ? "⌛ ждёт ответа"
-                  : `✅ Отвечено: ${summary}`;
+        if (messageId === undefined || messageId === null) return null;
+        // clearButtons сам экранирует текст — здесь не экранируем, иначе двойное.
+        const text = summary === "answered-in-gui"
+          ? "✅ Отвечено в GUI"
+          : summary === "answered-in-messenger"
+            ? "✅ Отвечено (передано в сессию)"
+            : summary === "answered-elsewhere"
+              ? "Отвечено в другом канале"
+              : closeMarkupText(summary)
+                ?? (QUIET_REASONS.has(summary) ? "⌛ ждёт ответа" : `✅ Отвечено: ${summary}`);
+        try {
           await transport.clearButtons({ messageId }, text);
+          return true;
+        } catch (error) {
+          log(`max: закрыть сообщение ${question?.shortId ?? messageId} не удалось (${describeError(error, token)})`);
+          return false;
         }
-        return;
       }
       const quiet = QUIET_REASONS.has(summary);
       const text = summary === "answered-in-gui"
@@ -933,18 +959,50 @@ export function createMaxTransport(options = {}) {
           ? "✅ Отвечено (передано в сессию)"
         : summary === "answered-elsewhere"
           ? "Отвечено в другом канале"
-          : quiet
-            ? "⌛ ждёт ответа"
-            : `✅ Отвечено: ${escapeHtml(summary)}`;
+          : closeMarkupText(summary)
+            ?? (quiet ? "⌛ ждёт ответа" : `✅ Отвечено: ${escapeHtml(summary)}`);
+      let ok = true;
       try {
+        // Повтор с backoff (429/сеть) — внутри `request`.
         await editQueue.push(() => request("PUT", "/messages", {
           query: { message_id: record.mid },
           body: { text, format: "html", attachments: [] },
         })).run();
       } catch (error) {
+        ok = false;
         log(`max: закрыть сообщение ${question.shortId} не удалось (${describeError(error, token)})`);
       }
       sent.delete(question.shortId);
+      return ok;
+    },
+
+    /** 085: подсказка на клик по уже снятому сообщению (одна на сообщение). */
+    async rejectUnknown({ callbackId = null, chatId: targetChat = null, messageId = null, text = "", userText = "" } = {}) {
+      if (typeof callbackId === "string" && callbackId !== "") {
+        try {
+          await answerCallback(callbackId, escapeHtml(text));
+          return true;
+        } catch (error) {
+          log(`max: подсказка по callback не прошла (${describeError(error, token)})`);
+        }
+      }
+      if (targetChat !== null && userText !== "" && typeof sendNotice === "function") {
+        try {
+          await sendNotice(targetChat, text);
+          return true;
+        } catch (error) {
+          log(`max: подсказка в чат не прошла (${describeError(error, token)})`);
+        }
+      }
+      if (targetChat !== null && messageId !== null) {
+        try {
+          await transport.clearButtons({ messageId }, text);
+          return true;
+        } catch (error) {
+          log(`max: подсказка в сообщение не прошла (${describeError(error, token)})`);
+        }
+      }
+      return false;
     },
 
     /** Подписка на ответы; возвращает отписку. */

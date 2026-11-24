@@ -343,6 +343,9 @@ test("TTL: правка вернула false — напоминание уход
 
   assert.equal(editCalls, 1, "правку пробовали");
   assert.equal(transport.sent.length, 1, "и упали в новое сообщение, а не потеряли напоминание");
+  assert.match(transport.sent[0].question.body, /⏳ осталось 5 минут \(обновление\)/);
+  await reliability.tick();
+  assert.equal(transport.sent.length, 1, "повторно не спамим новым напоминанием");
 });
 
 test("TTL: фасад без канала (editQuestion -> undefined) — напоминание не теряется молча", async (t) => {
@@ -381,7 +384,7 @@ test("TTL: пометка «⌛» невозможна — закрываем и
 
   assert.equal(transport.closed.length, 1, "кнопки сняты, даже если пометить нельзя");
   assert.equal(outcomes.length, 1, "исход истечения применён");
-  assert.match(fs.readFileSync(files.log, "utf8"), /expire-unmarked/);
+  assert.match(fs.readFileSync(files.log, "utf8"), /question\.expired/);
 });
 
 test("сторож включается через setInterval с unref и выключается", () => {
@@ -1238,7 +1241,7 @@ test("настоящий telegram: напоминание — правка со�
   assert.equal(edits.length, 1, "напоминание ушло правкой (§7.3)");
 });
 
-test("настоящий telegram: по TTL сообщение помечается «⌛ ждёт ответа» и кнопки снимаются", async (t) => {
+test("настоящий telegram: по TTL сообщение помечается «⌛ вопрос снят (истекло время)» и кнопки снимаются", async (t) => {
   const clock = fakeClock();
   const payloads = [];
   const fetchImpl = async (url, init = {}) => {
@@ -1259,7 +1262,7 @@ test("настоящий telegram: по TTL сообщение помечает�
     log: () => {},
     persistOffset: () => {},
   });
-  const { reliability } = makeReliability(t, { clock, transport });
+  const { reliability, files } = makeReliability(t, { clock, transport });
   const question = openQuestion({ ttlMs: 10 * 60 * 1000, now: 0 });
   await transport.sendQuestion(question);
   reliability.watch(question);
@@ -1268,9 +1271,10 @@ test("настоящий telegram: по TTL сообщение помечает�
   await reliability.tick();
 
   const edits = payloads.filter(({ method }) => method === "editMessageText");
-  assert.ok(edits.length >= 1, "текст сообщения отредактирован");
-  assert.match(edits.at(-1).payload.text, /⌛ ждёт ответа/, "пометка по TTL");
-  const markup = payloads.filter(({ method }) => method === "editMessageReplyMarkup");
-  assert.ok(markup.length >= 1, "кнопки сняты");
+  assert.equal(edits.length, 1, "одна правка: предварительной пометки «ждёт ответа» нет");
+  assert.match(edits[0].payload.text, /⌛ вопрос снят \(истекло время\)/, "пометка по TTL");
+  assert.deepEqual(edits[0].payload.reply_markup, { inline_keyboard: [] }, "кнопки сняты той же правкой");
+  assert.equal(payloads.filter(({ method }) => method === "editMessageReplyMarkup").length, 0, "второй правки нет");
+  assert.match(fs.readFileSync(files.log, "utf8"), /"event":"question\.expired".*"reason":"ttl"/, "journal question.expired reason=ttl");
   assert.equal(payloads.filter(({ method }) => method === "sendMessage").length, 1, "новых сообщений нет");
 });

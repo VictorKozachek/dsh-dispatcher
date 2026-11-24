@@ -809,7 +809,7 @@ test("068: имя сессии из кэша проекций попадает �
       workspace: dir, role: context.role, sessionTitle: context.sessionTitle,
       body: "Продолжать?", createdAt: 0,
     }, { maxText: 4096 });
-    assert.match(body.split("\n")[0], /Оркестратор/);
+    assert.match(body.split("\n").slice(0, 2).join("\n"), /Оркестратор/);
     assert.equal(body.split("\n")[0].includes("standard"), false);
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME;
@@ -826,7 +826,9 @@ test("068: API title предпочтительнее файла; без име�
     const apiSession = { header: { cwd: dir, agentPreset: "standard", title: "Из API" } };
     const context = resolveContext({ sessionId: SESSION_ID, ctx: fakeCtx({ get: () => apiSession }) });
     assert.equal(context.sessionTitle, "Из API");
-    assert.match(renderHeader({ workspace: "p", role: "standard", sessionTitle: context.sessionTitle }), /Из API/);
+    const withTitle = renderBody({ workspace: "p", role: "standard", sessionTitle: context.sessionTitle, body: "x", createdAt: 0 }, { maxText: 4096 });
+    assert.match(withTitle.split("\n").slice(0, 2).join("\n"), /Из API/);
+    assert.equal(renderHeader({ workspace: "p", role: "standard", sessionTitle: context.sessionTitle }).includes("Из API"), false, "имя — отдельной строкой");
     assert.equal(renderHeader({ workspace: "p", role: "standard" }).includes("standard"), true, "без имени — пресет");
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME;
@@ -861,16 +863,21 @@ test("068: битый кэш/нет файла — пресет и debug-лог,
 });
 
 test("068: длинное имя усечено, HEADER_LIMIT соблюдён", (t) => {
-  const long = "Очень длинное имя сессии оркестратора проекта";
+  const long = "Сессия менеджера направления «Инфраструктура и надёжность» очень длинное имя оркестратора проекта";
   const home = projectionHome(t, SESSION_ID, long);
   const previous = process.env.DSH_HOME;
   process.env.DSH_HOME = home;
   try {
     const workspace = tempWorkspace(t);
     const context = resolveContext({ sessionId: SESSION_ID, ctx: fakeCtx({ get: () => session(workspace, "standard") }) });
-    const header = renderHeader({ workspace: "very-long-project-name", role: context.role, sessionTitle: context.sessionTitle, now: 0 });
+    const body = renderBody({ workspace: "very-long-project-name", role: context.role, sessionTitle: context.sessionTitle, body: "x", createdAt: 0 }, { maxText: 4096 });
+    const header = body.split("\n")[0];
+    const title = body.split("\n").slice(1, 3).join("\n");
     assert.ok(header.length <= HEADER_LIMIT, `длина ${header.length}`);
-    assert.equal(header.includes("…"), true);
+    assert.equal(header.includes("standard"), false);
+    assert.equal(title.split("\n").length <= 2, true, `имя: ${title}`);
+    assert.equal(title.includes("…"), true, "длинное имя усечено");
+    assert.ok(long.startsWith(title.replace("…", "").split("\n")[0].slice(0, 8)), "начало имени сохранено");
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previous;
@@ -897,7 +904,8 @@ test("069: имя находится по session.id, если request.agent.id 
     });
     const context = resolveContext({ sessionId: "agent-abc", ctx });
     assert.equal(context.sessionTitle, "Оркестратор");
-    assert.match(renderBody({ workspace, role: context.role, sessionTitle: context.sessionTitle, body: "x", createdAt: 0 }, { maxText: 4096 }).split("\n")[0], /Оркестратор/);
+    const rendered = renderBody({ workspace, role: context.role, sessionTitle: context.sessionTitle, body: "x", createdAt: 0 }, { maxText: 4096 });
+    assert.match(rendered.split("\n").slice(0, 2).join("\n"), /Оркестратор/);
   } finally {
     if (previous === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = previous;
@@ -1010,4 +1018,63 @@ test("072: full/remote-only сохраняют «Другой ответ…» и
   assert.equal(rows.flat().some((row) => row.kind === "free"), true);
   const body = renderBody(question, { maxText: 4096 });
   assert.match(body, /Нажмите кнопку/);
+});
+
+test("083: длинное имя сессии — отдельной строкой, время/дедлайн в шапке целы", () => {
+  const name = "Сессия менеджера направления «Инфраструктура и надёжность» очень длинное имя";
+  const body = renderBody({
+    workspace: "/p/infra",
+    taskId: "AIF-160",
+    role: "standard",
+    sessionTitle: name,
+    body: "Продолжать?",
+    createdAt: FIXED_NOW,
+    expiresAt: FIXED_DEADLINE,
+  }, { maxText: 4096 });
+  const lines = body.split("\n");
+  assert.match(lines[0], /^▸ infra · task AIF-160 · \d{2}:\d{2} · до \d{2}:\d{2}$/);
+  assert.equal(lines[0].includes(name), false, "имя не в шапке");
+  assert.match(lines[1], /^Сессия менеджера направления/);
+  assert.equal(lines[1].includes("standard"), false);
+  // Две строки имени максимум, усечение по границе слова и с сохранением начала.
+  const titleLines = lines.slice(1, 3);
+  assert.ok(titleLines.join(" ").length <= 90, `имя: ${titleLines.join(" ")}`);
+  assert.equal(titleLines.some((line) => line.endsWith("…")), true);
+  assert.equal(titleLines.join(" ").endsWith("…направления"), false);
+});
+
+test("083: имя не вытесняет тело — caps.maxText соблюдён, без имени прежний пресет", () => {
+  const name = "Сессия менеджера направления «Инфраструктура и надёжность» очень длинное имя";
+  const longBody = "Длинное тело вопроса. ".repeat(20);
+  const message = renderBody({
+    workspace: "/p/infra",
+    taskId: "AIF-160",
+    role: "standard",
+    sessionTitle: name,
+    body: longBody,
+    createdAt: FIXED_NOW,
+  }, { maxText: 260 });
+  assert.ok(message.length <= 260, `длина ${message.length}`);
+  assert.match(message, /обрезано|ещё \d+ строк/);
+  assert.match(message.split("\n").slice(1, 3).join("\n"), /Сессия менеджера/);
+
+  const without = renderBody({ workspace: "/p/infra", role: "standard", body: "x", createdAt: FIXED_NOW }, { maxText: 4096 });
+  assert.match(without.split("\n")[0], /standard/);
+});
+
+test("083: подтверждение рендерится с именем так же, как вопрос", () => {
+  const name = "Сессия менеджера направления «Инфраструктура и надёжность» очень длинное имя";
+  const approval = {
+    workspace: "/p/infra",
+    taskId: "AIF-160",
+    role: "standard",
+    sessionTitle: name,
+    body: "Инструмент: bash\nПричина: нужен доступ",
+    createdAt: FIXED_NOW,
+  };
+  const rendered = renderBody(approval, { maxText: 4096 });
+  const lines = rendered.split("\n");
+  assert.match(lines[0], /^▸ infra · task AIF-160 · \d{2}:\d{2}/);
+  assert.match(lines[1], /^Сессия менеджера направления/);
+  assert.match(rendered, /Инструмент: bash/);
 });

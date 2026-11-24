@@ -1259,3 +1259,12 @@ test("055: вопрос 5700 символов режется по 4000 и не �
   assert.match(text, /Ответьте текстом/i, "подсказка не обрезана");
   assert.equal(text.includes("Z".repeat(5700)), false, "тело усечено");
 });
+
+test("085: rejectUnknown MAX отвечает на callback текстом", async (t) => {
+  const { transport, calls } = setup(t);
+  assert.equal(await transport.rejectUnknown({ callbackId: "cb-9", chatId: 42, text: "Вопрос снят" }), true);
+  const answer = calls.find((call) => call.key === "POST /answers");
+  assert.ok(answer);
+  assert.equal(answer.url.searchParams.get("callback_id"), "cb-9");
+  assert.match(answer.body.message.text, /Вопрос снят/);
+});

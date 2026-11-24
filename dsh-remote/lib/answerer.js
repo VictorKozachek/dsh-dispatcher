@@ -34,6 +34,7 @@
 import { randomUUID } from "node:crypto";
 
 import { ANSWERED_ELSEWHERE, createBroker } from "./broker.js";
+import { t } from "./i18n.js";
 import { createQuestions } from "./domain/question.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, resolveContext } from "./present.js";
 
@@ -375,19 +376,40 @@ export function createAnswerer({
       // Уже отвеченный или закрытый вопрос второй раз не закрываем: сообщение в
       // мессенджере и так снято, а лишний closeQuestion — ложный сигнал транспорту.
       if (!question.cancel(reason, now())) continue;
+      // 084: снятие вопроса видно в журнале ровно один раз — по факту `cancel`,
+      // а не по вызову: уже отвеченный вопрос снятым не считается. Для аборта
+      // событие пишется и тогда, когда правка сообщения ниже не удалась
+      // (`question.closeFailed` добавится отдельно): вопрос-то снят.
+      if (reason === "aborted") {
+        journalEvent("question.expired", { shortId: question.shortId, detail: { reason: "aborted" } });
+      }
       if (attempted !== null && !attempted.has(question)) continue;
       try {
+        let closed = true;
         if (useBroker && (question.deliveries?.length ?? 0) > 0) {
           // 012: в мультиканале одиночный `transport` — пустой фасад, поэтому
           // закрываем через брокер, иначе сообщения остаются с кнопками.
-          await broker.closeAll(question, { winner: null, summary: reason });
+          const outcome = await broker.closeAll(question, { winner: null, summary: reason });
+          closed = outcome?.ok !== false;
         } else {
-          await primary?.closeQuestion?.(question, reason);
+          // 084: `false` — транспорт не смог править сообщение; это не повод
+          // считать вопрос снятым молча.
+          closed = (await primary?.closeQuestion?.(question, reason)) !== false;
         }
+        if (!closed) throw new Error("канал не смог снять сообщение");
       } catch (error) {
         log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
         try {
-          onCloseError?.(question, error);
+          if (typeof onCloseError !== "function") {
+            // 084: неудача правки видна в журнале; ответ и сессия при этом не
+            // страдают — закрытие сообщения уже best effort.
+            journalEvent("question.closeFailed", {
+              shortId: question.shortId,
+              detail: { reason, message: String(error?.message ?? error) },
+            });
+          } else {
+            onCloseError(question, error);
+          }
         } catch {
           /* диагностика не должна ломать закрытие */
         }
@@ -430,6 +452,31 @@ export function createAnswerer({
     stats.hybridPhoneAnswers += 1;
     log(`гибрид: ответ на ${entry.question.shortId} из мессенджера доставлен steer-ом`);
     void closeMessage(entry.question);
+  }
+
+  /** 085: не спамить подсказками на одно сообщение (LRU по chat/message). */
+  const rejectedHints = new Map();
+  function rejectHint(event, reason, question = null) {
+    const key = `${event?.chatId ?? ""}:${event?.messageId ?? event?.callbackId ?? ""}`;
+    if (key !== ":" && rejectedHints.has(key)) return false;
+    if (key !== ":") {
+      rejectedHints.set(key, reason);
+      if (rejectedHints.size > 200) rejectedHints.delete(rejectedHints.keys().next().value);
+    }
+    journalEvent("answer.rejected", { shortId: event?.shortId ?? null, detail: { reason } });
+    const text = t(`answer.rejected.${reason}`);
+    const payload = { ...(event ?? {}), text, userText: typeof event?.text === "string" ? event.text : "", question };
+    try {
+      const source = question?.sourceTransport ?? null;
+      if (typeof source?.rejectUnknown === "function") {
+        void Promise.resolve(source.rejectUnknown(payload)).catch(() => {});
+      } else if (typeof primary?.rejectUnknown === "function") {
+        void Promise.resolve(primary.rejectUnknown(payload)).catch(() => {});
+      }
+    } catch {
+      /* подсказка не должна ронять ответчик */
+    }
+    return true;
   }
 
   function onTransportAnswer(event, sourceTransport = null) {
@@ -531,6 +578,7 @@ export function createAnswerer({
         });
         log(`ответ на ${normalized.shortId} из канала ${sourceTransport?.id ?? "?"} проигнорирован:`
           + ` вопрос уже отвечен в ${knownQuestion.answeredVia ?? "другом канале"}`);
+        rejectHint(event, "already-answered", knownQuestion);
         return;
       }
       journalEvent("answer.unmatched", {
@@ -538,6 +586,10 @@ export function createAnswerer({
         shortId: normalized.shortId,
         detail: { reason: knownQuestion === undefined ? "shortId" : "closed", optionIds: normalized.optionIds },
       });
+      const rejectReason = knownQuestion?.status === "expired" || knownQuestion?.status === "cancelled"
+        ? "expired"
+        : "unknown";
+      rejectHint(event, rejectReason, knownQuestion ?? recentlyClosed.get(normalized.shortId) ?? null);
       // Поздний ответ: вопрос уже снят (TTL/аборт/перезапуск). Это не игнор —
       // карточка требует, чтобы ответ дошёл до сессии через `steer`.
       const closedQuestion = recentlyClosed.get(normalized.shortId);

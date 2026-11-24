@@ -309,6 +309,8 @@ export function createReliability({
 
   /** Вопросы под TTL-сторожем: shortId → запись наблюдения. */
   const watched = new Map();
+  /** 086: сколько доставок сейчас реально в полёте (sendQuestion). */
+  let activeDeliveries = 0;
   let timer = null;
 
   // --- доставка ------------------------------------------------------------
@@ -486,7 +488,8 @@ export function createReliability({
       };
 
     const outgoing = prepareQuestion(question);
-
+    activeDeliveries += 1;
+    try {
     for (let attempt = 1; ; attempt += 1) {
       if (signal?.aborted) return "aborted";
       try {
@@ -536,6 +539,9 @@ export function createReliability({
           return "give-up";
         }
       }
+    }
+    } finally {
+      activeDeliveries = Math.max(0, activeDeliveries - 1);
     }
   }
 
@@ -627,6 +633,11 @@ export function createReliability({
     }
   }
 
+  /** 086: идёт ли сейчас отправка/доставка (для сторожа канала). */
+  function isSending() {
+    return activeDeliveries > 0;
+  }
+
   function pendingList() {
     try {
       return store.read().pending;
@@ -673,24 +684,25 @@ export function createReliability({
         let ok = true;
         for (const delivery of deliveries) {
           const target = typeof transportFor === "function" ? transportFor(delivery.transport) : null;
-          const question = { shortId: orphan.shortId, questionId: orphan.questionId ?? orphan.shortId };
-          try {
-            if (delivery.messageId !== null && delivery.messageId !== undefined && typeof target?.editMessage === "function") {
-              await target.editMessage({ chatId: delivery.chatId, messageId: delivery.messageId }, reason);
-              if (typeof target.clearButtons === "function") {
-                await target.clearButtons({ chatId: delivery.chatId, messageId: delivery.messageId });
-              }
-            } else if (typeof target?.closeQuestion === "function") {
-              await target.closeQuestion(question, "restarted");
-            }
-          } catch (error) {
+          const question = {
+            shortId: orphan.shortId,
+            questionId: orphan.questionId ?? orphan.shortId,
+            chatId: delivery.chatId ?? null,
+            messageId: delivery.messageId ?? null,
+          };
+          const outcome = await closeDelivery(target, question, delivery, "restarted", "сессия перезапущена, вопрос снят");
+          if (outcome !== "closed") {
             ok = false;
-            logger(`рестарт: канал ${delivery.transport ?? "?"} вопроса ${orphan.shortId} не снят (${error?.message ?? error})`);
+            if (outcome === "failed") {
+              journal.append({ event: "question.closeFailed", shortId: orphan.shortId, reason: "restart" });
+            }
+            logger(`рестарт: канал ${delivery.transport ?? "?"} вопроса ${orphan.shortId} не снят`);
           }
         }
         if (ok) {
           cancelled += 1;
           journal.append({ event: "orphan-cancelled", shortId: orphan.shortId });
+          journal.append({ event: "question.expired", shortId: orphan.shortId, reason: "restart" });
         } else {
           failed += 1;
           journal.append({ event: "orphan-failed", shortId: orphan.shortId });
@@ -709,24 +721,31 @@ export function createReliability({
         journal.append({ event: "orphan-session-dead", shortId: orphan.shortId });
         logger(`рестарт: сессия ${orphan.sessionId} уже мертва — вопрос ${orphan.shortId} снимаю, не жду`);
       }
-      try {
-        const live = channel();
-        const question = { shortId: orphan.shortId, questionId: orphan.questionId ?? orphan.shortId };
-        if (orphan.messageId !== null && orphan.messageId !== undefined && typeof live?.editMessage === "function") {
-          // Реальное сообщение прошлого процесса: правим текст по chatId/messageId.
-          await live.editMessage({ chatId: orphan.chatId, messageId: orphan.messageId }, reason);
-          if (typeof live.clearButtons === "function") {
-            await live.clearButtons({ chatId: orphan.chatId, messageId: orphan.messageId });
-          }
-        } else if (typeof live?.closeQuestion === "function") {
-          await live.closeQuestion(question, "restarted");
-        }
+      // 084: одна правка на вопрос — «⌛ вопрос снят (сессия перезапущена)» и
+      // пустые кнопки. Записи в памяти после рестарта нет, поэтому закрываем по
+      // chatId/messageId из состояния.
+      const live = channel();
+      const question = {
+        shortId: orphan.shortId,
+        questionId: orphan.questionId ?? orphan.shortId,
+        chatId: orphan.chatId ?? null,
+        messageId: orphan.messageId ?? null,
+      };
+      const outcome = await closeDelivery(live, question, orphan, "restarted", "сессия перезапущена, вопрос снят");
+      if (outcome === "closed") {
         cancelled += 1;
         journal.append({ event: "orphan-cancelled", shortId: orphan.shortId });
-      } catch (error) {
+        journal.append({ event: "question.expired", shortId: orphan.shortId, reason: "restart" });
+      } else if (outcome === "failed") {
         failed += 1;
-        logger(`рестарт: вопрос ${orphan.shortId} не снят (${error?.message ?? error})`);
+        journal.append({ event: "question.closeFailed", shortId: orphan.shortId, reason: "restart" });
         journal.append({ event: "orphan-failed", shortId: orphan.shortId });
+      } else {
+        // Снимать нечего: сообщения в мессенджере не было — вопрос всё равно
+        // считается снятым, иначе он остался бы в состоянии навсегда.
+        cancelled += 1;
+        journal.append({ event: "orphan-cancelled", shortId: orphan.shortId });
+        journal.append({ event: "question.expired", shortId: orphan.shortId, reason: "restart" });
       }
     }
 
@@ -750,7 +769,7 @@ export function createReliability({
    * Напоминание/итог: правим сообщение, если транспорт умеет, иначе — короткое
    * новое сообщение (карточка это разрешает при `caps.editAfterAnswer === false`).
    */
-  async function notify(question, text) {
+  async function notify(question, text, { allowNew = true } = {}) {
     // Правку проверяем по результату, а не по наличию метода: фасад 005 есть
     // всегда, но если за ним нет живого канала, правка «успешно» ничего не делает.
     let editedAny = false;
@@ -767,12 +786,12 @@ export function createReliability({
     if (editedAny) return "edited";
     // Если правка не удалась (нет метода, вернул не `true`, фасад без канала) —
     // карточка требует короткое новое сообщение. Не теряем напоминание молча.
-    if (typeof transport?.sendQuestion === "function") {
+    if (allowNew && typeof transport?.sendQuestion === "function") {
       try {
         await transport.sendQuestion({
           shortId: randomUUID().slice(0, 8),
           questionId: question.questionId ?? question.shortId,
-          body: text,
+          body: `${text} (обновление)`,
           options: [],
           multiSelect: false,
           allowFreeText: false,
@@ -798,6 +817,7 @@ export function createReliability({
       onExpire: typeof onExpireHook === "function" ? onExpireHook : null,
       remindedAt: null,
       lastPushAt: null,
+      fallbackSent: false,
     });
     return true;
   }
@@ -830,34 +850,27 @@ export function createReliability({
         watched.delete(shortId);
         forgetOpen(shortId);
         question.expire?.(now());
-        // §7.3: по TTL сообщение помечается «⌛ ждёт ответа», и только потом
-        // снимаются кнопки. Silent-close сам текст не меняет.
-        let marked = false;
+        // 084: одна правка на вопрос — «⌛ вопрос снят (истекло время)» и пустые
+        // кнопки. Предварительной пометки «ждёт ответа» больше нет: она давала
+        // вторую правку, а кнопки при этом оставались живыми.
+        let closed = 0;
+        let failed = 0;
         for (const target of targetsFor(question)) {
-          try {
-            const markedOne = (await withTimeout(
-              Promise.resolve(target?.editQuestion?.(question, "⌛ ждёт ответа")),
-              notifyTimeoutMs,
-            )) === true;
-            marked = marked || markedOne;
-          } catch (error) {
-            logger(`TTL: пометка вопроса ${shortId} в канале ${target.id ?? "?"} не удалась (${error?.message ?? error})`);
+          const outcome = await withTimeout(closeOne(target, question, "expired"), notifyTimeoutMs);
+          if (outcome === "closed") {
+            closed += 1;
+          } else if (outcome !== "nothing") {
+            // «timeout»/«failed» — правка не прошла: жмём не молча.
+            failed += 1;
+            journal.append({ event: "question.closeFailed", shortId, reason: "ttl" });
           }
         }
-        if (!marked) {
-          // Пометка невозможна (нет editQuestion / фасад без канала): сообщение
-          // всё равно закрываем, но фиксируем это, чтобы не выглядело как норма.
+        journal.append({ event: "question.reminder", shortId, via: closed > 0 ? "edit" : "dropped" });
+        if (closed === 0 && failed === 0) {
           journal.append({ event: "expire-unmarked", shortId });
-          logger(`TTL: транспорт не умеет править сообщение ${shortId} — пометка «⌛» не поставлена`);
+          logger(`TTL: транспорт не умеет править сообщение ${shortId} — вопрос не помечен`);
         }
-        for (const target of targetsFor(question)) {
-          try {
-            // Зависшая правка не должна блокировать сторож: ограничиваем время.
-            await withTimeout(Promise.resolve(target?.closeQuestion?.(question, "expired")), notifyTimeoutMs);
-          } catch (error) {
-            logger(`TTL: кнопки вопроса ${shortId} в канале ${target.id ?? "?"} не снялись (${error?.message ?? error})`);
-          }
-        }
+        journal.append({ event: "question.expired", shortId, reason: "ttl" });
         const resolved = resolveExpiry(question);
         journal.append({ event: "expired", shortId, outcome: onExpire });
         result.expired += 1;
@@ -875,11 +888,16 @@ export function createReliability({
       if (now() >= reminderAt) {
         const due = item.lastPushAt === null || now() - item.lastPushAt >= repushMs;
         if (due) {
-          const pushed = await withTimeout(notify(question, "⏳ осталось 5 минут"), notifyTimeoutMs)
-            .catch(() => "dropped");
+          const pushed = await withTimeout(
+            notify(question, "⏳ осталось 5 минут", { allowNew: item.fallbackSent !== true }),
+            notifyTimeoutMs,
+          ).catch(() => "dropped");
           item.lastPushAt = now();
+          if (pushed === "sent") item.fallbackSent = true;
           if (pushed !== "dropped") result.reminded += 1;
+          const via = pushed === "edited" ? "edit" : pushed === "sent" ? "new" : "dropped";
           journal.append({ event: "reminder", shortId, transport: pushed });
+          journal.append({ event: "question.reminder", shortId, via });
         }
       }
     }
@@ -903,6 +921,64 @@ export function createReliability({
         },
       );
     });
+  }
+
+  /**
+   * Снять сообщение вопроса в одном канале (084).
+   *
+   * Транспорт повторяет правку сам (429/сеть — backoff и `retry_after`,
+   * `maxAttempts` попыток), поэтому здесь одна попытка: мы лишь различаем
+   * «сняли», «снимать нечего» и «не удалось», чтобы записать `question.closeFailed`
+   * и не выдать неудачу за успех.
+   *
+   * @returns {Promise<"closed"|"nothing"|"failed">}
+   */
+  async function closeOne(target, question, reason) {
+    if (typeof target?.closeQuestion !== "function") return "nothing";
+    try {
+      const result = await target.closeQuestion(question, reason);
+      if (result === false) return "failed";
+      if (result === null) return "nothing";
+      return "closed";
+    } catch (error) {
+      logger(`вопрос ${question?.shortId ?? "?"}: закрыть сообщение не удалось (${error?.message ?? error})`);
+      return "failed";
+    }
+  }
+
+  /**
+   * Снять одну доставку вопроса (084).
+   *
+   * `closeQuestion` — штатный путь (одна правка: текст «⌛ вопрос снят …» и
+   * пустые кнопки). Фолбэк `editMessage` + `clearButtons` остаётся для
+   * транспортов, которые не умеют закрывать сообщение одной операцией, — без
+   * него «осиротевший» вопрос оставил бы кнопки живыми.
+   *
+   * @param {string} reason — причина для `closeQuestion` (`restarted`).
+   * @param {string} [fallbackText] — человеческий текст для транспорта без
+   *   `closeQuestion` (фолбэк `editMessage`).
+   * @returns {Promise<"closed"|"nothing"|"failed">}
+   */
+  async function closeDelivery(target, question, delivery, reason, fallbackText = reason) {
+    const messageId = delivery?.messageId;
+    // 084: сначала closeQuestion — это одна правка: текст «⌛ вопрос снят …» и
+    // пустые кнопки. `editMessage` у Telegram не трогает `reply_markup`, у MAX
+    // сохраняет `attachments`, поэтому он годится только как фолбэк для
+    // транспортов, которые не умеют закрывать сообщение одной операцией.
+    const outcome = await closeOne(target, question, reason);
+    if (outcome !== "nothing") return outcome;
+    if (messageId === null || messageId === undefined || typeof target?.editMessage !== "function") {
+      return "nothing";
+    }
+    const targetOf = { chatId: delivery.chatId ?? null, messageId };
+    try {
+      await target.editMessage(targetOf, fallbackText);
+      if (typeof target.clearButtons === "function") await target.clearButtons(targetOf);
+      return "closed";
+    } catch (error) {
+      logger(`вопрос ${question?.shortId ?? "?"}: закрыть сообщение не удалось (${error?.message ?? error})`);
+      return "failed";
+    }
   }
 
   /** Как разблокировать сессию при истечении — по конфигу. */
@@ -1058,6 +1134,7 @@ export function createReliability({
     deliver,
     dropPending,
     pendingList,
+    isSending,
     recoverOrphans,
     notify,
     watch,

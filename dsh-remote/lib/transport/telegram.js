@@ -31,6 +31,7 @@ import {
   callbackData,
   checkTransport,
   chrome,
+  closeMarkupText,
   parseCallbackData,
 } from "./base.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderHtml, renderRows } from "../present.js";
@@ -306,18 +307,25 @@ export function createTelegramTransport(options = {}) {
 
   /** Кнопка нажата: сначала гасим «часики», потом отдаём ответ наверх. */
   async function handleCallback(query) {
-    if (typeof query?.id === "string") {
-      try {
-        await call("answerCallbackQuery", { callback_query_id: query.id }, { attempts: 1 });
-      } catch (error) {
-        log(`telegram: answerCallbackQuery не прошёл (${error?.message ?? error})`);
-      }
-    }
     if (!allowed(query?.from?.id, query?.message?.chat?.id)) return;
     const parsed = parseCallbackData(query?.data);
     if (parsed === null) {
       log(`telegram: callback_data не разобрал (${JSON.stringify(query?.data)}) — игнор`);
       return;
+    }
+    const record = sent.get(parsed.shortId);
+    const known = record !== undefined && record.closed !== true;
+    const callbackMeta = {
+      callbackId: typeof query?.id === "string" ? query.id : null,
+      chatId: query?.message?.chat?.id ?? null,
+      messageId: query?.message?.message_id ?? null,
+    };
+    if (known && typeof query?.id === "string") {
+      try {
+        await call("answerCallbackQuery", { callback_query_id: query.id }, { attempts: 1 });
+      } catch (error) {
+        log(`telegram: answerCallbackQuery не прошёл (${error?.message ?? error})`);
+      }
     }
     // «Другой ответ…»: у inline-кнопок нет поля ввода, поэтому просим текст
     // отдельным сообщением с force_reply — иначе человек не понимает, куда писать.
@@ -336,6 +344,10 @@ export function createTelegramTransport(options = {}) {
       }
     }
 
+    if (!known) {
+      emit({ shortId: parsed.shortId, optionIds: [parsed.optionId], ...callbackMeta });
+      return;
+    }
     emit({
       shortId: parsed.shortId,
       optionIds: [parsed.optionId],
@@ -354,6 +366,18 @@ export function createTelegramTransport(options = {}) {
     }
     const shortId = shortIdForText(message);
     if (shortId === null) {
+      // 085: текст реплаем на уже снятое сообщение — отдаём ответчику, чтобы
+      // он показал «вопрос снят», а не молчал. Без reply это обычный чат.
+      if (message?.reply_to_message !== undefined) {
+        emit({
+          shortId: "unknown",
+          text,
+          answeredBy: String(message.from.id),
+          chatId: message?.chat?.id ?? null,
+          messageId: message.message_id ?? null,
+        });
+        return;
+      }
       log("telegram: свободный текст без открытого вопроса — игнор");
       return;
     }
@@ -421,17 +445,27 @@ export function createTelegramTransport(options = {}) {
   /**
    * Правка закрытого сообщения: снять кнопки и, если это ответ, написать его.
    *
+   * 084: снятый вопрос (TTL, аборт, рестарт) помечается «⌛ вопрос снят …» — одной
+   * правкой и с пустой клавиатурой. Раньше здесь снимались только кнопки, а
+   * текст оставался текстом вопроса: человек видел живые кнопки, жал и получал
+   * тишину (`answer.unmatched`).
+   *
    * Ошибка правки не ломает ответ: ответ уже уехал в сессию, а сообщение —
-   * украшение. Запись при этом снимается: переправлять больше некуда.
+   * украшение. Возвращаем `false`, чтобы вызывающий записал `question.closeFailed`
+   * в рабочий журнал.
+   *
+   * @returns {Promise<boolean>} правка ушла?
    */
   async function closeRecord(shortId, record, summary = record.closeSummary) {
     const messageId = record.messageIds.at(-1);
     const text = String(summary ?? "").trim();
-    // Пустая строка или служебная причина — не ответ: снимаем кнопки, но текст
-    // не переписываем, иначе человек увидит «Ответ: aborted».
+    // Пустая строка или служебная причина — не ответ: кнопки снимаем, а текст
+    // переписываем только пометкой о снятии, иначе человек увидит «Ответ: aborted».
     const inGui = text === "answered-in-gui";
     const inMessenger = text === "answered-in-messenger";
-    const silent = !inGui && !inMessenger && (text === "" || CLOSE_REASONS.has(text.toLowerCase()));
+    const closedText = closeMarkupText(text);
+    const silent = closedText === null && !inGui && !inMessenger
+      && (text === "" || CLOSE_REASONS.has(text.toLowerCase()));
     const payload = silent
       ? { chat_id: record.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }
       : {
@@ -442,16 +476,22 @@ export function createTelegramTransport(options = {}) {
           ? "✅ <b>Отвечено в GUI</b>"
           : inMessenger
             ? "✅ <b>Отвечено (передано в сессию)</b>"
-            : `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
+            : closedText !== null
+              ? `<b>${escapeHtml(closedText)}</b>`
+              : `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
         reply_markup: { inline_keyboard: [] },
       };
+    let ok = true;
     try {
+      // Повтор с backoff — внутри `call` (429 с `retry_after`, сеть, 5xx).
       await call(silent ? "editMessageReplyMarkup" : "editMessageText", payload);
     } catch (error) {
+      ok = false;
       log(`telegram: правку сообщения ${shortId} сделать не удалось (${error?.message ?? error})`);
     }
     record.closed = true;
     sent.delete(shortId);
+    return ok;
   }
 
   const transport = {
@@ -566,15 +606,44 @@ export function createTelegramTransport(options = {}) {
     },
 
     /**
-     * Закрыть вопрос: кнопки снимаются, текст правится на «✅ Отвечено: …».
-     * Ошибка правки не ломает ответ — ответ уже уехал в сессию.
+     * Закрыть вопрос: кнопки снимаются, текст правится на «✅ Отвечено: …», а для
+     * снятого вопроса (TTL/аборт/рестарт) — на «⌛ вопрос снят …».
+     *
+     * @returns {Promise<boolean|null>} `true` — правка ушла (или сообщение ещё
+     *   отправляется и будет закрыто по завершении), `false` — правка не удалась,
+     *   `null` — закрывать нечего: сообщение не отправлялось.
      */
     async closeQuestion(question, summary = "") {
       const shortId = question?.shortId;
       const record = shortId === undefined ? undefined : sent.get(shortId);
       if (record === undefined) {
-        log(`telegram: закрывать нечего — вопрос ${shortId ?? "?"} не отправлялся`);
-        return;
+        // 084: recover после рестарта записи не имеет, но знает chatId/messageId —
+        // закрываем сообщение прошлого процесса одной правкой.
+        const messageId = question?.messageId;
+        const targetChat = question?.chatId ?? chatId;
+        if (messageId === undefined || messageId === null || targetChat === null) {
+          log(`telegram: закрывать нечего — вопрос ${shortId ?? "?"} не отправлялся`);
+          return null;
+        }
+        const text = String(summary ?? "").trim();
+        const closedText = closeMarkupText(text);
+        const silent = closedText === null && (text === "" || CLOSE_REASONS.has(text.toLowerCase()));
+        const payload = silent
+          ? { chat_id: targetChat, message_id: messageId, reply_markup: { inline_keyboard: [] } }
+          : {
+            chat_id: targetChat,
+            message_id: messageId,
+            parse_mode: "HTML",
+            text: closedText !== null ? `<b>${escapeHtml(closedText)}</b>` : `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
+            reply_markup: { inline_keyboard: [] },
+          };
+        try {
+          await call(silent ? "editMessageReplyMarkup" : "editMessageText", payload);
+          return true;
+        } catch (error) {
+          log(`telegram: закрыть ${shortId ?? messageId} по messageId не удалось (${error?.message ?? error})`);
+          return false;
+        }
       }
       const text = String(summary ?? "").trim();
       if (record.messageIds.length === 0) {
@@ -583,9 +652,9 @@ export function createTelegramTransport(options = {}) {
         record.closed = true;
         record.closeSummary = text;
         log(`telegram: закрытие вопроса ${shortId} отложено — сообщение ещё отправляется`);
-        return;
+        return true;
       }
-      await closeRecord(shortId, record, text);
+      return closeRecord(shortId, record, text);
     },
 
     /**
@@ -640,6 +709,47 @@ export function createTelegramTransport(options = {}) {
         reply_markup: { inline_keyboard: [] },
       });
       return true;
+    },
+
+    /** 085: подсказка на клик по уже снятому сообщению (одна на сообщение). */
+    async rejectUnknown({ callbackId = null, chatId: targetChat = null, messageId = null, text = "", userText = "" } = {}) {
+      if (typeof callbackId === "string" && callbackId !== "") {
+        try {
+          await call("answerCallbackQuery", { callback_query_id: callbackId, text: String(text) }, { attempts: 1 });
+          return true;
+        } catch (error) {
+          log(`telegram: подсказка по callback не прошла (${error?.message ?? error})`);
+        }
+      }
+      if (targetChat !== null && userText !== "") {
+        // Текст пришёл реплаем на снятое сообщение: править сообщение человека
+        // нельзя — отвечаем коротким сообщением в чат.
+        try {
+          await call("sendMessage", {
+            chat_id: targetChat,
+            text: escapeHtml(text),
+            ...(messageId === null ? {} : { reply_parameters: { message_id: messageId, allow_sending_without_reply: true } }),
+          }, { attempts: 2 });
+          return true;
+        } catch (error) {
+          log(`telegram: подсказка в чат не прошла (${error?.message ?? error})`);
+        }
+      }
+      if (targetChat !== null && messageId !== null) {
+        try {
+          await call("editMessageText", {
+            chat_id: targetChat,
+            message_id: messageId,
+            parse_mode: "HTML",
+            text: escapeHtml(text),
+            reply_markup: { inline_keyboard: [] },
+          });
+          return true;
+        } catch (error) {
+          log(`telegram: подсказка в сообщение не прошла (${error?.message ?? error})`);
+        }
+      }
+      return false;
     },
 
     /** Подписка на ответы; возвращает отписку. */

@@ -69,6 +69,10 @@ const dictionariesBase = Object.freeze({
     "commands.lang.current": "язык: {lang}",
     "commands.lang.set": "язык переключён: {lang}",
     "commands.lang.usage": "usage: /remote lang ru|en",
+    "answer.rejected.unknown": "Этот вопрос уже снят — ответьте в GUI",
+    "answer.rejected.expired": "Вопрос уже снят (истекло время) — ответьте в GUI",
+    "answer.rejected.already-answered": "Ответ уже дан — повторный не нужен",
+
     "commands.connect.approvalsQuestion": "Присылать подтверждения опасных действий (запуск команд, запись файлов, git push) в мессенджер? «Да, всё» разрешает подтверждать выполнение команд с телефона.",
     "commands.connect.approvalsAll": "Да, всё",
     "commands.connect.approvalsSafe": "Только безопасные (по умолчанию)",
@@ -104,6 +108,7 @@ const dictionariesBase = Object.freeze({
 
 
     "commands.status.language": "язык: {lang}",
+    "commands.status.channelWatchdog": "канал: последний апдейт {p0} мин назад, перезапусков {p1}, последняя ошибка: {p2}",
     "commands.status.journal": "журнал: {p0}",
     "commands.status.override": "режим: глобально {p0}; {p1} → {p2} (scope: {p3})",
     "commands.status.journalDisabled": "журнал выключен: {p0}",
@@ -156,6 +161,10 @@ const dictionariesBase = Object.freeze({
     "commands.lang.current": "language: {lang}",
     "commands.lang.set": "language switched: {lang}",
     "commands.lang.usage": "usage: /remote lang ru|en",
+    "answer.rejected.unknown": "This question is already closed — answer in the GUI",
+    "answer.rejected.expired": "The question has expired — answer in the GUI",
+    "answer.rejected.already-answered": "Already answered — no need to repeat",
+
     "commands.connect.approvalsQuestion": "Send confirmations of dangerous actions (commands, file writes, git push) to the messenger? «Yes, all» allows approving command execution from the phone.",
     "commands.connect.approvalsAll": "Yes, all",
     "commands.connect.approvalsSafe": "Safe only (default)",
@@ -191,6 +200,7 @@ const dictionariesBase = Object.freeze({
 
 
     "commands.status.language": "language: {lang}",
+    "commands.status.channelWatchdog": "channel: last update {p0} min ago, restarts {p1}, last error: {p2}",
     "commands.status.journal": "journal: {p0}",
     "commands.status.override": "mode: global {p0}; {p1} → {p2} (scope: {p3})",
     "commands.status.journalDisabled": "journal disabled: {p0}",
