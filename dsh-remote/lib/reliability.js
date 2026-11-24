@@ -758,7 +758,7 @@ export function createReliability({
    * Напоминание/итог: правим сообщение, если транспорт умеет, иначе — короткое
    * новое сообщение (карточка это разрешает при `caps.editAfterAnswer === false`).
    */
-  async function notify(question, text) {
+  async function notify(question, text, { allowNew = true } = {}) {
     // Правку проверяем по результату, а не по наличию метода: фасад 005 есть
     // всегда, но если за ним нет живого канала, правка «успешно» ничего не делает.
     let editedAny = false;
@@ -775,12 +775,12 @@ export function createReliability({
     if (editedAny) return "edited";
     // Если правка не удалась (нет метода, вернул не `true`, фасад без канала) —
     // карточка требует короткое новое сообщение. Не теряем напоминание молча.
-    if (typeof transport?.sendQuestion === "function") {
+    if (allowNew && typeof transport?.sendQuestion === "function") {
       try {
         await transport.sendQuestion({
           shortId: randomUUID().slice(0, 8),
           questionId: question.questionId ?? question.shortId,
-          body: text,
+          body: `${text} (обновление)`,
           options: [],
           multiSelect: false,
           allowFreeText: false,
@@ -806,6 +806,7 @@ export function createReliability({
       onExpire: typeof onExpireHook === "function" ? onExpireHook : null,
       remindedAt: null,
       lastPushAt: null,
+      fallbackSent: false,
     });
     return true;
   }
@@ -853,6 +854,7 @@ export function createReliability({
             journal.append({ event: "question.closeFailed", shortId, reason: "ttl" });
           }
         }
+        journal.append({ event: "question.reminder", shortId, via: closed > 0 ? "edit" : "dropped" });
         if (closed === 0 && failed === 0) {
           journal.append({ event: "expire-unmarked", shortId });
           logger(`TTL: транспорт не умеет править сообщение ${shortId} — вопрос не помечен`);
@@ -875,11 +877,16 @@ export function createReliability({
       if (now() >= reminderAt) {
         const due = item.lastPushAt === null || now() - item.lastPushAt >= repushMs;
         if (due) {
-          const pushed = await withTimeout(notify(question, "⏳ осталось 5 минут"), notifyTimeoutMs)
-            .catch(() => "dropped");
+          const pushed = await withTimeout(
+            notify(question, "⏳ осталось 5 минут", { allowNew: item.fallbackSent !== true }),
+            notifyTimeoutMs,
+          ).catch(() => "dropped");
           item.lastPushAt = now();
+          if (pushed === "sent") item.fallbackSent = true;
           if (pushed !== "dropped") result.reminded += 1;
+          const via = pushed === "edited" ? "edit" : pushed === "sent" ? "new" : "dropped";
           journal.append({ event: "reminder", shortId, transport: pushed });
+          journal.append({ event: "question.reminder", shortId, via });
         }
       }
     }
