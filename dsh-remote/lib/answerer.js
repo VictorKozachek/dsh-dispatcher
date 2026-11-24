@@ -465,7 +465,7 @@ export function createAnswerer({
     }
     journalEvent("answer.rejected", { shortId: event?.shortId ?? null, detail: { reason } });
     const text = t(`answer.rejected.${reason}`);
-    const payload = { ...(event ?? {}), text, question };
+    const payload = { ...(event ?? {}), text, userText: typeof event?.text === "string" ? event.text : "", question };
     try {
       const source = question?.sourceTransport ?? null;
       if (typeof source?.rejectUnknown === "function") {

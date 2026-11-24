@@ -977,13 +977,21 @@ export function createMaxTransport(options = {}) {
     },
 
     /** 085: подсказка на клик по уже снятому сообщению (одна на сообщение). */
-    async rejectUnknown({ callbackId = null, chatId: targetChat = null, messageId = null, text = "" } = {}) {
+    async rejectUnknown({ callbackId = null, chatId: targetChat = null, messageId = null, text = "", userText = "" } = {}) {
       if (typeof callbackId === "string" && callbackId !== "") {
         try {
           await answerCallback(callbackId, escapeHtml(text));
           return true;
         } catch (error) {
           log(`max: подсказка по callback не прошла (${describeError(error, token)})`);
+        }
+      }
+      if (targetChat !== null && userText !== "" && typeof sendNotice === "function") {
+        try {
+          await sendNotice(targetChat, text);
+          return true;
+        } catch (error) {
+          log(`max: подсказка в чат не прошла (${describeError(error, token)})`);
         }
       }
       if (targetChat !== null && messageId !== null) {

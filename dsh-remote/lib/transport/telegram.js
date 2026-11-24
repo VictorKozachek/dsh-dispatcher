@@ -712,13 +712,27 @@ export function createTelegramTransport(options = {}) {
     },
 
     /** 085: подсказка на клик по уже снятому сообщению (одна на сообщение). */
-    async rejectUnknown({ callbackId = null, chatId: targetChat = null, messageId = null, text = "" } = {}) {
+    async rejectUnknown({ callbackId = null, chatId: targetChat = null, messageId = null, text = "", userText = "" } = {}) {
       if (typeof callbackId === "string" && callbackId !== "") {
         try {
           await call("answerCallbackQuery", { callback_query_id: callbackId, text: String(text) }, { attempts: 1 });
           return true;
         } catch (error) {
           log(`telegram: подсказка по callback не прошла (${error?.message ?? error})`);
+        }
+      }
+      if (targetChat !== null && userText !== "") {
+        // Текст пришёл реплаем на снятое сообщение: править сообщение человека
+        // нельзя — отвечаем коротким сообщением в чат.
+        try {
+          await call("sendMessage", {
+            chat_id: targetChat,
+            text: escapeHtml(text),
+            ...(messageId === null ? {} : { reply_parameters: { message_id: messageId, allow_sending_without_reply: true } }),
+          }, { attempts: 2 });
+          return true;
+        } catch (error) {
+          log(`telegram: подсказка в чат не прошла (${error?.message ?? error})`);
         }
       }
       if (targetChat !== null && messageId !== null) {
