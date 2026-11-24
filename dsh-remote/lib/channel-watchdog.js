@@ -30,6 +30,8 @@ export function createChannelWatchdog({
   setInterval: setIntervalImpl = globalThis.setInterval,
   clearInterval: clearIntervalImpl = globalThis.clearInterval,
   intervalMs = 60_000,
+  sleep = async () => {},
+  backoffMs = 1_000,
   autostart = true,
 } = {}) {
   if (typeof now !== "function") throw new TypeError("channel-watchdog: now ждёт функцию");
@@ -79,6 +81,7 @@ export function createChannelWatchdog({
     lastError = error?.message ?? String(error ?? "unknown");
     consecutiveErrors += 1;
     if (consecutiveErrors >= errorLimit && !failed) {
+      emit("channel.stall", { errors: consecutiveErrors });
       return requestRestart("errors", { at });
     }
     return null;
@@ -118,6 +121,12 @@ export function createChannelWatchdog({
         failed = true;
         emit("channel.failed", { reason, lastError, restarts });
         return "failed";
+      }
+      // Backoff между попытками: 1s, 2s, … не долбим платформу сразу.
+      try {
+        await sleep(Math.min(30_000, backoffMs * restarts));
+      } catch {
+        /* сон не должен ломать сторож */
       }
       return "error";
     } finally {

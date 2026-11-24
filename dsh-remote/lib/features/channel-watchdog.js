@@ -28,7 +28,14 @@ export const channelWatchdogFeature = {
       silenceMs: silenceMinutes * 60_000,
       errorLimit,
       maxRestarts,
-      isBusy: () => deps.get("remoteAnswererPending") === true,
+      isBusy: () => {
+        try {
+          const reliability = deps.get("remoteReliability");
+          return (reliability?.pendingList?.()?.length ?? 0) > 0;
+        } catch {
+          return false;
+        }
+      },
       onEvent: (event) => {
         try {
           journal()?.record?.(event.event, { detail: { ...event } });

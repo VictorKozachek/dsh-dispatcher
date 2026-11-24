@@ -101,3 +101,24 @@ test("086: после failed и успешного апдейта пишется
   assert.equal(watchdog.status().failed, false);
   assert.equal(events.some((e) => e.event === "channel.recovered"), true);
 });
+
+test("086: неудачные перезапуски идут с backoff, а не сразу", async () => {
+  const time = clock();
+  const transport = fakeTransport({ failStart: true });
+  const delays = [];
+  const watchdog = createChannelWatchdog({
+    transport,
+    now: time.now,
+    autostart: false,
+    silenceMs: 10 * 60 * 1000,
+    maxRestarts: 3,
+    sleep: async (ms) => { delays.push(ms); },
+  });
+  time.advance(11 * 60 * 1000);
+  assert.equal(await watchdog.tick(), "error");
+  assert.deepEqual(delays, [1_000]);
+  assert.equal(await watchdog.tick(), "error");
+  assert.deepEqual(delays, [1_000, 2_000]);
+  assert.equal(await watchdog.tick(), "failed");
+  assert.equal(watchdog.status().restarts, 3);
+});
