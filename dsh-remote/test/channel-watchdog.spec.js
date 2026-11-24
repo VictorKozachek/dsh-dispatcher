@@ -143,3 +143,23 @@ test("086 feature: pending из remoteReliability откладывает пер�
   assert.equal(await watchdog.tick(clockValue + 120_000), "busy");
   assert.deepEqual(transport.calls, [], "pending не даёт перезапустить канал");
 });
+
+test("086 feature: активная отправка (isSending) откладывает перезапуск", async () => {
+  const { channelWatchdogFeature, CHANNEL_WATCHDOG_SERVICE } = await import("../lib/features/channel-watchdog.js");
+  const transport = fakeTransport();
+  const services = new Map([
+    ["remoteTransport", transport],
+    ["remoteReliability", { pendingList: () => [], isSending: () => true }],
+  ]);
+  const provided = new Map();
+  const ctx = { provide: (name, value) => provided.set(name, value), get: (name) => services.get(name) ?? null };
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => services.get(name) ?? null,
+    onDispose: () => {},
+  };
+  await channelWatchdogFeature.apply(ctx, { channel: { silenceMinutes: 1 } }, deps);
+  const watchdog = provided.get(CHANNEL_WATCHDOG_SERVICE);
+  assert.equal(await watchdog.tick(Date.now() + 120_000), "busy");
+  assert.deepEqual(transport.calls, []);
+});

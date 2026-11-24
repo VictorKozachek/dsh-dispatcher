@@ -31,6 +31,7 @@ export const channelWatchdogFeature = {
       isBusy: () => {
         try {
           const reliability = deps.get("remoteReliability");
+          if (reliability?.isSending?.() === true) return true;
           return (reliability?.pendingList?.()?.length ?? 0) > 0;
         } catch {
           return false;
