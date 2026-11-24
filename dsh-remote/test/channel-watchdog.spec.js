@@ -122,3 +122,24 @@ test("086: неудачные перезапуски идут с backoff, а н�
   assert.equal(await watchdog.tick(), "failed");
   assert.equal(watchdog.status().restarts, 3);
 });
+
+test("086 feature: pending из remoteReliability откладывает перезапуск", async () => {
+  const { channelWatchdogFeature, CHANNEL_WATCHDOG_SERVICE } = await import("../lib/features/channel-watchdog.js");
+  let clockValue = 0;
+  const transport = fakeTransport();
+  const services = new Map([["remoteTransport", transport], ["remoteReliability", { pendingList: () => [{ shortId: "x" }] }]]);
+  const provided = new Map();
+  const ctx = { provide: (name, value) => provided.set(name, value), get: (name) => services.get(name) ?? null };
+  const deps = {
+    logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+    get: (name) => services.get(name) ?? null,
+    onDispose: (fn) => { services.set("dispose", fn); },
+  };
+  await channelWatchdogFeature.apply(ctx, { channel: { silenceMinutes: 1 } }, deps);
+  const watchdog = provided.get(CHANNEL_WATCHDOG_SERVICE);
+  assert.ok(watchdog);
+  // Подменяем часы сторожу нельзя (он создан с Date.now), поэтому проверяем
+  // статус и busy через публичный isBusy-эффект: pending непуст → tick busy.
+  assert.equal(await watchdog.tick(clockValue + 120_000), "busy");
+  assert.deepEqual(transport.calls, [], "pending не даёт перезапустить канал");
+});
