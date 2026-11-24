@@ -943,18 +943,24 @@ export function createReliability({
    */
   async function closeDelivery(target, question, delivery, reason, fallbackText = reason) {
     const messageId = delivery?.messageId;
-    if (messageId !== null && messageId !== undefined && typeof target?.editMessage === "function") {
-      const targetOf = { chatId: delivery.chatId ?? null, messageId };
-      try {
-        await target.editMessage(targetOf, fallbackText);
-        if (typeof target.clearButtons === "function") await target.clearButtons(targetOf);
-        return "closed";
-      } catch (error) {
-        logger(`вопрос ${question?.shortId ?? "?"}: закрыть сообщение не удалось (${error?.message ?? error})`);
-        return "failed";
-      }
+    // 084: сначала closeQuestion — это одна правка: текст «⌛ вопрос снят …» и
+    // пустые кнопки. `editMessage` у Telegram не трогает `reply_markup`, у MAX
+    // сохраняет `attachments`, поэтому он годится только как фолбэк для
+    // транспортов, которые не умеют закрывать сообщение одной операцией.
+    const outcome = await closeOne(target, question, reason);
+    if (outcome !== "nothing") return outcome;
+    if (messageId === null || messageId === undefined || typeof target?.editMessage !== "function") {
+      return "nothing";
     }
-    return closeOne(target, question, reason);
+    const targetOf = { chatId: delivery.chatId ?? null, messageId };
+    try {
+      await target.editMessage(targetOf, fallbackText);
+      if (typeof target.clearButtons === "function") await target.clearButtons(targetOf);
+      return "closed";
+    } catch (error) {
+      logger(`вопрос ${question?.shortId ?? "?"}: закрыть сообщение не удалось (${error?.message ?? error})`);
+      return "failed";
+    }
   }
 
   /** Как разблокировать сессию при истечении — по конфигу. */
