@@ -309,6 +309,8 @@ export function createReliability({
 
   /** Вопросы под TTL-сторожем: shortId → запись наблюдения. */
   const watched = new Map();
+  /** 086: сколько доставок сейчас реально в полёте (sendQuestion). */
+  let activeDeliveries = 0;
   let timer = null;
 
   // --- доставка ------------------------------------------------------------
@@ -486,7 +488,8 @@ export function createReliability({
       };
 
     const outgoing = prepareQuestion(question);
-
+    activeDeliveries += 1;
+    try {
     for (let attempt = 1; ; attempt += 1) {
       if (signal?.aborted) return "aborted";
       try {
@@ -536,6 +539,9 @@ export function createReliability({
           return "give-up";
         }
       }
+    }
+    } finally {
+      activeDeliveries = Math.max(0, activeDeliveries - 1);
     }
   }
 
@@ -625,6 +631,11 @@ export function createReliability({
       logger(`очередь: ${shortId} не снят (${error?.message ?? error})`);
       return false;
     }
+  }
+
+  /** 086: идёт ли сейчас отправка/доставка (для сторожа канала). */
+  function isSending() {
+    return activeDeliveries > 0;
   }
 
   function pendingList() {
@@ -1123,6 +1134,7 @@ export function createReliability({
     deliver,
     dropPending,
     pendingList,
+    isSending,
     recoverOrphans,
     notify,
     watch,

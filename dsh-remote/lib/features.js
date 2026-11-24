@@ -31,6 +31,7 @@ import { metricsFeature } from "./features/metrics.js";
 import { maxFeature } from "./features/max.js";
 import { telegramFeature } from "./features/telegram.js";
 import { reliabilityFeature } from "./features/reliability.js";
+import { channelWatchdogFeature } from "./features/channel-watchdog.js";
 import { answererFeature } from "./features/answerer.js";
 import { approvalsFeature } from "./features/approvals.js";
 import { notifyFeature } from "./features/notify.js";
@@ -47,6 +48,7 @@ export const features = [
   maxFeature,
   telegramFeature,
   reliabilityFeature,
+  channelWatchdogFeature,
   answererFeature,
   approvalsFeature,
   relayFeature,

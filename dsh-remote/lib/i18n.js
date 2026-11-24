@@ -108,6 +108,7 @@ const dictionariesBase = Object.freeze({
 
 
     "commands.status.language": "язык: {lang}",
+    "commands.status.channelWatchdog": "канал: последний апдейт {p0} мин назад, перезапусков {p1}, последняя ошибка: {p2}",
     "commands.status.journal": "журнал: {p0}",
     "commands.status.override": "режим: глобально {p0}; {p1} → {p2} (scope: {p3})",
     "commands.status.journalDisabled": "журнал выключен: {p0}",
@@ -199,6 +200,7 @@ const dictionariesBase = Object.freeze({
 
 
     "commands.status.language": "language: {lang}",
+    "commands.status.channelWatchdog": "channel: last update {p0} min ago, restarts {p1}, last error: {p2}",
     "commands.status.journal": "journal: {p0}",
     "commands.status.override": "mode: global {p0}; {p1} → {p2} (scope: {p3})",
     "commands.status.journalDisabled": "journal disabled: {p0}",
