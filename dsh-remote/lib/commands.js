@@ -1365,6 +1365,15 @@ export function createRemoteCommands({
 
     lines.push(t("commands.status.language", { lang }, lang));
     // 056: путь журнала виден в статусе; если сервис не поднялся — строки нет.
+    const watchdog = ctx?.get?.("remoteChannelWatchdog") ?? null;
+    if (watchdog !== null && typeof watchdog.status === "function") {
+      const channel = watchdog.status();
+      lines.push(t("commands.status.channelWatchdog", {
+        p0: channel.lastUpdateMinutes === null ? "?" : channel.lastUpdateMinutes,
+        p1: channel.restarts,
+        p2: channel.lastError ?? "—",
+      }, lang));
+    }
     const journal = journalService();
     if (journal !== null && typeof journal === "object") {
       const journalFile = typeof journal.file === "string" && journal.file !== "" ? journal.file : "?";
