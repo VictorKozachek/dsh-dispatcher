@@ -18,6 +18,7 @@ import path from "node:path";
 import { createAnswerer } from "../lib/answerer.js";
 import { createRegistry } from "../lib/domain/registry.js";
 import { createQuestion } from "../lib/domain/question.js";
+import { createJournal } from "../lib/journal.js";
 import { createJsonState, createReliability } from "../lib/reliability.js";
 import { createMaxTransport } from "../lib/transport/max.js";
 import { createTelegramTransport } from "../lib/transport/telegram.js";
@@ -147,6 +148,23 @@ function makeReliability(t, { clock, transport, transportFor = null, state = nul
   return { reliability, logFile: file };
 }
 
+/** Записи рабочего журнала (structured `createJournal`: detail — JSON-строка). */
+function journalEvents(file) {
+  if (!fs.existsSync(file)) return [];
+  return fs
+    .readFileSync(file, "utf8")
+    .trim()
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => JSON.parse(line));
+}
+
+/** `detail` записи журнала как объект. */
+function detailOf(entry) {
+  if (entry?.detail === undefined) return {};
+  return typeof entry.detail === "string" ? JSON.parse(entry.detail) : entry.detail;
+}
+
 /** Открытый вопрос домена. */
 function openQuestion({ id = "q1", ttlMs = 10 * 60 * 1000, now = 0 } = {}) {
   const question = createQuestion(
@@ -203,12 +221,15 @@ test("084 TTL: MAX — одна правка PUT /messages, attachments: [], п�
   assert.equal(api.of("PUT /messages").length, 1, "повторный tick сообщение не правит");
 });
 
-test("084 аборт: Telegram правит сообщение «⌛ вопрос снят» и снимает кнопки", async (t) => {
+test("084 аборт: Telegram правит сообщение «⌛ вопрос снят», снимает кнопки и пишет журнал", async (t) => {
   const clock = fakeClock();
   const api = telegramApi();
   const transport = telegram(clock, api);
+  const dir = tempDir(t);
+  const logFile = path.join(dir, "log.jsonl");
+  const journal = createJournal({ file: logFile });
   const registry = createRegistry({ readState: () => ({ global: true }) });
-  const answerer = createAnswerer({ transport, registry, log: () => {}, now: () => 1_000 });
+  const answerer = createAnswerer({ transport, registry, journal, log: () => {}, now: () => 1_000 });
   answerer.attach({ on: () => () => {}, get: () => null });
 
   const controller = new AbortController();
@@ -229,6 +250,49 @@ test("084 аборт: Telegram правит сообщение «⌛ вопро�
   assert.match(edits[0].payload.text, /⌛ вопрос снят/);
   assert.doesNotMatch(edits[0].payload.text, /aborted/, "служебная причина не выдаётся за ответ");
   assert.deepEqual(edits[0].payload.reply_markup, { inline_keyboard: [] }, "кнопки сняты");
+
+  // 084 п.4: снятие по аборту видно в журнале — один раз и с причиной aborted.
+  const events = journalEvents(logFile);
+  const expired = events.filter((entry) => entry.event === "question.expired");
+  assert.equal(expired.length, 1, "ровно одно question.expired на снятый вопрос");
+  assert.equal(detailOf(expired[0]).reason, "aborted");
+  assert.equal(events.filter((entry) => entry.event === "question.closeFailed").length, 0, "успешная правка — не неудача");
+});
+
+test("084 аборт + ошибка правки: журнал пишет и question.expired (aborted), и question.closeFailed", async (t) => {
+  const clock = fakeClock();
+  const api = telegramApi({
+    editMessageText: () => response({ ok: false, description: "message can't be edited" }, 400),
+  });
+  const transport = telegram(clock, api);
+  const dir = tempDir(t);
+  const logFile = path.join(dir, "log.jsonl");
+  const journal = createJournal({ file: logFile });
+  const registry = createRegistry({ readState: () => ({ global: true }) });
+  const answerer = createAnswerer({ transport, registry, journal, log: () => {}, now: () => 1_000 });
+  answerer.attach({ on: () => () => {}, get: () => null });
+
+  const controller = new AbortController();
+  const pending = answerer.handler(
+    {
+      questions: [{ id: "q1", question: "Продолжать?", options: [{ label: "Да" }] }],
+      agent: { id: "s1" },
+      signal: controller.signal,
+    },
+    () => assert.fail("next() звать нельзя: вопрос забрали в мессенджер"),
+  );
+  await tickMs();
+  controller.abort();
+  // Правка не удалась, но аборт всё равно доходит до сессии: плагин не падает.
+  await assert.rejects(pending, (error) => error.name === "AbortError");
+
+  const events = journalEvents(logFile);
+  const expired = events.filter((entry) => entry.event === "question.expired");
+  const failed = events.filter((entry) => entry.event === "question.closeFailed");
+  assert.equal(expired.length, 1, "вопрос снят — событие есть, несмотря на неудачу правки");
+  assert.equal(detailOf(expired[0]).reason, "aborted");
+  assert.equal(failed.length, 1, "неудача правки видна отдельным событием");
+  assert.equal(detailOf(failed[0]).reason, "aborted");
 });
 
 test("084 recover: осиротевший вопрос снимается в обоих каналах, состояние очищается", async (t) => {

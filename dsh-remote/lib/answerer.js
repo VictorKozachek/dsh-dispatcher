@@ -375,6 +375,13 @@ export function createAnswerer({
       // Уже отвеченный или закрытый вопрос второй раз не закрываем: сообщение в
       // мессенджере и так снято, а лишний closeQuestion — ложный сигнал транспорту.
       if (!question.cancel(reason, now())) continue;
+      // 084: снятие вопроса видно в журнале ровно один раз — по факту `cancel`,
+      // а не по вызову: уже отвеченный вопрос снятым не считается. Для аборта
+      // событие пишется и тогда, когда правка сообщения ниже не удалась
+      // (`question.closeFailed` добавится отдельно): вопрос-то снят.
+      if (reason === "aborted") {
+        journalEvent("question.expired", { shortId: question.shortId, detail: { reason: "aborted" } });
+      }
       if (attempted !== null && !attempted.has(question)) continue;
       try {
         let closed = true;
@@ -1129,12 +1136,6 @@ export function createAnswerer({
             /* метрики не должны ронять аборт */
           }
           cleanupBatch();
-          // 084: снятие видно в журнале до правок сообщений. Отвеченный в пачке
-          // вопрос не «снят» — его пропускаем.
-          for (const item of questions) {
-            if (item?.isOpen !== true) continue;
-            journalEvent("question.expired", { shortId: item.shortId, detail: { reason: "aborted" } });
-          }
           await closeQuestions(questions, "aborted", attempted);
           if (mirrorFull && !mirrorCancelCalled) {
             mirrorCancelCalled = true;
