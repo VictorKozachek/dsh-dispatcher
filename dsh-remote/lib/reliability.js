@@ -679,7 +679,7 @@ export function createReliability({
             chatId: delivery.chatId ?? null,
             messageId: delivery.messageId ?? null,
           };
-          const outcome = await closeDelivery(target, question, delivery, "restarted");
+          const outcome = await closeDelivery(target, question, delivery, "restarted", "сессия перезапущена, вопрос снят");
           if (outcome !== "closed") {
             ok = false;
             if (outcome === "failed") {
@@ -720,7 +720,7 @@ export function createReliability({
         chatId: orphan.chatId ?? null,
         messageId: orphan.messageId ?? null,
       };
-      const outcome = await closeDelivery(live, question, orphan, "restarted");
+      const outcome = await closeDelivery(live, question, orphan, "restarted", "сессия перезапущена, вопрос снят");
       if (outcome === "closed") {
         cancelled += 1;
         journal.append({ event: "orphan-cancelled", shortId: orphan.shortId });
@@ -943,20 +943,18 @@ export function createReliability({
    */
   async function closeDelivery(target, question, delivery, reason, fallbackText = reason) {
     const messageId = delivery?.messageId;
-    const outcome = await closeOne(target, question, reason);
-    if (outcome !== "nothing") return outcome;
-    if (messageId === null || messageId === undefined || typeof target?.editMessage !== "function") {
-      return "nothing";
+    if (messageId !== null && messageId !== undefined && typeof target?.editMessage === "function") {
+      const targetOf = { chatId: delivery.chatId ?? null, messageId };
+      try {
+        await target.editMessage(targetOf, fallbackText);
+        if (typeof target.clearButtons === "function") await target.clearButtons(targetOf);
+        return "closed";
+      } catch (error) {
+        logger(`вопрос ${question?.shortId ?? "?"}: закрыть сообщение не удалось (${error?.message ?? error})`);
+        return "failed";
+      }
     }
-    const targetOf = { chatId: delivery.chatId ?? null, messageId };
-    try {
-      await target.editMessage(targetOf, fallbackText);
-      if (typeof target.clearButtons === "function") await target.clearButtons(targetOf);
-      return "closed";
-    } catch (error) {
-      logger(`вопрос ${question?.shortId ?? "?"}: закрыть сообщение не удалось (${error?.message ?? error})`);
-      return "failed";
-    }
+    return closeOne(target, question, reason);
   }
 
   /** Как разблокировать сессию при истечении — по конфигу. */
