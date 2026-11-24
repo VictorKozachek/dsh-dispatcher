@@ -442,8 +442,10 @@ test("служебная причина закрытия не выдаётся �
 
   await transport.closeQuestion(question(), "aborted");
 
-  assert.ok(calls.some((call) => call.method === "editMessageReplyMarkup"), "кнопки сняты");
-  assert.equal(calls.some((call) => call.method === "editMessageText"), false, "текст не врёт про ответ");
+  const edit = calls.find((call) => call.method === "editMessageText");
+  assert.ok(edit, "сообщение правится текстом «снят»");
+  assert.match(edit.payload.text, /⌛ вопрос снят/i);
+  assert.deepEqual(edit.payload.reply_markup, { inline_keyboard: [] });
 });
 
 test("ошибка правки не ломает ответ", async () => {
@@ -815,9 +817,10 @@ test("аборт во время отправки: сообщение закры
   releaseSend(response({ ok: true, result: { message_id: 500 } }));
   await settle(6);
 
-  const edit = calls.find((call) => call.method === "editMessageReplyMarkup");
+  const edit = calls.find((call) => call.method === "editMessageText");
   assert.ok(edit, "сообщение закрыто, когда отправка завершилась");
   assert.equal(edit.payload.message_id, 500);
+  assert.match(edit.payload.text, /⌛ вопрос снят/i);
   assert.deepEqual(edit.payload.reply_markup, { inline_keyboard: [] }, "кнопки сняты");
   assert.equal(transport.messages.has(shortId), false, "открытых записей не осталось");
 });

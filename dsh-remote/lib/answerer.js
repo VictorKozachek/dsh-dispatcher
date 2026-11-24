@@ -375,19 +375,40 @@ export function createAnswerer({
       // Уже отвеченный или закрытый вопрос второй раз не закрываем: сообщение в
       // мессенджере и так снято, а лишний closeQuestion — ложный сигнал транспорту.
       if (!question.cancel(reason, now())) continue;
+      // 084: снятие вопроса видно в журнале ровно один раз — по факту `cancel`,
+      // а не по вызову: уже отвеченный вопрос снятым не считается. Для аборта
+      // событие пишется и тогда, когда правка сообщения ниже не удалась
+      // (`question.closeFailed` добавится отдельно): вопрос-то снят.
+      if (reason === "aborted") {
+        journalEvent("question.expired", { shortId: question.shortId, detail: { reason: "aborted" } });
+      }
       if (attempted !== null && !attempted.has(question)) continue;
       try {
+        let closed = true;
         if (useBroker && (question.deliveries?.length ?? 0) > 0) {
           // 012: в мультиканале одиночный `transport` — пустой фасад, поэтому
           // закрываем через брокер, иначе сообщения остаются с кнопками.
-          await broker.closeAll(question, { winner: null, summary: reason });
+          const outcome = await broker.closeAll(question, { winner: null, summary: reason });
+          closed = outcome?.ok !== false;
         } else {
-          await primary?.closeQuestion?.(question, reason);
+          // 084: `false` — транспорт не смог править сообщение; это не повод
+          // считать вопрос снятым молча.
+          closed = (await primary?.closeQuestion?.(question, reason)) !== false;
         }
+        if (!closed) throw new Error("канал не смог снять сообщение");
       } catch (error) {
         log(`вопрос ${question.shortId}: закрыть сообщение не удалось (${error?.message ?? error})`);
         try {
-          onCloseError?.(question, error);
+          if (typeof onCloseError !== "function") {
+            // 084: неудача правки видна в журнале; ответ и сессия при этом не
+            // страдают — закрытие сообщения уже best effort.
+            journalEvent("question.closeFailed", {
+              shortId: question.shortId,
+              detail: { reason, message: String(error?.message ?? error) },
+            });
+          } else {
+            onCloseError(question, error);
+          }
         } catch {
           /* диагностика не должна ломать закрытие */
         }

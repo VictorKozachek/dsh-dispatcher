@@ -160,8 +160,11 @@ export function createBroker({
    *
    * @param {object} question
    * @param {{winner?: object|null, summary?: string}} [options]
+   * @returns {Promise<{ok: boolean, failed: string[]}>} какие каналы не сняли
+   *   сообщение (084: по ним ответчик пишет `question.closeFailed` в журнал).
    */
   async function closeAll(question, { winner = null, summary = "" } = {}) {
+    const failed = [];
     for (const delivery of question?.deliveries ?? []) {
       const transport = transportOf(delivery.transport);
       if (transport === null) continue;
@@ -170,7 +173,10 @@ export function createBroker({
         // Без победителя (аборт/недоставка/истечение) закрываем все каналы одной
         // причиной: это не гонка ответов, и пометка «в другом канале» соврёт.
         if (isWinner || winner === null) {
-          await transport.closeQuestion?.(question, summary);
+          if ((await transport.closeQuestion?.(question, summary)) === false) {
+            failed.push(delivery.transport);
+            log(`broker: канал ${delivery.transport} не снял сообщение вопроса ${question?.shortId ?? "?"}`);
+          }
           continue;
         }
         // Проигравший: сначала текст пометки, потом снятие кнопок тихой причиной.
@@ -180,12 +186,18 @@ export function createBroker({
         } catch (error) {
           log(`broker: пометка в ${delivery.transport} не удалась (${error?.message ?? error})`);
         }
-        await transport.closeQuestion?.(question, ANSWERED_ELSEWHERE);
-        log(`broker: канал ${delivery.transport} закрыт — ответ пришёл в ${winner?.id ?? "другой канал"}`);
+        if ((await transport.closeQuestion?.(question, ANSWERED_ELSEWHERE)) === false) {
+          failed.push(delivery.transport);
+          log(`broker: канал ${delivery.transport} не снял сообщение вопроса ${question?.shortId ?? "?"}`);
+        } else {
+          log(`broker: канал ${delivery.transport} закрыт — ответ пришёл в ${winner?.id ?? "другой канал"}`);
+        }
       } catch (error) {
+        failed.push(delivery.transport);
         log(`broker: канал ${delivery.transport} не закрылся (${error?.message ?? error})`);
       }
     }
+    return { ok: failed.length === 0, failed };
   }
 
   return { transports: channels, publish, closeAll, transportOf };

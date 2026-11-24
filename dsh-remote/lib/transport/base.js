@@ -25,8 +25,11 @@
  * @property {(question: object, options?: {chatId?: string}) => void | Promise<{messageId?: string}>} sendQuestion
  *   Отправить вопрос; `question.shortId` и `question.options[{id,label}]` — то, из
  *   чего строятся кнопки.
- * @property {(question: object, summary?: string) => void | Promise<void>} closeQuestion
+ * @property {(question: object, summary?: string) => void | Promise<boolean|null>} closeQuestion
  *   Снять кнопки/пометить сообщение закрытым (ответили, истёк TTL, аборт).
+ *   `true` — правка ушла, `false` — правка не удалась (вызывающий пишет
+ *   `question.closeFailed` в журнал), `null`/`undefined` — снимать нечего
+ *   (сообщение не отправлялось).
  * @property {(handler: (answer: TransportAnswer) => void) => (() => void)} onAnswer
  *   Подписка на ответы; возвращает функцию отписки.
  * @property {() => ({ok: boolean, detail?: string} | Promise<{ok: boolean, detail?: string}>)} healthCheck
@@ -42,6 +45,26 @@ export const DEFAULT_CAPS = Object.freeze({
   /** Сколько вариантов влезает в одно сообщение. */
   maxOptions: 8,
 });
+
+/**
+ * Текст пометки снятого вопроса (084).
+ *
+ * После снятия вопроса (TTL, аборт запроса, «осиротевший» после рестарта профиля)
+ * сообщение оставалось с живыми кнопками: человек жмёт, плагин молча игнорирует
+ * (`answer.unmatched`). Поэтому снятие — это не «тихое» удаление клавиатуры, а
+ * одна правка: текст «⌛ вопрос снят …» и пустые кнопки. Причины, которых здесь
+ * нет (реальный ответ, недоставка и прочие служебные), закрываются как раньше.
+ *
+ * @param {string} summary — причина закрытия (`expired`, `aborted`, `restarted`).
+ * @returns {string|null} текст пометки или `null`, если причина не про снятие.
+ */
+export function closeMarkupText(summary) {
+  const value = String(summary ?? "").trim().toLowerCase();
+  if (value === "expired") return "⌛ вопрос снят (истекло время)";
+  if (value === "restarted") return "⌛ вопрос снят (сессия перезапущена)";
+  if (value === "aborted") return "⌛ вопрос снят";
+  return null;
+}
 
 /** Методы, без которых объект не является транспортом. */
 export const TRANSPORT_METHODS = Object.freeze([

@@ -269,11 +269,6 @@ test("recoverOrphans: вопрос мёртвой сессии снимаетс�
     questions: [{ shortId: "b2", questionId: "q2", sessionId: "dead-session", chatId: 42, messageId: 9 }],
   });
   const transport = fakeTransport();
-  const edited = [];
-  transport.editMessage = async (target, text) => {
-    edited.push({ target, text });
-  };
-  transport.clearButtons = async () => {};
   const { reliability } = makeReliability(t, {
     transport,
     state,
@@ -284,8 +279,7 @@ test("recoverOrphans: вопрос мёртвой сессии снимаетс�
   const result = await reliability.recoverOrphans();
 
   assert.deepEqual(result, { cancelled: 1, failed: 0 });
-  assert.equal(edited.length, 1, "сообщение закрыто, ожидания не было");
-  assert.match(edited[0].text, /сессия перезапущена/);
+  assert.deepEqual(transport.closed, [{ shortId: "b2", summary: "restarted" }], "одна правка closeQuestion");
   const journal = fs.readFileSync(logFile, "utf8");
   assert.match(journal, /orphan-session-dead/, "мёртвая сессия видна в журнале");
 });

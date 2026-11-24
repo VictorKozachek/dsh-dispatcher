@@ -773,7 +773,7 @@ test("TTL на двух каналах: пометка и закрытие ид�
 
   assert.deepEqual(telegram.closed.map((item) => item.summary), ["expired"]);
   assert.deepEqual(max.closed.map((item) => item.summary), ["expired"]);
-  assert.equal(max.edited.at(-1).text, "⌛ ждёт ответа");
+  assert.equal(max.edited.length, 1, "TTL больше не правит текст отдельной пометкой");
 });
 
 test("recover после рестарта закрывает обе доставки из state.questions", async (t) => {
@@ -784,21 +784,18 @@ test("recover после рестарта закрывает обе достав
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-012-recover-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const edited = { telegram: [], max: [] };
-  const cleared = { telegram: [], max: [] };
+  const closed = { telegram: [], max: [] };
+  // 084: recover закрывает сообщение одной правкой closeQuestion, а не
+  // «правка текста + отдельное снятие кнопок».
   const makeChannel = (id) => ({
     id,
     caps: {},
-    async editMessage(target, text) {
-      edited[id].push({ target, text });
-    },
-    async clearButtons(target) {
-      cleared[id].push(target);
-    },
     async sendQuestion() {
       return { messageId: "1" };
     },
-    async closeQuestion() {},
+    async closeQuestion(question, summary) {
+      closed[id].push({ question, summary });
+    },
   });
   const registry = new Map([["telegram", makeChannel("telegram")], ["max", makeChannel("max")]]);
   const state = createJsonState({ file: path.join(dir, "state.json") });
@@ -827,11 +824,10 @@ test("recover после рестарта закрывает обе достав
   const result = await reliability.recoverOrphans();
 
   assert.deepEqual(result, { cancelled: 1, failed: 0 });
-  assert.equal(edited.telegram.length, 1, "правка в telegram");
-  assert.equal(edited.max.length, 1, "правка в max");
-  assert.match(edited.max[0].text, /сессия перезапущена/);
-  assert.deepEqual(cleared.telegram[0], { chatId: 42, messageId: "tg-1" });
-  assert.deepEqual(cleared.max[0], { chatId: 42, messageId: "max-1" });
+  assert.deepEqual(closed.telegram.map((item) => item.summary), ["restarted"]);
+  assert.deepEqual(closed.max.map((item) => item.summary), ["restarted"]);
+  assert.equal(closed.telegram[0].question.messageId, "tg-1", "правка по id из состояния");
+  assert.equal(closed.max[0].question.messageId, "max-1");
 });
 
 // --- регрессии по четвёртому ревью 012 --------------------------------------
@@ -892,8 +888,8 @@ test("reliabilityFeature передаёт transportFor: TTL и recover идут 
   reliability.watch(question, { onExpire: () => {} });
   await reliability.tick();
 
-  assert.equal(edited.telegram.length, 1, "пометка в telegram");
-  assert.equal(edited.max.length, 1, "пометка в max");
+  assert.equal(edited.telegram.length, 0, "TTL не шлёт отдельную пометку");
+  assert.equal(edited.max.length, 0, "TTL не шлёт отдельную пометку");
   assert.deepEqual(closed.telegram.map((item) => item.summary), ["expired"]);
   assert.deepEqual(closed.max.map((item) => item.summary), ["expired"]);
 
@@ -1126,16 +1122,13 @@ test("deliveries.messageId переживает reliability-доставку и 
   reliability.noteDeliveries(question);
 
   // Рестарт: новые каналы (in-memory пусто), но state помнит оба messageId.
-  const edited = { telegram: [], max: [] };
-  const cleared = { telegram: [], max: [] };
+  const closed = { telegram: [], max: [] };
   for (const id of ["telegram", "max"]) {
     registry.set(id, {
       id,
       caps: {},
-      async editMessage(target, text) { edited[id].push({ target, text }); },
-      async clearButtons(target) { cleared[id].push(target); },
       async sendQuestion() { return { messageId: "x" }; },
-      async closeQuestion() {},
+      async closeQuestion(question, summary) { closed[id].push({ question, summary }); },
     });
   }
   const { createReliability: makeReliability } = await import("../lib/reliability.js");
@@ -1151,10 +1144,10 @@ test("deliveries.messageId переживает reliability-доставку и 
   const result = await afterRestart.recoverOrphans();
 
   assert.deepEqual(result, { cancelled: 1, failed: 0 });
-  assert.equal(edited.telegram.length, 1, "правим telegram");
-  assert.equal(edited.max.length, 1, "правим max");
-  assert.deepEqual(cleared.telegram[0], { chatId: 42, messageId: "telegram-mid" });
-  assert.deepEqual(cleared.max[0], { chatId: 43, messageId: "max-mid" });
+  assert.deepEqual(closed.telegram.map((item) => item.summary), ["restarted"], "правим telegram одной правкой");
+  assert.deepEqual(closed.max.map((item) => item.summary), ["restarted"], "правим max одной правкой");
+  assert.equal(closed.telegram[0].question.messageId, "telegram-mid");
+  assert.equal(closed.max[0].question.messageId, "max-mid");
 });
 
 test("аборт на уровне фичевой сборки закрывает оба канала (сетевые вызовы есть)", async (t) => {

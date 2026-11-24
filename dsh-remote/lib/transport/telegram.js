@@ -31,6 +31,7 @@ import {
   callbackData,
   checkTransport,
   chrome,
+  closeMarkupText,
   parseCallbackData,
 } from "./base.js";
 import { FREE_TEXT_OPTION, MORE_OPTION, renderBody, renderHtml, renderRows } from "../present.js";
@@ -421,17 +422,27 @@ export function createTelegramTransport(options = {}) {
   /**
    * Правка закрытого сообщения: снять кнопки и, если это ответ, написать его.
    *
+   * 084: снятый вопрос (TTL, аборт, рестарт) помечается «⌛ вопрос снят …» — одной
+   * правкой и с пустой клавиатурой. Раньше здесь снимались только кнопки, а
+   * текст оставался текстом вопроса: человек видел живые кнопки, жал и получал
+   * тишину (`answer.unmatched`).
+   *
    * Ошибка правки не ломает ответ: ответ уже уехал в сессию, а сообщение —
-   * украшение. Запись при этом снимается: переправлять больше некуда.
+   * украшение. Возвращаем `false`, чтобы вызывающий записал `question.closeFailed`
+   * в рабочий журнал.
+   *
+   * @returns {Promise<boolean>} правка ушла?
    */
   async function closeRecord(shortId, record, summary = record.closeSummary) {
     const messageId = record.messageIds.at(-1);
     const text = String(summary ?? "").trim();
-    // Пустая строка или служебная причина — не ответ: снимаем кнопки, но текст
-    // не переписываем, иначе человек увидит «Ответ: aborted».
+    // Пустая строка или служебная причина — не ответ: кнопки снимаем, а текст
+    // переписываем только пометкой о снятии, иначе человек увидит «Ответ: aborted».
     const inGui = text === "answered-in-gui";
     const inMessenger = text === "answered-in-messenger";
-    const silent = !inGui && !inMessenger && (text === "" || CLOSE_REASONS.has(text.toLowerCase()));
+    const closedText = closeMarkupText(text);
+    const silent = closedText === null && !inGui && !inMessenger
+      && (text === "" || CLOSE_REASONS.has(text.toLowerCase()));
     const payload = silent
       ? { chat_id: record.chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }
       : {
@@ -442,16 +453,22 @@ export function createTelegramTransport(options = {}) {
           ? "✅ <b>Отвечено в GUI</b>"
           : inMessenger
             ? "✅ <b>Отвечено (передано в сессию)</b>"
-            : `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
+            : closedText !== null
+              ? `<b>${escapeHtml(closedText)}</b>`
+              : `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
         reply_markup: { inline_keyboard: [] },
       };
+    let ok = true;
     try {
+      // Повтор с backoff — внутри `call` (429 с `retry_after`, сеть, 5xx).
       await call(silent ? "editMessageReplyMarkup" : "editMessageText", payload);
     } catch (error) {
+      ok = false;
       log(`telegram: правку сообщения ${shortId} сделать не удалось (${error?.message ?? error})`);
     }
     record.closed = true;
     sent.delete(shortId);
+    return ok;
   }
 
   const transport = {
@@ -566,15 +583,44 @@ export function createTelegramTransport(options = {}) {
     },
 
     /**
-     * Закрыть вопрос: кнопки снимаются, текст правится на «✅ Отвечено: …».
-     * Ошибка правки не ломает ответ — ответ уже уехал в сессию.
+     * Закрыть вопрос: кнопки снимаются, текст правится на «✅ Отвечено: …», а для
+     * снятого вопроса (TTL/аборт/рестарт) — на «⌛ вопрос снят …».
+     *
+     * @returns {Promise<boolean|null>} `true` — правка ушла (или сообщение ещё
+     *   отправляется и будет закрыто по завершении), `false` — правка не удалась,
+     *   `null` — закрывать нечего: сообщение не отправлялось.
      */
     async closeQuestion(question, summary = "") {
       const shortId = question?.shortId;
       const record = shortId === undefined ? undefined : sent.get(shortId);
       if (record === undefined) {
-        log(`telegram: закрывать нечего — вопрос ${shortId ?? "?"} не отправлялся`);
-        return;
+        // 084: recover после рестарта записи не имеет, но знает chatId/messageId —
+        // закрываем сообщение прошлого процесса одной правкой.
+        const messageId = question?.messageId;
+        const targetChat = question?.chatId ?? chatId;
+        if (messageId === undefined || messageId === null || targetChat === null) {
+          log(`telegram: закрывать нечего — вопрос ${shortId ?? "?"} не отправлялся`);
+          return null;
+        }
+        const text = String(summary ?? "").trim();
+        const closedText = closeMarkupText(text);
+        const silent = closedText === null && (text === "" || CLOSE_REASONS.has(text.toLowerCase()));
+        const payload = silent
+          ? { chat_id: targetChat, message_id: messageId, reply_markup: { inline_keyboard: [] } }
+          : {
+            chat_id: targetChat,
+            message_id: messageId,
+            parse_mode: "HTML",
+            text: closedText !== null ? `<b>${escapeHtml(closedText)}</b>` : `✅ <b>Отвечено</b>: ${escapeHtml(text)}`,
+            reply_markup: { inline_keyboard: [] },
+          };
+        try {
+          await call(silent ? "editMessageReplyMarkup" : "editMessageText", payload);
+          return true;
+        } catch (error) {
+          log(`telegram: закрыть ${shortId ?? messageId} по messageId не удалось (${error?.message ?? error})`);
+          return false;
+        }
       }
       const text = String(summary ?? "").trim();
       if (record.messageIds.length === 0) {
@@ -583,9 +629,9 @@ export function createTelegramTransport(options = {}) {
         record.closed = true;
         record.closeSummary = text;
         log(`telegram: закрытие вопроса ${shortId} отложено — сообщение ещё отправляется`);
-        return;
+        return true;
       }
-      await closeRecord(shortId, record, text);
+      return closeRecord(shortId, record, text);
     },
 
     /**
